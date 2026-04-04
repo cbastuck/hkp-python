@@ -13,6 +13,7 @@ from hkp.server import create_runtime_server
 from hkp.services.http_server import HTTP_SERVER_SUBSERVICES_DESCRIPTOR
 from hkp.services.map_service import MAP_DESCRIPTOR
 from hkp.services.monitor import MONITOR_DESCRIPTOR
+from hkp.services.timer import TIMER_DESCRIPTOR
 from hkp.services.sub_service import SUB_SERVICE_DESCRIPTOR
 
 
@@ -96,6 +97,7 @@ async def test_registry_shape(server_info, base_url, port):
             "serviceName": "HttpServerSubservices",
             "capabilities": ["subservices"],
         },
+        {"serviceId": "hookup.to/service/timer", "serviceName": "Timer"},
     ]
 
     assert len(body["runtimes"]) == 1
@@ -478,6 +480,128 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
             session, f"http://127.0.0.1:{port}/runtimes/rt-1/services/outer-monitor-1"
         )
         assert "message" not in svc_state
+
+
+@pytest.mark.asyncio
+async def test_timer_periodic_fires_via_websocket(server_info, port):
+    """Periodic timer autonomously fires and its results reach WebSocket clients."""
+    async with aiohttp.ClientSession() as session:
+        runtime = await create_runtime(
+            session,
+            port,
+            services=[
+                {
+                    "serviceId": TIMER_DESCRIPTOR.service_id,
+                    "uuid": "timer-1",
+                    "state": {
+                        "periodic": True,
+                        "periodicValue": 50,
+                        "periodicUnit": "ms",
+                    },
+                }
+            ],
+        )
+        ws_url = runtime["outputUrl"]
+
+    tick_received = asyncio.Event()
+    first_result: dict = {}
+
+    async def watch() -> None:
+        async with aiohttp.ClientSession() as ws_session:
+            async with ws_session.ws_connect(ws_url) as ws:
+                # Start the timer
+                async with aiohttp.ClientSession() as s:
+                    await _post_json(
+                        s,
+                        f"http://127.0.0.1:{port}/runtimes/rt-1/services/timer-1",
+                        {"start": True},
+                    )
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data.get("type") == "result" and isinstance(data.get("data"), dict):
+                            first_result.update(data["data"])
+                            tick_received.set()
+                            await ws.close()
+                            return
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    task = asyncio.create_task(watch())
+    await asyncio.wait_for(tick_received.wait(), timeout=5.0)
+    task.cancel()
+
+    assert first_result.get("triggerCount") == 1
+
+    # Stop and verify state
+    async with aiohttp.ClientSession() as session:
+        state = await _post_json(
+            session,
+            f"http://127.0.0.1:{port}/runtimes/rt-1/services/timer-1",
+            {"stop": True},
+        )
+    assert state["running"] is False
+
+
+@pytest.mark.asyncio
+async def test_timer_until_auto_stops(server_info, port):
+    """Timer with until.triggerCount stops itself after N ticks."""
+    collected_results: list[dict] = []
+    done = asyncio.Event()
+
+    async with aiohttp.ClientSession() as session:
+        runtime = await create_runtime(
+            session,
+            port,
+            services=[
+                {
+                    "serviceId": TIMER_DESCRIPTOR.service_id,
+                    "uuid": "timer-1",
+                    "state": {
+                        "periodic": True,
+                        "periodicValue": 30,
+                        "periodicUnit": "ms",
+                        "until": {"triggerCount": 3},
+                    },
+                }
+            ],
+        )
+        ws_url = runtime["outputUrl"]
+
+    async def watch() -> None:
+        async with aiohttp.ClientSession() as ws_session:
+            async with ws_session.ws_connect(ws_url) as ws:
+                async with aiohttp.ClientSession() as s:
+                    await _post_json(
+                        s,
+                        f"http://127.0.0.1:{port}/runtimes/rt-1/services/timer-1",
+                        {"start": True},
+                    )
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data.get("type") == "result" and isinstance(data.get("data"), dict):
+                            collected_results.append(data["data"])
+                            if len(collected_results) >= 3:
+                                done.set()
+                                await ws.close()
+                                return
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    task = asyncio.create_task(watch())
+    await asyncio.wait_for(done.wait(), timeout=5.0)
+    task.cancel()
+
+    assert [r["triggerCount"] for r in collected_results] == [1, 2, 3]
+
+    # Timer should have stopped itself
+    await asyncio.sleep(0.15)  # wait longer than one interval to confirm no more ticks
+    async with aiohttp.ClientSession() as session:
+        state = await _get_json(
+            session, f"http://127.0.0.1:{port}/runtimes/rt-1/services/timer-1"
+        )
+    assert state["running"] is False
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────

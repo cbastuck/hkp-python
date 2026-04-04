@@ -15,6 +15,7 @@ from .services.http_server import (
 from .services.map_service import MAP_DESCRIPTOR, MapService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
+from .services.timer import TIMER_DESCRIPTOR, TimerService
 from .types import (
     JsonRecord,
     RuntimeConfiguration,
@@ -44,6 +45,10 @@ class RuntimeServer:
             HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id: HostedServiceFactory(
                 HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
                 lambda cfg, cs: HttpServerSubservicesService(cfg, cs),
+            ),
+            TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
+                TIMER_DESCRIPTOR,
+                lambda cfg, _cs: TimerService(cfg),
             ),
         }
 
