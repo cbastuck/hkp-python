@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Service Documentation
+# Service ID: sub-service
+# Service Name: SubService
+# Runtime: hkp-python
+# Modes: sub-pipeline execution
+# Key Config: pipeline/subservices configuration
+# IO: in=any -> out=pipeline result
+# Arrays: service-defined, typically forwarded
+# Binary: depends on nested services
+# MixedData: not native in runtime
+
 import uuid as _uuid_mod
 from typing import Any
 

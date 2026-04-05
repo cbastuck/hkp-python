@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Service Documentation
+# Service ID: monitor
+# Service Name: Monitor
+# Runtime: hkp-python
+# Modes: observe
+# Key Config: runtime-specific observe/log settings
+# IO: in=any -> out=identity
+# Arrays: pass-through
+# Binary: inspect/log support depends on runtime UI/logging
+# MixedData: not native in runtime
+
 import json
 from typing import Any
 

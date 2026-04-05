@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Service Documentation
+# Service ID: hookup.to/service/timer
+# Service Name: Timer
+# Runtime: hkp-python
+# Modes: periodic | oneShot
+# Key Config: service-specific timer fields (period, units, triggers)
+# IO: in=any -> out=tick payload or delayed payload
+# Arrays: treated as generic input
+# Binary: pass-through when payload-based
+# MixedData: not native in runtime
+
 import asyncio
 from typing import Any
 
@@ -12,7 +23,7 @@ from ..types import (
 )
 
 TIMER_DESCRIPTOR = ServiceRegistryEntry(
-    service_id="timer",
+    service_id="hookup.to/service/timer",
     service_name="Timer",
 )
 

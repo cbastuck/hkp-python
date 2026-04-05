@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# Service Documentation
+# Service ID: http-server-subservices
+# Service Name: HttpServerSubservices
+# Runtime: hkp-python
+# Modes: session pipeline hosting
+# Key Config: host/port/routes/subservices
+# IO: in=request envelope -> out=response envelope
+# Arrays: not primary
+# Binary: depends on endpoint + nested services
+# MixedData: not native in runtime
+
 import asyncio
 import json
 import uuid as _uuid_mod
