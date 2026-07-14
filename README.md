@@ -4,10 +4,28 @@ asyncio port of the hkp-node runtime engine, built with [aiohttp](https://docs.a
 
 ## Setup
 
+From the hkp-python directory:
+
 ```bash
+# 1. Create the venv (or reuse the existing .venv from run_tests.sh)
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+
+# 2. Install the package with all extras (ASR + dev tooling)
+.venv/bin/pip install -r requirements.txt
+
+# 3. Start the runtime (no need to activate the venv)
+.venv/bin/hkp-python
+```
+
+You should see `hkp-python listening on http://127.0.0.1:8080`.
+
+`requirements.txt` is a thin pointer — the actual dependency list lives in
+`pyproject.toml`. To install selectively:
+
+```bash
+pip install -e .          # base runtime only
+pip install -e ".[asr]"   # + speech-to-text (faster-whisper, numpy)
+pip install -e ".[dev]"   # + test tooling
 ```
 
 ## Running the server
@@ -67,6 +85,8 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `map`                     | Transforms payloads via templates (modes: `overwrite`, `add`, `replace`)   |
 | `sub-service`             | Embeds an inner pipeline of services                                       |
 | `http-server-subservices` | Runs an embedded HTTP server that drives an inner pipeline on each request |
+| `hookup.to/service/timer` | Emits ticks on an interval                                                  |
+| `speech-to-text`          | Transcribes 16 kHz mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra) |
 
 ## Testing
 

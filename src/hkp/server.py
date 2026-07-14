@@ -2,18 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Coroutine
 
 import aiohttp_cors
 from aiohttp import WSMsgType, web
 
+from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp
+from .yas import (
+    MessagePurpose,
+    YasError,
+    deserialize_message,
+    is_yas_message,
+    serialize_message,
+)
 from .services.http_server import (
     HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
     HttpServerSubservicesService,
 )
 from .services.map_service import MAP_DESCRIPTOR, MapService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
+from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.timer import TIMER_DESCRIPTOR, TimerService
 from .types import (
@@ -50,6 +60,10 @@ class RuntimeServer:
                 TIMER_DESCRIPTOR,
                 lambda cfg, _cs: TimerService(cfg),
             ),
+            SPEECH_TO_TEXT_DESCRIPTOR.service_id: HostedServiceFactory(
+                SPEECH_TO_TEXT_DESCRIPTOR,
+                lambda cfg, _cs: SpeechToTextService(cfg),
+            ),
         }
 
         self.runtime_app = RuntimeApp(factories)
@@ -57,10 +71,18 @@ class RuntimeServer:
         self._app = self._build_app()
         self._runner: web.AppRunner | None = None
         self._port = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Single worker so pipeline processing stays serialized (services are
+        # not thread-safe) while long-running work (ML inference) does not
+        # block the event loop.
+        self._process_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hkp-process"
+        )
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self, port: int = 0, host: str = "127.0.0.1") -> dict[str, Any]:
+        self._loop = asyncio.get_running_loop()
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
@@ -81,6 +103,8 @@ class RuntimeServer:
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+
+        self._process_executor.shutdown(wait=False, cancel_futures=True)
 
     # ── App construction ───────────────────────────────────────────────────────
 
@@ -144,6 +168,30 @@ class RuntimeServer:
         descriptor = runtime.serialize(self._runtime_output_url(runtime.id))
         return _descriptor_to_dict(descriptor)
 
+    # ── Processing ─────────────────────────────────────────────────────────────
+
+    async def _process_off_loop(self, runtime: HostedRuntime, body: Any) -> Any:
+        """Run the pipeline in the worker thread so slow services (e.g. ML
+        inference) don't stall the event loop."""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._process_executor, runtime.process, body, lambda _n: None
+        )
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Schedule a coroutine on the server loop; safe from worker threads."""
+        loop = self._loop
+        if loop is None:
+            coro.close()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            asyncio.ensure_future(coro)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+
     # ── Notification / result helpers ──────────────────────────────────────────
 
     def _send_notification(
@@ -156,21 +204,27 @@ class RuntimeServer:
             {
                 "type": "notification",
                 "instanceId": notification.instance_id,
-                "value": json.dumps(notification.payload),
+                "value": json.dumps(notification.payload, default=_json_placeholder),
             }
         )
         for ws in list(sockets):
             if not ws.closed:
-                asyncio.ensure_future(ws.send_str(message))
+                self._spawn(ws.send_str(message))
 
     def _send_result(self, runtime_id: str, result: Any) -> None:
         sockets = self._runtime_sockets.get(runtime_id)
         if not sockets:
             return
-        message = json.dumps({"type": "result", "data": result})
+        if _is_binary_result(result):
+            frame = serialize_message(result, purpose=MessagePurpose.RESULT)
+            for ws in list(sockets):
+                if not ws.closed:
+                    self._spawn(ws.send_bytes(frame))
+            return
+        message = json.dumps({"type": "result", "data": _jsonable_result(result)})
         for ws in list(sockets):
             if not ws.closed:
-                asyncio.ensure_future(ws.send_str(message))
+                self._spawn(ws.send_str(message))
 
     def _register_runtime_targets(self, runtime: HostedRuntime) -> None:
         runtime_id = runtime.id
@@ -244,14 +298,28 @@ class RuntimeServer:
 
     async def _process_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
-        try:
-            body = await request.json()
-        except Exception:
-            raise web.HTTPBadRequest()
-        if not isinstance(body, dict):
-            raise web.HTTPBadRequest()
-        result = runtime.process(body, lambda _n: None)
-        return web.json_response(result)
+        raw = await request.read()
+
+        if request.content_type == "application/octet-stream" or is_yas_message(raw):
+            try:
+                body = deserialize_message(raw).data
+            except YasError:
+                raise web.HTTPBadRequest()
+        else:
+            try:
+                body = json.loads(raw)
+            except Exception:
+                raise web.HTTPBadRequest()
+            if not isinstance(body, dict):
+                raise web.HTTPBadRequest()
+
+        result = await self._process_off_loop(runtime, body)
+        if _is_binary_result(result):
+            return web.Response(
+                body=serialize_message(result, purpose=MessagePurpose.RESULT),
+                content_type="application/octet-stream",
+            )
+        return web.json_response(_jsonable_result(result))
 
     # ── /runtimes/{id}/services handlers ──────────────────────────────────────
 
@@ -348,10 +416,50 @@ class RuntimeServer:
                     ):
                         runtime = self.runtime_app.get_runtime(runtime_id)
                         if runtime:
-                            result = runtime.process(data["params"], lambda _n: None)
+                            result = await self._process_off_loop(
+                                runtime, data["params"]
+                            )
                             if not ws.closed:
+                                if _is_binary_result(result):
+                                    await ws.send_bytes(
+                                        serialize_message(
+                                            result, purpose=MessagePurpose.RESULT
+                                        )
+                                    )
+                                else:
+                                    await ws.send_str(
+                                        json.dumps(
+                                            {
+                                                "type": "result",
+                                                "data": _jsonable_result(result),
+                                            }
+                                        )
+                                    )
+                elif msg.type == WSMsgType.BINARY:
+                    # Binary frames are YAS-encoded data to process (the
+                    # frontend ships FloatRingBuffer etc. this way).
+                    try:
+                        message = deserialize_message(msg.data)
+                    except YasError:
+                        continue
+                    runtime = self.runtime_app.get_runtime(runtime_id)
+                    if runtime:
+                        result = await self._process_off_loop(runtime, message.data)
+                        if not ws.closed:
+                            if _is_binary_result(result):
+                                await ws.send_bytes(
+                                    serialize_message(
+                                        result, purpose=MessagePurpose.RESULT
+                                    )
+                                )
+                            else:
                                 await ws.send_str(
-                                    json.dumps({"type": "result", "data": result})
+                                    json.dumps(
+                                        {
+                                            "type": "result",
+                                            "data": _jsonable_result(result),
+                                        }
+                                    )
                                 )
                 elif msg.type == WSMsgType.ERROR:
                     break
@@ -377,6 +485,37 @@ class RuntimeServer:
 
 def create_runtime_server(options: dict[str, Any] | None = None) -> RuntimeServer:
     return RuntimeServer(options or {})
+
+
+# ── Result / notification encoding helpers ─────────────────────────────────────
+
+
+def _is_binary_result(result: Any) -> bool:
+    return isinstance(result, (FloatRingBuffer, BinaryData, TextData))
+
+
+def _jsonable_result(result: Any) -> Any:
+    if isinstance(result, (NullData, UndefinedData)):
+        return None
+    return result
+
+
+def _json_placeholder(value: Any) -> Any:
+    """json.dumps fallback so binary pipeline data can appear in notifications."""
+    if isinstance(value, FloatRingBuffer):
+        return {
+            "type": "FloatRingBuffer",
+            "numSamples": value.num_samples,
+            "id": value.id,
+            "ts": value.ts,
+        }
+    if isinstance(value, BinaryData):
+        return {"type": "BinaryData", "size": len(value.data)}
+    if isinstance(value, TextData):
+        return value.text
+    if isinstance(value, (NullData, UndefinedData)):
+        return None
+    return repr(value)
 
 
 # ── Middleware ─────────────────────────────────────────────────────────────────

@@ -1,0 +1,8 @@
+# Installs hkp-python in editable mode with all optional extras.
+# The dependency list itself lives in pyproject.toml (single source of truth):
+#   [project.dependencies]              — runtime deps (aiohttp, ...)
+#   [project.optional-dependencies].asr — speech-to-text (faster-whisper, numpy)
+#   [project.optional-dependencies].dev — test tooling (pytest, ...)
+#
+# Usage:  pip install -r requirements.txt
+-e .[asr,dev]
