@@ -41,13 +41,37 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `PORT`            | `8080`      | TCP port to listen on                                         |
 | `HOST`            | `0.0.0.0`   | Bind address                                                  |
 | `EXTERNAL_HOST`   | `127.0.0.1` | Host used in `outputUrl` / WebSocket URLs returned to clients |
-| `ALLOWED_ORIGINS` | `*`         | CORS allowed origins                                          |
+| `ALLOWED_ORIGINS` | `*`         | CORS + WebSocket Origin allowlist (comma-separated)           |
+| `AUTH0_DOMAIN`    | —           | Auth0 tenant domain; enables JWT auth together with `AUTH0_AUDIENCE` |
+| `AUTH0_AUDIENCE`  | —           | Expected `aud` claim (the SPA client id — the frontend sends the ID token) |
+| `ALLOWED_EMAILS`  | —           | Comma-separated email allowlist; requires Auth0 config, matched against the **verified** `email` claim |
+| `ALLOW_NO_AUTH`   | —           | `true` permits an unauthenticated non-loopback bind — honored only when running from a source checkout, never for a pip-installed package |
+
+Variables may also be placed in a `.env` file in the project root (real
+environment variables win; set `SKIP_LOADING_ENV=1` to skip it).
 
 Example:
 
 ```bash
 PORT=9000 EXTERNAL_HOST=myhost.local python3 -m hkp
 ```
+
+### Authentication
+
+The auth model mirrors hkp-node exactly, so the same client (hkp-frontend, the
+hkp-node coordinator) works against both runtimes:
+
+- With `AUTH0_DOMAIN` + `AUTH0_AUDIENCE` set, every HTTP request needs
+  `Authorization: Bearer <token>`; WebSocket upgrades take the token from the
+  Authorization header or `?access_token=` (browsers can't set WS headers) and
+  are Origin-checked against `ALLOWED_ORIGINS`.
+- `POST /runtimes/{id}/session-token` (JWT-gated) mints an opaque in-memory
+  token bound to the calling user and that runtime — used by the hkp-node
+  coordinator for long-lived machine calls past JWT expiry. Tokens are purged
+  when the runtime is removed.
+- Fail closed: without Auth0 config the server only starts on a loopback bind
+  (`HOST=127.0.0.1`), or from a source checkout with `ALLOW_NO_AUTH=true`.
+  Setting `ALLOWED_EMAILS` without Auth0 config refuses to start.
 
 ## Running the server using the run_server.sh script
 
@@ -67,6 +91,7 @@ The API mirrors hkp-node exactly.
 | `GET`    | `/runtimes/{id}`                                | Get a runtime                              |
 | `DELETE` | `/runtimes/{id}`                                | Remove a runtime                           |
 | `POST`   | `/runtimes/{id}`                                | Process input through the runtime pipeline |
+| `POST`   | `/runtimes/{id}/session-token`                  | Mint an opaque coordinator session token   |
 | `POST`   | `/runtimes/{id}/rearrange`                      | Reorder services                           |
 | `GET`    | `/runtimes/{id}/services`                       | List services                              |
 | `POST`   | `/runtimes/{id}/services`                       | Add a service                              |

@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Coroutine
 
 import aiohttp_cors
 from aiohttp import WSMsgType, web
 
+from .auth import (
+    AllowedOrigins,
+    AuthConfig,
+    AuthenticatedUser,
+    Authenticator,
+    is_origin_allowed,
+)
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp
 from .yas import (
@@ -34,10 +43,41 @@ from .types import (
 )
 
 
+# Typed request-storage key on aiohttp >= 3.13; plain string on older versions.
+_AUTHENTICATED_USER_KEY: Any = (
+    web.RequestKey("authenticated_user", AuthenticatedUser)
+    if hasattr(web, "RequestKey")
+    else "authenticated_user"
+)
+
+
+@dataclass
+class SessionToken:
+    """A coordinator session token, bound to the user it was minted for and the
+    runtime it grants access to."""
+
+    sub: str
+    runtime_id: str
+
+
 class RuntimeServer:
     def __init__(self, options: dict[str, Any]) -> None:
         self._external_host: str = options.get("external_host", "127.0.0.1")
-        self._allowed_origins: str = options.get("allowed_origins", "*")
+        self._allowed_origins: AllowedOrigins = options.get("allowed_origins", "*")
+        # Tests and local dev default to no auth; __main__.py always resolves an
+        # explicit config and fails closed for non-loopback binds (see
+        # resolve_server_auth_config).
+        self._auth_config: AuthConfig = options.get("auth") or AuthConfig(mode="none")
+        # Coordinator session tokens this runtime has issued (see POST
+        # .../session-token). Opaque, in-memory, and bound to the minting user —
+        # so they resolve back to a real `sub`, not an unscoped superuser. They
+        # live only as long as this process: if the runtime dies, the
+        # coordinator must re-provision (which needs a live user JWT).
+        self._session_tokens: dict[str, SessionToken] = {}
+        self._authenticator = Authenticator(
+            self._auth_config,
+            resolve_opaque_token=self._resolve_session_token,
+        )
 
         factories = {
             MONITOR_DESCRIPTOR.service_id: HostedServiceFactory(
@@ -106,10 +146,54 @@ class RuntimeServer:
 
         self._process_executor.shutdown(wait=False, cancel_futures=True)
 
+    # ── Auth ───────────────────────────────────────────────────────────────────
+
+    def _resolve_session_token(self, token: str) -> AuthenticatedUser | None:
+        session = self._session_tokens.get(token)
+        return AuthenticatedUser(sub=session.sub) if session else None
+
+    def _purge_session_tokens(self, runtime_id: str) -> None:
+        """Drop any session tokens a runtime issued, so a dead runtime's tokens
+        can't linger as valid credentials."""
+        for token, info in list(self._session_tokens.items()):
+            if info.runtime_id == runtime_id:
+                del self._session_tokens[token]
+
+    @web.middleware
+    async def _auth_middleware(self, request: web.Request, handler: Any) -> web.Response:
+        """Authenticate every request with the same rules as hkp-node: HTTP
+        routes take the token from the Authorization header; WebSocket
+        handshakes may also carry it as ?access_token= (browsers can't set
+        headers on a WS upgrade) and are additionally Origin-checked (CSWSH
+        protection)."""
+        if request.method == "OPTIONS":
+            # CORS preflights are unauthenticated by design.
+            return await handler(request)
+
+        is_upgrade = request.headers.get("Upgrade", "").strip().lower() == "websocket"
+
+        header = request.headers.get("Authorization")
+        token = header[7:] if header and header.startswith("Bearer ") else None
+        if is_upgrade:
+            if not is_origin_allowed(
+                request.headers.get("Origin"), self._allowed_origins
+            ):
+                raise web.HTTPForbidden()
+            # Non-browser clients (the coordinator) use the standard
+            # Authorization header, keeping the token out of URLs/logs.
+            token = token or request.query.get("access_token")
+
+        user = await self._authenticator.verify_token(token)
+        if user is None:
+            raise web.HTTPUnauthorized()
+        request[_AUTHENTICATED_USER_KEY] = user
+        return await handler(request)
+
     # ── App construction ───────────────────────────────────────────────────────
 
     def _build_app(self) -> web.Application:
-        app = web.Application(middlewares=[_error_middleware])
+        # Error middleware is outermost so it also renders auth failures.
+        app = web.Application(middlewares=[_error_middleware, self._auth_middleware])
 
         app.router.add_get("/runtimes", self._get_runtimes)
         app.router.add_post("/runtimes", self._post_runtimes)
@@ -117,6 +201,9 @@ class RuntimeServer:
 
         app.router.add_get("/runtimes/{runtime_id}", self._get_runtime)
         app.router.add_delete("/runtimes/{runtime_id}", self._delete_runtime)
+        app.router.add_post(
+            "/runtimes/{runtime_id}/session-token", self._mint_session_token
+        )
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
         app.router.add_post("/runtimes/{runtime_id}", self._process_runtime)
 
@@ -139,16 +226,21 @@ class RuntimeServer:
         # WebSocket endpoint — matches /{runtimeId}
         app.router.add_get("/{runtime_id}", self._websocket_handler)
 
-        # CORS
+        # CORS — honour the allowed-origins list and let the browser send the
+        # Authorization header on authenticated requests.
+        cors_origins = (
+            ["*"] if self._allowed_origins == "*" else list(self._allowed_origins)
+        )
         cors = aiohttp_cors.setup(
             app,
             defaults={
-                "*": aiohttp_cors.ResourceOptions(
+                origin: aiohttp_cors.ResourceOptions(
                     allow_credentials=True,
                     expose_headers="*",
-                    allow_headers=["Content-Type"],
+                    allow_headers=["Content-Type", "Authorization"],
                     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
                 )
+                for origin in cors_origins
             },
         )
         for route in list(app.router.routes()):
@@ -270,6 +362,7 @@ class RuntimeServer:
 
     async def _delete_runtimes(self, request: web.Request) -> web.Response:
         self.runtime_app.remove_all_runtimes()
+        self._session_tokens.clear()
         return web.Response(status=200)
 
     # ── /runtimes/{id} handlers ────────────────────────────────────────────────
@@ -282,7 +375,26 @@ class RuntimeServer:
         runtime_id = request.match_info["runtime_id"]
         if not self.runtime_app.remove_runtime(runtime_id):
             raise web.HTTPNotFound()
+        self._purge_session_tokens(runtime_id)
         return web.json_response({"id": runtime_id})
+
+    async def _mint_session_token(self, request: web.Request) -> web.Response:
+        """Mint a coordinator session token for a runtime. Gated by the normal
+        auth middleware, so the caller must present a valid user JWT (the
+        "bootstrap"). The returned opaque token is bound to that user and this
+        runtime, and the coordinator then uses it for its long-lived machine
+        calls without needing a user JWT that would expire.
+
+        Limitation (v1, same as hkp-node): tokens live only in this process. If
+        the runtime restarts the token is gone and the coordinator must
+        re-provision — which requires a live user JWT.
+        """
+        runtime = self._get_runtime_or_404(request)
+        user = request.get(_AUTHENTICATED_USER_KEY)
+        sub = user.sub if user else "anonymous"
+        token = secrets.token_hex(32)
+        self._session_tokens[token] = SessionToken(sub=sub, runtime_id=runtime.id)
+        return web.json_response({"token": token})
 
     async def _rearrange_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
@@ -528,10 +640,12 @@ async def _error_middleware(request: web.Request, handler: Any) -> web.Response:
     except web.HTTPException:
         raise
     except Exception as exc:
+        # Don't leak internal error details (paths, stack hints) to clients.
+        print(f"[server] Unhandled request error: {exc!r}")
         return web.Response(
             status=500,
             content_type="application/json",
-            text=json.dumps({"error": str(exc)}),
+            text=json.dumps({"error": "Internal Server Error"}),
         )
 
 

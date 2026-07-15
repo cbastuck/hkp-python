@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
     "aiohttp-cors>=0.7",
+    "PyJWT[crypto]>=2.8",
 ]
 
 [project.scripts]
