@@ -70,8 +70,12 @@ hkp-node coordinator) works against both runtimes:
   coordinator for long-lived machine calls past JWT expiry. Tokens are purged
   when the runtime is removed.
 - Fail closed: without Auth0 config the server only starts on a loopback bind
-  (`HOST=127.0.0.1`), or from a source checkout with `ALLOW_NO_AUTH=true`.
+  (`HOST=127.0.0.1`), or from a source checkout with `ALLOW_NO_AUTH=true` — and
+  in both cases it runs **without authentication** (every request is anonymous).
   Setting `ALLOWED_EMAILS` without Auth0 config refuses to start.
+- Auth0 config always wins over the loopback bypass: with `AUTH0_DOMAIN` +
+  `AUTH0_AUDIENCE` set, JWT auth is enforced on any bind — including
+  `127.0.0.1`, which is how to test the authenticated path locally.
 
 ## Running the server using the run_server.sh script
 
@@ -112,6 +116,35 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `http-server-subservices` | Runs an embedded HTTP server that drives an inner pipeline on each request |
 | `hookup.to/service/timer` | Emits ticks on an interval                                                  |
 | `speech-to-text`          | Transcribes 16 kHz mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra) |
+| `text-generation`         | Generates text via a local OpenAI-compatible server (llama-server, Ollama, ...); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
+
+### Text generation backend
+
+The `text-generation` service does not run a model in-process — it talks to any
+locally running server that speaks the OpenAI chat-completions API
+(`POST {serverUrl}/v1/chat/completions`). No extra Python dependencies are needed.
+
+The reference backend is **1-bit Bonsai 27B**
+([prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)) —
+a ~3.9 GB GGUF that retains ~90% of FP16 quality. Its `Q1_0_g128` format needs
+the PrismML fork of llama.cpp (mainline llama.cpp and stock `llama-cpp-python`
+cannot load it):
+
+```bash
+git clone https://github.com/PrismML-Eng/llama.cpp && cd llama.cpp
+cmake -B build && cmake --build build -j        # Metal is the default on macOS
+hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf --local-dir .
+./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --port 8081 -ngl 99
+```
+
+The service's defaults (`serverUrl http://127.0.0.1:8081`, temperature 0.7,
+top-p 0.95, top-k 20) match this setup and the Bonsai model card's recommended
+sampling parameters. For thinking models the reasoning is split off into a
+separate `thinking` field of the output JSON; `text` carries only the answer.
+
+Because the speech-to-text service emits JSON with a `text` key, the two chain
+directly: `audio-input → speech-to-text → text-generation` turns voice notes
+into LLM-processed text with no glue services.
 
 ## Testing
 

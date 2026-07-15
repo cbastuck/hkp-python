@@ -99,6 +99,7 @@ async def test_registry_shape(server_info, base_url, port):
         },
         {"serviceId": "hookup.to/service/timer", "serviceName": "Timer"},
         {"serviceId": "speech-to-text", "serviceName": "Speech To Text"},
+        {"serviceId": "text-generation", "serviceName": "Text Generation"},
     ]
 
     assert len(body["runtimes"]) == 1
@@ -258,6 +259,43 @@ async def test_websocket_process_and_notifications(server_info, port):
             session, f"http://127.0.0.1:{port}/runtimes/rt-1/services/svc-1"
         )
     assert "message" not in svc_state
+
+
+@pytest.mark.asyncio
+async def test_websocket_process_accepts_string_params(server_info, port):
+    """A plain-text Injector sends params as a bare string, not an object —
+    the WS handler must process it like hkp-node (params !== undefined)."""
+    async with aiohttp.ClientSession() as session:
+        runtime = await create_runtime(
+            session,
+            port,
+            services=[{"serviceId": MONITOR_DESCRIPTOR.service_id, "uuid": "svc-1"}],
+        )
+        ws_url = runtime["outputUrl"]
+
+    async def run_ws() -> dict:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url) as ws:
+                await ws.send_str(json.dumps({"type": "readwrite", "id": "rt-1"}))
+                await ws.send_str(
+                    json.dumps(
+                        {
+                            "type": "processRuntime",
+                            "params": "hallo how are you",
+                            "context": None,
+                        }
+                    )
+                )
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        if data.get("type") == "result":
+                            await ws.close()
+                            return data
+        raise AssertionError("socket closed without a result message")
+
+    result = await asyncio.wait_for(run_ws(), timeout=5.0)
+    assert result["data"] == "hallo how are you"
 
 
 @pytest.mark.asyncio

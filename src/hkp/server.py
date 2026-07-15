@@ -33,6 +33,7 @@ from .services.http_server import (
 from .services.map_service import MAP_DESCRIPTOR, MapService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
+from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.timer import TIMER_DESCRIPTOR, TimerService
 from .types import (
@@ -103,6 +104,10 @@ class RuntimeServer:
             SPEECH_TO_TEXT_DESCRIPTOR.service_id: HostedServiceFactory(
                 SPEECH_TO_TEXT_DESCRIPTOR,
                 lambda cfg, _cs: SpeechToTextService(cfg),
+            ),
+            TEXT_GENERATION_DESCRIPTOR.service_id: HostedServiceFactory(
+                TEXT_GENERATION_DESCRIPTOR,
+                lambda cfg, _cs: TextGenerationService(cfg),
             ),
         }
 
@@ -523,9 +528,9 @@ class RuntimeServer:
                     if data.get("type") == "readwrite":
                         continue  # protocol handshake, nothing to do
 
-                    if data.get("type") == "processRuntime" and isinstance(
-                        data.get("params"), dict
-                    ):
+                    # Mirror hkp-node: any JSON params value is processable —
+                    # a plain-text Injector ships a bare string, not an object.
+                    if data.get("type") == "processRuntime" and "params" in data:
                         runtime = self.runtime_app.get_runtime(runtime_id)
                         if runtime:
                             result = await self._process_off_loop(
