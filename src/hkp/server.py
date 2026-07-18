@@ -34,6 +34,8 @@ from .services.map_service import MAP_DESCRIPTOR, MapService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
 from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
+from .services.skill_router import SKILL_ROUTER_DESCRIPTOR, SkillRouterService
+from .services.text_to_speech import TEXT_TO_SPEECH_DESCRIPTOR, TextToSpeechService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.timer import TIMER_DESCRIPTOR, TimerService
 from .types import (
@@ -108,6 +110,14 @@ class RuntimeServer:
             TEXT_GENERATION_DESCRIPTOR.service_id: HostedServiceFactory(
                 TEXT_GENERATION_DESCRIPTOR,
                 lambda cfg, _cs: TextGenerationService(cfg),
+            ),
+            TEXT_TO_SPEECH_DESCRIPTOR.service_id: HostedServiceFactory(
+                TEXT_TO_SPEECH_DESCRIPTOR,
+                lambda cfg, _cs: TextToSpeechService(cfg),
+            ),
+            SKILL_ROUTER_DESCRIPTOR.service_id: HostedServiceFactory(
+                SKILL_ROUTER_DESCRIPTOR,
+                lambda cfg, _cs: SkillRouterService(cfg),
             ),
         }
 

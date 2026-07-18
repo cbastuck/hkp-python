@@ -117,6 +117,8 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `hookup.to/service/timer` | Emits ticks on an interval                                                  |
 | `speech-to-text`          | Transcribes 16 kHz mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra) |
 | `text-generation`         | Generates text via a local OpenAI-compatible server (llama-server, Ollama, ...); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
+| `text-to-speech`          | Synthesizes speech with the local Kokoro-82M model (requires the `tts` extra); accepts a String or JSON with `text`/`prompt`, emits a 24 kHz `FloatRingBuffer` |
+| `skill-router`            | Matches free-form text against configured skills via the local LLM and emits `{ board, payload }` for dispatch (or `null` to stop) |
 
 ### Text generation backend
 
@@ -145,6 +147,65 @@ separate `thinking` field of the output JSON; `text` carries only the answer.
 Because the speech-to-text service emits JSON with a `text` key, the two chain
 directly: `audio-input → speech-to-text → text-generation` turns voice notes
 into LLM-processed text with no glue services.
+
+### Text to speech
+
+The `text-to-speech` service runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+in-process via [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx)
+(onnxruntime — no PyTorch, faster than real time on CPU):
+
+```bash
+pip install -e ".[tts]"
+```
+
+Model files (~310 MB onnx + ~27 MB voices, or ~88 MB with the
+`kokoro-v1.0-int8` model) are downloaded automatically on first use into
+`~/.cache/hkp-python/kokoro` (override with the `modelDir` state).
+
+Config state: `model` (`kokoro-v1.0` | `kokoro-v1.0-int8`), `voice`
+(default `af_heart`), `speed` (0.5–2.0), `lang` (e.g. `en-us`), `modelDir`.
+Input is a String or JSON with a `text`/`prompt` key — the text-generation
+service's output pipes straight in. Output is a 24 kHz mono `FloatRingBuffer`,
+which the browser Audio Output service plays directly (set its `sampleRate`
+state to 24000).
+
+The three services complete a fully local voice loop with no glue:
+`audio-input → speech-to-text → text-generation → text-to-speech → audio-output`.
+
+### Skill routing
+
+The `skill-router` service turns free-form text (e.g. a voice transcript) into
+a dispatch decision. It shares the OpenAI-compatible backend of
+`text-generation` (one LLM call, strict JSON output, thinking disabled).
+Configure it with a `skills` array:
+
+```json
+{
+  "skills": [
+    {
+      "action": "send notification",
+      "board": "send ntfy",
+      "payload": { "topic": "the ntfy topic", "message": "the message text" }
+    }
+  ]
+}
+```
+
+The payload template's keys are the parameter names; its values describe what
+the model should extract. On a match the service emits
+`{ "board": "send ntfy", "payload": { "topic": "X", "message": "hello" } }` —
+in the browser, a Board-Service in "board name from input" mode plays that
+saved board with the payload. Backend errors surface as `{ "error": ... }`.
+
+A match is **early-returned** (`ControlFlowData`): services after the router in
+the same runtime are skipped and the dispatch payload becomes the runtime
+output. The `noMatch` config decides the other branch: `"stop"` (default) ends
+the pipeline, `"forward"` passes the original input to the remaining services —
+chain `skill-router (noMatch: forward) → text-generation → text-to-speech` for
+a voice assistant that acts on matching requests and answers everything else.
+See `hkp-frontend/boards/skill-router-demo-board.json`,
+`voice-assistant-skills-demo-board.json`, and the target board
+`send-ntfy-board.json`.
 
 ## Testing
 

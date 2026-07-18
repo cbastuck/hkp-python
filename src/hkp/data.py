@@ -13,6 +13,7 @@ that travel over the YAS binary wire format.
 
 from array import array
 from dataclasses import dataclass, field
+from typing import Any
 import time
 
 
@@ -63,6 +64,14 @@ class TextData:
 @dataclass
 class BinaryData:
     data: bytes
+
+
+@dataclass
+class ControlFlowData:
+    """Early-return signal: skips the remaining services in the runtime and
+    makes `result` the runtime's output (see the shared data-types table)."""
+
+    result: Any
 
 
 class NullData:

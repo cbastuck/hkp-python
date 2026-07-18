@@ -25,6 +25,10 @@ asr = [
     "faster-whisper>=1.1",
     "numpy>=1.26",
 ]
+tts = [
+    "kokoro-onnx>=0.4",
+    "numpy>=1.26",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hkp"]

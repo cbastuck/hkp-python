@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .data import ControlFlowData
 from .types import (
     HostedService,
     JsonRecord,
@@ -181,6 +182,12 @@ class HostedRuntime:
 
             result = svc.process(result, _make_notify(uuid))
 
+            # Early return: skip the remaining services, the carried result
+            # becomes the runtime's output.
+            early_return = isinstance(result, ControlFlowData)
+            if early_return:
+                result = result.result
+
             self._emit_notification(
                 RuntimeNotification(
                     instance_id=uuid,
@@ -189,7 +196,7 @@ class HostedRuntime:
                 on_notification,
             )
 
-            if result is None:
+            if early_return or result is None:
                 break
 
         return result

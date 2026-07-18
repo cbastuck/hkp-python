@@ -100,6 +100,8 @@ async def test_registry_shape(server_info, base_url, port):
         {"serviceId": "hookup.to/service/timer", "serviceName": "Timer"},
         {"serviceId": "speech-to-text", "serviceName": "Speech To Text"},
         {"serviceId": "text-generation", "serviceName": "Text Generation"},
+        {"serviceId": "text-to-speech", "serviceName": "Text To Speech"},
+        {"serviceId": "skill-router", "serviceName": "Skill Router"},
     ]
 
     assert len(body["runtimes"]) == 1
