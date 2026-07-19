@@ -29,6 +29,9 @@ tts = [
     "kokoro-onnx>=0.4",
     "numpy>=1.26",
 ]
+llm = [
+    "llama-cpp-python>=0.3",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hkp"]

@@ -116,17 +116,20 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `http-server-subservices` | Runs an embedded HTTP server that drives an inner pipeline on each request |
 | `hookup.to/service/timer` | Emits ticks on an interval                                                  |
 | `speech-to-text`          | Transcribes 16 kHz mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra) |
-| `text-generation`         | Generates text via a local OpenAI-compatible server (llama-server, Ollama, ...); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
+| `text-generation`         | Generates text with a local LLM — either via an OpenAI-compatible server (llama-server, Ollama, ...) or by loading a GGUF in-process (requires the `llm` extra); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
 | `text-to-speech`          | Synthesizes speech with the local Kokoro-82M model (requires the `tts` extra); accepts a String or JSON with `text`/`prompt`, emits a 24 kHz `FloatRingBuffer` |
 | `skill-router`            | Matches free-form text against configured skills via the local LLM and emits `{ board, payload }` for dispatch (or `null` to stop) |
 
-### Text generation backend
+### Text generation backends
 
-The `text-generation` service does not run a model in-process — it talks to any
-locally running server that speaks the OpenAI chat-completions API
-(`POST {serverUrl}/v1/chat/completions`). No extra Python dependencies are needed.
+The `text-generation` service has two backends, selected by the `backend`
+state (`"server"`, the default, or `"local"`).
 
-The reference backend is **1-bit Bonsai 27B**
+**Server backend** — the service talks to any locally running server that
+speaks the OpenAI chat-completions API (`POST {serverUrl}/v1/chat/completions`).
+No extra Python dependencies are needed. This is the only way to run quants
+that need a custom llama.cpp build, such as the reference model
+**1-bit Bonsai 27B**
 ([prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf)) —
 a ~3.9 GB GGUF that retains ~90% of FP16 quality. Its `Q1_0_g128` format needs
 the PrismML fork of llama.cpp (mainline llama.cpp and stock `llama-cpp-python`
@@ -139,10 +142,27 @@ hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf --local-dir .
 ./build/bin/llama-server -m Bonsai-27B-Q1_0.gguf --port 8081 -ngl 99
 ```
 
+**Local backend** — for standard GGUFs (Qwen, Llama, Mistral, ...) the service
+loads the model in-process via `llama-cpp-python`, so no external server is
+needed:
+
+```bash
+pip install -e ".[llm]"
+```
+
+Configure `backend: "local"` plus `modelPath` (path to the `.gguf` file;
+`~` expands), and optionally `contextSize` (default 4096) and `gpuLayers`
+(default -1 = offload all layers; Metal/CUDA support depends on how
+`llama-cpp-python` was built). The model loads lazily on first use — status
+notifications go `loading → generating → idle` — and reloads automatically
+when `modelPath`, `contextSize`, or `gpuLayers` change.
+
 The service's defaults (`serverUrl http://127.0.0.1:8081`, temperature 0.7,
-top-p 0.95, top-k 20) match this setup and the Bonsai model card's recommended
-sampling parameters. For thinking models the reasoning is split off into a
-separate `thinking` field of the output JSON; `text` carries only the answer.
+top-p 0.95, top-k 20) match the Bonsai setup above and the model card's
+recommended sampling parameters. For thinking models the reasoning is split
+off into a separate `thinking` field of the output JSON; `text` carries only
+the answer (the `thinking` on/off toggle itself is a llama-server extension
+and applies to the server backend only).
 
 Because the speech-to-text service emits JSON with a `text` key, the two chain
 directly: `audio-input → speech-to-text → text-generation` turns voice notes
@@ -175,9 +195,11 @@ The three services complete a fully local voice loop with no glue:
 ### Skill routing
 
 The `skill-router` service turns free-form text (e.g. a voice transcript) into
-a dispatch decision. It shares the OpenAI-compatible backend of
-`text-generation` (one LLM call, strict JSON output, thinking disabled).
-Configure it with a `skills` array:
+a dispatch decision. It shares the LLM backends of `text-generation` (one LLM
+call, strict JSON output, thinking disabled): `backend: "server"` (default)
+talks to an OpenAI-compatible server via `serverUrl`, `backend: "local"` loads
+a GGUF in-process via `modelPath`/`contextSize`/`gpuLayers` and the `[llm]`
+extra. Configure it with a `skills` array:
 
 ```json
 {

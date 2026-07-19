@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import urllib.error
 from typing import Any
 
@@ -53,6 +54,13 @@ def _chat_response(content: str, **message_extra: Any) -> dict:
     }
 
 
+def _stream_chunks(content: str, pieces: int = 3):
+    """Replay a canned completion as OpenAI-style stream chunks."""
+    step = max(1, -(-len(content) // pieces))
+    for i in range(0, len(content), step):
+        yield {"choices": [{"delta": {"content": content[i : i + step]}}]}
+
+
 @pytest.fixture
 def fake_server(monkeypatch):
     """Returns calls; set calls.response to control the model's reply."""
@@ -63,7 +71,13 @@ def fake_server(monkeypatch):
         calls.append({"url": url, "payload": payload, "timeout": timeout})
         return responses["value"]
 
+    def post_json_stream(url: str, payload: dict, timeout: float):
+        calls.append({"url": url, "payload": payload, "timeout": timeout})
+        message = responses["value"]["choices"][0]["message"]
+        yield from _stream_chunks(message.get("content") or "")
+
     monkeypatch.setattr(skill_router, "_post_json", post_json)
+    monkeypatch.setattr(skill_router, "_post_json_stream", post_json_stream)
     return calls, responses
 
 
@@ -198,6 +212,74 @@ def test_no_configured_skills_returns_none_without_calling_llm(fake_server) -> N
     assert calls == []
 
 
+# ── Streaming ──────────────────────────────────────────────────────────────────
+
+
+def test_streaming_notifies_partial_and_final_text(fake_server, monkeypatch) -> None:
+    # Disable the notification throttle so every chunk is observable: each
+    # monotonic() call advances by a full second.
+    ticks = iter(range(1, 100000))
+    monkeypatch.setattr(skill_router.time, "monotonic", lambda: float(next(ticks)))
+    reply = '{"action": "send notification", "payload": {"topic": "X", "message": "hi"}}'
+    _, responses = fake_server
+    responses["value"] = _chat_response(reply)
+    svc = _make_service()
+    notifications: list = []
+
+    result = svc.process("notify X with hi", _collect_notify(notifications))
+    assert _unwrap(result) == {"board": "send ntfy", "payload": {"topic": "X", "message": "hi"}}
+
+    streamed = [n for n in notifications if isinstance(n, dict) and "streamText" in n]
+    assert len(streamed) > 1
+    # The text grows monotonically and ends with the full model output.
+    for prev, cur in zip(streamed, streamed[1:]):
+        assert cur["streamText"].startswith(prev["streamText"])
+    assert streamed[-1] == {"streamText": reply, "streamDone": True}
+
+    output = next(n for n in notifications if isinstance(n, dict) and "lastOutput" in n)
+    assert output["lastOutput"] == reply
+
+    state = svc.get_state()
+    assert state["stream"] is True
+    assert state["lastRequest"] == "notify X with hi"
+    assert state["lastOutput"] == reply
+    assert state["lastMatch"]["matched"] == "send notification"
+    assert state["lastMatch"]["board"] == "send ntfy"
+
+
+def test_stream_disabled_uses_non_streaming_request(fake_server) -> None:
+    calls, responses = fake_server
+    responses["value"] = _chat_response('{"action": null}')
+    svc = _make_service({"stream": False})
+    notifications: list = []
+
+    assert svc.process("anything", _collect_notify(notifications)) is None
+    assert calls[0]["payload"]["stream"] is False
+    assert not any(isinstance(n, dict) and "streamText" in n for n in notifications)
+    assert svc.get_state()["lastMatch"] == {
+        "matched": None,
+        "durationMs": svc.get_state()["lastMatch"]["durationMs"],
+    }
+
+
+def test_local_backend_streams_by_default(fake_llama_cpp) -> None:
+    fake_llama_cpp.reply = (
+        '{"action": "set timer", "payload": {"seconds": 30}}'
+    )
+    svc = _make_service({"backend": "local", "modelPath": "/models/qwen.gguf"})
+    notifications: list = []
+
+    result = svc.process("timer for 30 seconds", _collect_notify(notifications))
+    assert _unwrap(result) == {"board": "timer board", "payload": {"seconds": 30}}
+
+    llama = fake_llama_cpp.instances[0]
+    assert llama.calls[0]["stream"] is True
+    streamed = [n for n in notifications if isinstance(n, dict) and "streamText" in n]
+    assert streamed
+    assert streamed[-1]["streamText"] == fake_llama_cpp.reply
+    assert streamed[-1]["streamDone"] is True
+
+
 # ── noMatch: forward ───────────────────────────────────────────────────────────
 
 
@@ -229,6 +311,11 @@ def test_invalid_no_match_value_is_ignored() -> None:
 async def _process_via_server(monkeypatch, model_reply: str, no_match: str):
     monkeypatch.setattr(
         skill_router, "_post_json", lambda url, payload, timeout: _chat_response(model_reply)
+    )
+    monkeypatch.setattr(
+        skill_router,
+        "_post_json_stream",
+        lambda url, payload, timeout: _stream_chunks(model_reply),
     )
     from hkp.server import create_runtime_server
 
@@ -283,6 +370,76 @@ async def test_no_match_forward_reaches_downstream_services(monkeypatch) -> None
     assert result == {"fallback": True}
 
 
+# ── Local backend (in-process llama-cpp-python) ────────────────────────────────
+
+
+class _FakeLlama:
+    instances: list["_FakeLlama"] = []
+    reply = '{"action": null}'
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.calls: list[dict] = []
+        _FakeLlama.instances.append(self)
+
+    def create_chat_completion(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            return _stream_chunks(_FakeLlama.reply)
+        return _chat_response(_FakeLlama.reply)
+
+
+@pytest.fixture
+def fake_llama_cpp(monkeypatch):
+    _FakeLlama.instances = []
+    _FakeLlama.reply = '{"action": null}'
+    module = type(sys)("llama_cpp")
+    module.Llama = _FakeLlama
+    monkeypatch.setitem(sys.modules, "llama_cpp", module)
+    return _FakeLlama
+
+
+def test_local_backend_matches_skill(fake_llama_cpp) -> None:
+    fake_llama_cpp.reply = (
+        '{"action": "send notification", "payload": {"topic": "X", "message": "hi"}}'
+    )
+    svc = _make_service({"backend": "local", "modelPath": "/models/qwen.gguf"})
+    notifications: list = []
+
+    result = svc.process("notify X with hi", _collect_notify(notifications))
+    assert _unwrap(result) == {"board": "send ntfy", "payload": {"topic": "X", "message": "hi"}}
+
+    statuses = [n["status"] for n in notifications if isinstance(n, dict) and "status" in n]
+    assert statuses == ["loading", "routing", "idle"]
+
+    llama = fake_llama_cpp.instances[0]
+    assert llama.kwargs["model_path"] == "/models/qwen.gguf"
+    call = llama.calls[0]
+    assert call["temperature"] == 0.1
+    # Thinking is suppressed via the prompt marker (no chat_template_kwargs
+    # support in-process).
+    assert call["messages"][0]["content"].endswith("/no_think")
+    assert "chat_template_kwargs" not in call
+
+    # Second call reuses the loaded model — no reload.
+    svc.process("again", _collect_notify([]))
+    assert len(fake_llama_cpp.instances) == 1
+
+
+def test_local_without_model_path_yields_error() -> None:
+    svc = _make_service({"backend": "local"})
+    result = svc.process("notify x", _collect_notify([]))
+    assert "modelPath" in result["error"]
+
+
+def test_local_missing_dependency_reports_install_hint(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "llama_cpp", None)
+    svc = _make_service({"backend": "local", "modelPath": "/models/qwen.gguf"})
+    result = svc.process("notify x", _collect_notify([]))
+    assert result == {"error": skill_router.INSTALL_HINT}
+    assert svc.get_state()["status"] == "error"
+
+
 # ── Inputs / errors ────────────────────────────────────────────────────────────
 
 
@@ -304,6 +461,7 @@ def test_unreachable_server_reports_hint(monkeypatch) -> None:
         raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
 
     monkeypatch.setattr(skill_router, "_post_json", refuse)
+    monkeypatch.setattr(skill_router, "_post_json_stream", refuse)
     svc = _make_service()
     result = svc.process("notify x", _collect_notify([]))
     assert result == {"error": server_hint("http://127.0.0.1:8081")}

@@ -4,9 +4,18 @@ from __future__ import annotations
 # Service ID: skill-router
 # Service Name: Skill Router
 # Runtime: hkp-python
-# Modes: route (one LLM call, strict JSON output)
-# Key Config: skills (array of {action, board, payload}), serverUrl, model,
-#             temperature, maxTokens, timeoutSec
+# Modes: route (one LLM call, strict JSON output), via one of two backends
+#        selected by the `backend` state — server (default, OpenAI-compatible
+#        HTTP) or local (in-process GGUF via llama-cpp-python), exactly as in
+#        the text-generation service
+# Key Config: skills (array of {action, board, payload}), backend,
+#             serverUrl, model (server backend),
+#             modelPath, contextSize, gpuLayers (local backend),
+#             temperature, maxTokens, timeoutSec,
+#             stream (default true — consume the model output token by token,
+#             notifying the growing text as {streamText} so the service UI's
+#             process view can show the routing decision being generated; the
+#             pipeline output is unaffected and still emitted once, at the end)
 # IO: in=String/TextData (the request) or JSON ({text} | {prompt})
 #     -> out=JSON { board, payload } for the matched skill, or None (stop)
 # Arrays: n/a
@@ -15,7 +24,7 @@ from __future__ import annotations
 #
 # Matches free-form text (e.g. a voice transcript) against a configured set of
 # skills and extracts the payload parameters, using the same local
-# OpenAI-compatible backend as the text-generation service. On a match the
+# LLM backends as the text-generation service. On a match the
 # routing decision is final: the result is early-returned (ControlFlowData),
 # skipping any services after the router in the same runtime. The noMatch
 # config decides the other branch: "stop" (default) ends the pipeline,
@@ -41,7 +50,17 @@ from typing import Any
 
 from ..data import ControlFlowData, TextData
 from ..types import JsonRecord, NotifyCallback, ServiceConfiguration, ServiceRegistryEntry
-from .text_generation import THINK_CLOSE, THINK_OPEN, _post_json, server_hint
+from .text_generation import (
+    _BACKENDS,
+    INSTALL_HINT,
+    THINK_CLOSE,
+    THINK_OPEN,
+    LocalLlm,
+    _consume_stream,
+    _post_json,
+    _post_json_stream,
+    server_hint,
+)
 
 SKILL_ROUTER_DESCRIPTOR = ServiceRegistryEntry(
     service_id="skill-router",
@@ -113,26 +132,36 @@ class SkillRouterService:
 
     def __init__(self, config: ServiceConfiguration, _create_service: Any = None) -> None:
         self.uuid = config.uuid
+        self._backend = "server"
         self._server_url = DEFAULT_SERVER_URL
         self._model = ""
+        self._local = LocalLlm()
         self._skills: list[JsonRecord] = []
         self._temperature = DEFAULT_TEMPERATURE
         self._max_tokens = DEFAULT_MAX_TOKENS
         self._timeout_sec = DEFAULT_TIMEOUT_SEC
         self._no_match: str = "stop"
+        self._stream = True
         self._status = "idle"
-        # The messages of the most recent LLM call — inspectable in the UI to
-        # debug prompt composition and the model's routing behavior.
+        # The most recent LLM call — request text, composed messages, raw model
+        # output, and the routing decision — inspectable in the UI to debug
+        # prompt composition and the model's routing behavior.
         self._last_prompt: list[JsonRecord] = []
+        self._last_request = ""
+        self._last_output = ""
+        self._last_match: JsonRecord | None = None
 
         if config.state:
             self.configure(config.state)
 
     def configure(self, config: JsonRecord) -> JsonRecord:
+        if config.get("backend") in _BACKENDS:
+            self._backend = config["backend"]
         if isinstance(config.get("serverUrl"), str) and config["serverUrl"]:
             self._server_url = config["serverUrl"].rstrip("/")
         if isinstance(config.get("model"), str):
             self._model = config["model"]
+        self._local.configure(config)
         if isinstance(config.get("skills"), list):
             self._skills = [s for s in config["skills"] if _is_skill(s)]
         if isinstance(config.get("temperature"), (int, float)) and not isinstance(
@@ -153,19 +182,27 @@ class SkillRouterService:
             self._timeout_sec = float(config["timeoutSec"])
         if config.get("noMatch") in ("stop", "forward"):
             self._no_match = config["noMatch"]
+        if isinstance(config.get("stream"), bool):
+            self._stream = config["stream"]
         return self.get_state()
 
     def get_state(self) -> JsonRecord:
         return {
+            "backend": self._backend,
             "serverUrl": self._server_url,
             "model": self._model,
+            **self._local.state(),
             "skills": self._skills,
             "temperature": self._temperature,
             "maxTokens": self._max_tokens,
             "timeoutSec": self._timeout_sec,
             "noMatch": self._no_match,
+            "stream": self._stream,
             "status": self._status,
+            "lastRequest": self._last_request,
             "lastPrompt": self._last_prompt,
+            "lastOutput": self._last_output,
+            "lastMatch": self._last_match,
         }
 
     def process(self, input: Any, notify: NotifyCallback) -> Any:
@@ -182,49 +219,103 @@ class SkillRouterService:
             notify({"matched": None, "reason": "no skills configured"})
             return input if self._no_match == "forward" else None
 
-        payload: JsonRecord = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": "Skills:\n"
-                    + json.dumps(
-                        [{"action": s["action"], "payload": s["payload"]} for s in self._skills]
-                    )
-                    + "\n\nRequest:\n"
-                    + text,
-                },
-            ],
-            "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
-            "stream": False,
-            # llama-server extension; harmless elsewhere. Routing output must
-            # not be eaten by an invisible thinking budget.
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        if self._model:
-            payload["model"] = self._model
+        # Routing output must not be eaten by an invisible thinking budget.
+        # The server backend disables thinking via chat_template_kwargs below;
+        # the local backend has no such switch, so use the Qwen-style prompt
+        # marker instead (harmless for non-thinking models).
+        system_prompt = SYSTEM_PROMPT + (" /no_think" if self._backend == "local" else "")
+        messages: list[JsonRecord] = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": "Skills:\n"
+                + json.dumps(
+                    [{"action": s["action"], "payload": s["payload"]} for s in self._skills]
+                )
+                + "\n\nRequest:\n"
+                + text,
+            },
+        ]
 
-        self._last_prompt = payload["messages"]
-        notify({"lastPrompt": self._last_prompt})
-        self._set_status(notify, "routing")
-        started = time.monotonic()
-        try:
-            response = _post_json(
-                f"{self._server_url}/v1/chat/completions", payload, self._timeout_sec
-            )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:200]
-            return self._error(notify, f"server returned HTTP {exc.code}: {detail}")
-        except (urllib.error.URLError, OSError):
-            return self._error(notify, server_hint(self._server_url))
+        self._last_request = text
+        self._last_prompt = messages
+        notify({"lastRequest": text, "lastPrompt": self._last_prompt})
+
+        if self._backend == "local":
+            if not self._local.model_path:
+                return self._error(
+                    notify, "local backend needs a modelPath pointing to a .gguf file"
+                )
+            try:
+                llama = self._local.ensure(
+                    lambda detail: self._set_status(notify, "loading", detail=detail)
+                )
+            except ImportError:
+                return self._error(notify, INSTALL_HINT)
+            except Exception as exc:
+                return self._error(
+                    notify, f"failed to load model '{self._local.model_path}': {exc}"
+                )
+
+            self._set_status(notify, "routing")
+            started = time.monotonic()
+            try:
+                if self._stream:
+                    chunks = llama.create_chat_completion(
+                        messages=messages,
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                        stream=True,
+                    )
+                    response = _consume_stream(chunks, notify)
+                else:
+                    response = llama.create_chat_completion(
+                        messages=messages,
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                    )
+            except Exception as exc:
+                return self._error(notify, f"routing failed: {exc}")
+        else:
+            payload: JsonRecord = {
+                "messages": messages,
+                "temperature": self._temperature,
+                "max_tokens": self._max_tokens,
+                "stream": self._stream,
+                # llama-server extension; harmless elsewhere.
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            if self._model:
+                payload["model"] = self._model
+
+            self._set_status(notify, "routing")
+            started = time.monotonic()
+            try:
+                if self._stream:
+                    chunks = _post_json_stream(
+                        f"{self._server_url}/v1/chat/completions", payload, self._timeout_sec
+                    )
+                    response = _consume_stream(chunks, notify)
+                else:
+                    response = _post_json(
+                        f"{self._server_url}/v1/chat/completions", payload, self._timeout_sec
+                    )
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:200]
+                return self._error(notify, f"server returned HTTP {exc.code}: {detail}")
+            except (urllib.error.URLError, OSError):
+                return self._error(notify, server_hint(self._server_url))
 
         try:
             message = response["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
             return self._error(notify, f"unexpected response shape: {str(response)[:200]}")
 
-        decision = _extract_json_object(_strip_thinking(message))
+        raw_output = _strip_thinking(message)
+        self._last_output = raw_output
+        notify({"lastOutput": raw_output})
+
+        decision = _extract_json_object(raw_output)
         duration_ms = int((time.monotonic() - started) * 1000)
         self._set_status(notify, "idle")
 
@@ -233,7 +324,8 @@ class SkillRouterService:
             # No match, unknown action, or unparseable output — all mean
             # "nothing to dispatch": stop the pipeline, or forward the
             # original input to the services after the router.
-            notify({"matched": None, "durationMs": duration_ms})
+            self._last_match = {"matched": None, "durationMs": duration_ms}
+            notify(dict(self._last_match))
             return input if self._no_match == "forward" else None
 
         extracted = decision.get("payload") if isinstance(decision, dict) else None
@@ -243,7 +335,8 @@ class SkillRouterService:
         result_payload = {k: extracted[k] for k in skill["payload"] if k in extracted}
 
         result = {"board": skill["board"], "payload": result_payload}
-        notify({"matched": skill["action"], "durationMs": duration_ms, **result})
+        self._last_match = {"matched": skill["action"], "durationMs": duration_ms, **result}
+        notify(dict(self._last_match))
         # The routing decision is final — skip any services after the router
         # (e.g. a text-generation fallback) and emit the dispatch payload.
         return ControlFlowData(result)
@@ -252,7 +345,7 @@ class SkillRouterService:
         pass
 
     def destroy(self) -> None:
-        pass
+        self._local.release()
 
     # ── Internals ──────────────────────────────────────────────────────────────
 
@@ -281,9 +374,12 @@ class SkillRouterService:
                 return skill
         return None
 
-    def _set_status(self, notify: NotifyCallback, status: str) -> None:
+    def _set_status(self, notify: NotifyCallback, status: str, detail: str | None = None) -> None:
         self._status = status
-        notify({"status": status})
+        payload: JsonRecord = {"status": status}
+        if detail is not None:
+            payload["detail"] = detail
+        notify(payload)
 
     def _error(self, notify: NotifyCallback, message: str) -> JsonRecord:
         self._set_status(notify, "error")
