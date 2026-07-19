@@ -115,7 +115,7 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `sub-service`             | Embeds an inner pipeline of services                                       |
 | `http-server-subservices` | Runs an embedded HTTP server that drives an inner pipeline on each request |
 | `hookup.to/service/timer` | Emits ticks on an interval                                                  |
-| `speech-to-text`          | Transcribes 16 kHz mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra) |
+| `speech-to-text`          | Transcribes mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra); `sampleRate` config declares the incoming rate (default 16000), other rates are resampled internally |
 | `text-generation`         | Generates text with a local LLM — either via an OpenAI-compatible server (llama-server, Ollama, ...) or by loading a GGUF in-process (requires the `llm` extra); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
 | `text-to-speech`          | Synthesizes speech with the local Kokoro-82M model (requires the `tts` extra); accepts a String or JSON with `text`/`prompt`, emits a 24 kHz `FloatRingBuffer` |
 | `skill-router`            | Matches free-form text against configured skills via the local LLM and emits `{ board, payload }` for dispatch (or `null` to stop) |

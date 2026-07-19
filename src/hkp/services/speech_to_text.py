@@ -7,8 +7,8 @@ from __future__ import annotations
 # Modes: transcribe (faster-whisper backend)
 # Key Config: model (tiny|base|small|medium|large-v3|distil-large-v3),
 #             language ("auto" or ISO code), computeType (int8|int8_float16|float16|float32),
-#             device (auto|cpu|cuda)
-# IO: in=FloatRingBuffer (16 kHz mono float32) -> out=JSON
+#             device (auto|cpu|cuda), sampleRate (rate of incoming samples, default 16000)
+# IO: in=FloatRingBuffer (mono float32 at the configured sampleRate) -> out=JSON
 #     { text, language, languageProbability, durationMs, segments: [{start, end, text}] }
 # Arrays: n/a
 # Binary: consumes FloatRingBuffer; other inputs yield an error JSON
@@ -29,15 +29,25 @@ SPEECH_TO_TEXT_DESCRIPTOR = ServiceRegistryEntry(
     service_name="Speech To Text",
 )
 
-# The pcm mode of the browser Audio Input service emits at this rate; it is
-# also what Whisper-family models expect.
-EXPECTED_SAMPLE_RATE = 16000
+# Whisper-family models require this rate; input at any other configured
+# sampleRate is resampled to it before transcription.
+WHISPER_SAMPLE_RATE = 16000
 
 _MODELS = ["tiny", "base", "small", "medium", "large-v3", "distil-large-v3"]
 _COMPUTE_TYPES = ["int8", "int8_float16", "float16", "float32"]
 _DEVICES = ["auto", "cpu", "cuda"]
 
 INSTALL_HINT = 'faster-whisper is not installed — run: pip install "hkp-python[asr]"'
+
+
+def _resample_linear(audio: Any, from_rate: int, to_rate: int) -> Any:
+    import numpy as np
+
+    if from_rate == to_rate or len(audio) == 0:
+        return audio
+    out_length = int(len(audio) * to_rate / from_rate)
+    positions = np.arange(out_length) * (from_rate / to_rate)
+    return np.interp(positions, np.arange(len(audio)), audio).astype(np.float32)
 
 
 class SpeechToTextService:
@@ -52,6 +62,7 @@ class SpeechToTextService:
         self._language = "auto"
         self._compute_type = "int8"
         self._device = "auto"
+        self._sample_rate = WHISPER_SAMPLE_RATE
         self._model: Any = None
         self._loaded_key: tuple[str, str, str] | None = None
         self._status = "idle"
@@ -68,6 +79,9 @@ class SpeechToTextService:
             self._compute_type = config["computeType"]
         if config.get("device") in _DEVICES:
             self._device = config["device"]
+        sample_rate = config.get("sampleRate")
+        if isinstance(sample_rate, (int, float)) and sample_rate > 0:
+            self._sample_rate = int(sample_rate)
 
         # Drop the cached model if its parameters changed; it reloads lazily.
         if self._loaded_key is not None and self._loaded_key != self._model_key():
@@ -81,6 +95,7 @@ class SpeechToTextService:
             "language": self._language,
             "computeType": self._compute_type,
             "device": self._device,
+            "sampleRate": self._sample_rate,
             "status": self._status,
             "availableModels": _MODELS,
         }
@@ -89,7 +104,10 @@ class SpeechToTextService:
         if input is None:
             return None
         if not isinstance(input, FloatRingBuffer):
-            return self._error(notify, "speech-to-text expects FloatRingBuffer input (16 kHz mono float32)")
+            return self._error(
+                notify,
+                "speech-to-text expects FloatRingBuffer input (mono float32 at the configured sampleRate)",
+            )
 
         try:
             model = self._ensure_model(notify)
@@ -101,7 +119,9 @@ class SpeechToTextService:
         import numpy as np
 
         audio = np.frombuffer(input.samples, dtype=np.float32)
-        duration_ms = int(len(audio) / EXPECTED_SAMPLE_RATE * 1000)
+        duration_ms = int(len(audio) / self._sample_rate * 1000)
+        if self._sample_rate != WHISPER_SAMPLE_RATE:
+            audio = _resample_linear(audio, self._sample_rate, WHISPER_SAMPLE_RATE)
 
         self._set_status(notify, "transcribing")
         try:

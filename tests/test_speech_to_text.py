@@ -43,6 +43,7 @@ class _FakeInfo:
 
 class _FakeWhisperModel:
     created_with: dict | None = None
+    last_audio = None
 
     def __init__(self, model_name: str, device: str = "auto", compute_type: str = "int8"):
         _FakeWhisperModel.created_with = {
@@ -52,6 +53,7 @@ class _FakeWhisperModel:
         }
 
     def transcribe(self, audio, language=None):
+        _FakeWhisperModel.last_audio = audio
         segments = [
             _FakeSegment(0.0, 1.2, " Hello "),
             _FakeSegment(1.2, 2.0, " world. "),
@@ -65,6 +67,7 @@ def fake_faster_whisper(monkeypatch):
     module.WhisperModel = _FakeWhisperModel
     monkeypatch.setitem(sys.modules, "faster_whisper", module)
     _FakeWhisperModel.created_with = None
+    _FakeWhisperModel.last_audio = None
     return module
 
 
@@ -115,6 +118,23 @@ def test_transcribes_ring_buffer(fake_faster_whisper) -> None:
     statuses = [n["status"] for n in notifications if isinstance(n, dict) and "status" in n]
     assert statuses[-1] == "idle"
     assert any("loading" in s for s in statuses)
+
+
+def test_resamples_configured_sample_rate_to_whisper_rate(fake_faster_whisper) -> None:
+    svc = _make_service({"model": "tiny", "sampleRate": 24000})
+    assert svc.get_state()["sampleRate"] == 24000
+    rb = FloatRingBuffer.from_floats([0.0] * 24000)  # 1 second at 24 kHz
+
+    result = svc.process(rb, _collect_notify([]))
+
+    assert result["durationMs"] == 1000
+    assert len(_FakeWhisperModel.last_audio) == 16000
+
+
+def test_invalid_sample_rate_ignored() -> None:
+    svc = _make_service()
+    svc.configure({"sampleRate": -1})
+    assert svc.get_state()["sampleRate"] == 16000
 
 
 def test_model_reloads_after_reconfigure(fake_faster_whisper) -> None:
