@@ -46,7 +46,16 @@ class TimerService:
     version: str | None = None
     capabilities: list[str] | None = None
 
-    def __init__(self, config: ServiceConfiguration) -> None:
+    def __init__(
+        self,
+        config: ServiceConfiguration,
+        min_interval_ms: float = 0,
+    ) -> None:
+        # Lower bound on the periodic interval. On a shared host a very short
+        # period is a way for one tenant to spend everyone's CPU, so the server
+        # supplies a floor and ticks are clamped to it.
+        self._min_interval_ms = min_interval_ms
+
         self.uuid = config.uuid
         self._periodic = False
         self._periodic_value = 1
@@ -162,7 +171,13 @@ class TimerService:
     def _schedule(self, immediate: bool = False) -> None:
         if self._periodic:
             self._cancel_task()
-            interval_s = _duration_ms(self._periodic_value, self._periodic_unit) / 1000
+            interval_s = (
+                max(
+                    _duration_ms(self._periodic_value, self._periodic_unit),
+                    self._min_interval_ms,
+                )
+                / 1000
+            )
             first_delay_s = 0.001 if immediate else interval_s
             self._run_soon(self._periodic_loop(first_delay_s, interval_s))
         else:
@@ -203,7 +218,9 @@ class TimerService:
             result = self._host.process_from(
                 self.uuid,
                 merged,
-                lambda n: self._notify(n.payload, n.instance_id),
+                # No-op: the runtime already fans these out to its notification
+                # targets. Re-notifying through the host would deliver each twice.
+                lambda _n: None,
             )
             self._host.emit_result(result)
 
@@ -221,7 +238,9 @@ class TimerService:
             result = self._host.process_from(
                 self.uuid,
                 {"triggerCount": trigger_count},
-                lambda n: self._notify(n.payload, n.instance_id),
+                # No-op: the runtime already fans these out to its notification
+                # targets. Re-notifying through the host would deliver each twice.
+                lambda _n: None,
             )
             self._host.emit_result(result)
 

@@ -29,6 +29,21 @@ class AuthenticatedUser:
     email: str | None = None
 
 
+#: Owner key used when authentication is disabled. Every request collapses into
+#: this single tenant, which is exactly the pre-multi-tenancy behaviour.
+ANONYMOUS_SUB = "anonymous"
+
+
+def owner_key_of(user: AuthenticatedUser | None) -> str:
+    """The tenant a request belongs to.
+
+    Runtimes are namespaced by this key, so a runtime id is only ever resolved
+    within the caller's own namespace. Matches the ``userId`` the coordinator
+    uses, so a coordinator-provisioned runtime lands where the browser looks.
+    """
+    return user.sub if user else ANONYMOUS_SUB
+
+
 @dataclass
 class AuthConfig:
     """How requests are authenticated.

@@ -16,9 +16,11 @@ from .auth import (
     AuthenticatedUser,
     Authenticator,
     is_origin_allowed,
+    owner_key_of,
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
-from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp
+from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
+from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp, TenantRuntimes
 from .yas import (
     MessagePurpose,
     YasError,
@@ -54,6 +56,17 @@ _AUTHENTICATED_USER_KEY: Any = (
 )
 
 
+#: Largest accepted request body on a public service endpoint (25 MB).
+DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
+
+
+def _tenant_key(owner: str, runtime_id: str) -> str:
+    """Runtime ids are unique per tenant, not globally, so anything keyed by
+    runtime outside a tenant view (socket sets) must be keyed by both. NUL
+    cannot occur in either part, so the join is unambiguous."""
+    return f"{owner}\x00{runtime_id}"
+
+
 @dataclass
 class SessionToken:
     """A coordinator session token, bound to the user it was minted for and the
@@ -77,9 +90,36 @@ class RuntimeServer:
         # live only as long as this process: if the runtime dies, the
         # coordinator must re-provision (which needs a live user JWT).
         self._session_tokens: dict[str, SessionToken] = {}
-        self._authenticator = Authenticator(
-            self._auth_config,
-            resolve_opaque_token=self._resolve_session_token,
+        # Per-tenant limits. Runtimes, services and timers all consume resources
+        # on a shared host, so without a cap one tenant can degrade the server
+        # for everyone. 0 / unset means unlimited, which is the right default
+        # for a single-user instance and for local development.
+        quotas: dict[str, Any] = options.get("quotas") or {}
+        self._max_runtimes_per_user: int = quotas.get("max_runtimes_per_user") or 0
+        self._max_services_per_runtime: int = (
+            quotas.get("max_services_per_runtime") or 0
+        )
+        self._min_timer_interval_ms: int = quotas.get("min_timer_interval_ms") or 0
+        # Unlike the other quotas this defaults to a real value rather than
+        # unlimited: service endpoints take no token, so "off" would make the
+        # dangerous choice the automatic one.
+        self._max_request_body_bytes: int = (
+            quotas["max_request_body_bytes"]
+            if "max_request_body_bytes" in quotas
+            else DEFAULT_MAX_REQUEST_BODY_BYTES
+        )
+        # Builds the authenticator, defaulting to a JWKS-backed one for `auth`.
+        # Overriding it replaces only how a raw token is verified — the server
+        # still resolves its own session tokens first, by passing the resolver it
+        # owns into whatever this returns.
+        build_authenticator = options.get("build_authenticator")
+        self._authenticator = (
+            build_authenticator(self._resolve_session_token)
+            if build_authenticator
+            else Authenticator(
+                self._auth_config,
+                resolve_opaque_token=self._resolve_session_token,
+            )
         )
 
         factories = {
@@ -97,11 +137,13 @@ class RuntimeServer:
             ),
             HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id: HostedServiceFactory(
                 HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
-                lambda cfg, cs: HttpServerSubservicesService(cfg, cs),
+                lambda cfg, cs: HttpServerSubservicesService(
+                    cfg, cs, self._max_request_body_bytes
+                ),
             ),
             TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
                 TIMER_DESCRIPTOR,
-                lambda cfg, _cs: TimerService(cfg),
+                lambda cfg, _cs: TimerService(cfg, self._min_timer_interval_ms),
             ),
             SPEECH_TO_TEXT_DESCRIPTOR.service_id: HostedServiceFactory(
                 SPEECH_TO_TEXT_DESCRIPTOR,
@@ -121,7 +163,19 @@ class RuntimeServer:
             ),
         }
 
-        self.runtime_app = RuntimeApp(factories)
+        # Public service endpoints. Declared before the runtime app because
+        # runtimes hand mounts to their services as they are created.
+        self._mounts = MountRegistry(self._public_mount_url)
+        self.runtime_app = RuntimeApp(
+            factories,
+            mounts_for=lambda owner, runtime_id: RuntimeMounts(
+                mount=lambda service_uuid, handler: self._mounts.register(
+                    owner, runtime_id, service_uuid, handler
+                )
+            ),
+        )
+        # Keyed by _tenant_key(owner, runtime_id), not runtime id alone: ids are
+        # unique per tenant, not globally.
         self._runtime_sockets: dict[str, set[web.WebSocketResponse]] = {}
         self._app = self._build_app()
         self._runner: web.AppRunner | None = None
@@ -163,15 +217,35 @@ class RuntimeServer:
 
     # ── Auth ───────────────────────────────────────────────────────────────────
 
+    def _at_quota(self, count: int, limit: int) -> bool:
+        """True when adding one more to ``count`` would pass ``limit``."""
+        return limit > 0 and count >= limit
+
+    def _exceeds_quota(self, count: int, limit: int) -> bool:
+        """True when ``count`` items is already more than ``limit`` allows."""
+        return limit > 0 and count > limit
+
+    def _tenant_of(self, request: web.Request) -> TenantRuntimes:
+        """The caller's runtime namespace. Every route resolves through it."""
+        return self.runtime_app.for_owner(self._owner_of(request))
+
+    def _owner_of(self, request: web.Request) -> str:
+        return owner_key_of(request.get(_AUTHENTICATED_USER_KEY))
+
     def _resolve_session_token(self, token: str) -> AuthenticatedUser | None:
         session = self._session_tokens.get(token)
         return AuthenticatedUser(sub=session.sub) if session else None
 
-    def _purge_session_tokens(self, runtime_id: str) -> None:
+    def _purge_session_tokens(self, owner: str, runtime_id: str) -> None:
         """Drop any session tokens a runtime issued, so a dead runtime's tokens
         can't linger as valid credentials."""
         for token, info in list(self._session_tokens.items()):
-            if info.runtime_id == runtime_id:
+            if info.sub == owner and info.runtime_id == runtime_id:
+                del self._session_tokens[token]
+
+    def _purge_owner_session_tokens(self, owner: str) -> None:
+        for token, info in list(self._session_tokens.items()):
+            if info.sub == owner:
                 del self._session_tokens[token]
 
     @web.middleware
@@ -183,6 +257,12 @@ class RuntimeServer:
         protection)."""
         if request.method == "OPTIONS":
             # CORS preflights are unauthenticated by design.
+            return await handler(request)
+
+        # Service endpoints exist to be called by outside parties (webhooks,
+        # uploads) that hold no token; their unguessable mount id is what gates
+        # access. Checked before anything else so no auth failure can shadow them.
+        if request.path.startswith(f"{MOUNT_PREFIX}/"):
             return await handler(request)
 
         is_upgrade = request.headers.get("Upgrade", "").strip().lower() == "websocket"
@@ -209,6 +289,11 @@ class RuntimeServer:
     def _build_app(self) -> web.Application:
         # Error middleware is outermost so it also renders auth failures.
         app = web.Application(middlewares=[_error_middleware, self._auth_middleware])
+
+        app.router.add_route("*", f"{MOUNT_PREFIX}/{{mount_id}}", self._mounts.handle)
+        app.router.add_route(
+            "*", f"{MOUNT_PREFIX}/{{mount_id}}/{{sub_path:.*}}", self._mounts.handle
+        )
 
         app.router.add_get("/runtimes", self._get_runtimes)
         app.router.add_post("/runtimes", self._post_runtimes)
@@ -268,6 +353,11 @@ class RuntimeServer:
 
     # ── URL helper ─────────────────────────────────────────────────────────────
 
+    def _public_mount_url(self, mount_path: str) -> str | None:
+        if not self._port:
+            return None
+        return f"http://{self._external_host}:{self._port}{mount_path}"
+
     def _runtime_output_url(self, runtime_id: str) -> str:
         return f"ws://{self._external_host}:{self._port}/{runtime_id}"
 
@@ -302,9 +392,9 @@ class RuntimeServer:
     # ── Notification / result helpers ──────────────────────────────────────────
 
     def _send_notification(
-        self, runtime_id: str, notification: RuntimeNotification
+        self, socket_key: str, notification: RuntimeNotification
     ) -> None:
-        sockets = self._runtime_sockets.get(runtime_id)
+        sockets = self._runtime_sockets.get(socket_key)
         if not sockets:
             return
         message = json.dumps(
@@ -318,8 +408,8 @@ class RuntimeServer:
             if not ws.closed:
                 self._spawn(ws.send_str(message))
 
-    def _send_result(self, runtime_id: str, result: Any) -> None:
-        sockets = self._runtime_sockets.get(runtime_id)
+    def _send_result(self, socket_key: str, result: Any) -> None:
+        sockets = self._runtime_sockets.get(socket_key)
         if not sockets:
             return
         if _is_binary_result(result):
@@ -333,13 +423,13 @@ class RuntimeServer:
             if not ws.closed:
                 self._spawn(ws.send_str(message))
 
-    def _register_runtime_targets(self, runtime: HostedRuntime) -> None:
-        runtime_id = runtime.id
+    def _register_runtime_targets(self, owner: str, runtime: HostedRuntime) -> None:
+        socket_key = _tenant_key(owner, runtime.id)
         runtime.register_notification_target(
-            lambda n: self._send_notification(runtime_id, n)
+            lambda n: self._send_notification(socket_key, n)
         )
         runtime.register_result_target(
-            lambda result: self._send_result(runtime_id, result)
+            lambda result: self._send_result(socket_key, result)
         )
 
     # ── /runtimes handlers ─────────────────────────────────────────────────────
@@ -348,8 +438,10 @@ class RuntimeServer:
         return web.json_response(
             {
                 "runtimes": [
-                    self._serialize_runtime(rt) for rt in self.runtime_app.get_runtimes()
+                    self._serialize_runtime(rt)
+                    for rt in self._tenant_of(request).get_runtimes()
                 ],
+                # The service registry is a property of the build, not a tenant.
                 "registry": self.runtime_app.get_registry(),
             }
         )
@@ -360,6 +452,8 @@ class RuntimeServer:
         except Exception:
             raise web.HTTPBadRequest()
 
+        owner = self._owner_of(request)
+        tenant = self._tenant_of(request)
         payloads = body if isinstance(body, list) else [body]
         runtimes = []
 
@@ -367,8 +461,35 @@ class RuntimeServer:
             config = _validate_runtime_configuration(payload)
             if config is None:
                 raise web.HTTPBadRequest()
-            runtime = self.runtime_app.create_runtime(config)
-            self._register_runtime_targets(runtime)
+
+            # Quotas apply only to genuinely new runtimes — re-creating one that
+            # already exists must not be refused for being over the limit.
+            is_new = tenant.get_runtime(config.id) is None
+            if is_new and self._at_quota(
+                len(tenant.get_runtimes()), self._max_runtimes_per_user
+            ):
+                raise web.HTTPTooManyRequests(
+                    text=json.dumps(
+                        {
+                            "error": f"Runtime limit reached ({self._max_runtimes_per_user})"
+                        }
+                    ),
+                    content_type="application/json",
+                )
+            if self._exceeds_quota(
+                len(config.services), self._max_services_per_runtime
+            ):
+                raise web.HTTPTooManyRequests(
+                    text=json.dumps(
+                        {
+                            "error": f"Service limit reached ({self._max_services_per_runtime})"
+                        }
+                    ),
+                    content_type="application/json",
+                )
+
+            runtime = tenant.create_runtime(config)
+            self._register_runtime_targets(owner, runtime)
             runtimes.append(self._serialize_runtime(runtime))
 
         return web.json_response(
@@ -376,8 +497,10 @@ class RuntimeServer:
         )
 
     async def _delete_runtimes(self, request: web.Request) -> web.Response:
-        self.runtime_app.remove_all_runtimes()
-        self._session_tokens.clear()
+        owner = self._owner_of(request)
+        self.runtime_app.remove_all_runtimes(owner)
+        self._mounts.release_owner(owner)
+        self._purge_owner_session_tokens(owner)
         return web.Response(status=200)
 
     # ── /runtimes/{id} handlers ────────────────────────────────────────────────
@@ -388,9 +511,13 @@ class RuntimeServer:
 
     async def _delete_runtime(self, request: web.Request) -> web.Response:
         runtime_id = request.match_info["runtime_id"]
-        if not self.runtime_app.remove_runtime(runtime_id):
+        owner = self._owner_of(request)
+        # Scoped to the caller, so this can only ever remove their own runtime;
+        # an id owned by another tenant is indistinguishable from a missing one.
+        if not self.runtime_app.remove_runtime(owner, runtime_id):
             raise web.HTTPNotFound()
-        self._purge_session_tokens(runtime_id)
+        self._mounts.release_runtime(owner, runtime_id)
+        self._purge_session_tokens(owner, runtime_id)
         return web.json_response({"id": runtime_id})
 
     async def _mint_session_token(self, request: web.Request) -> web.Response:
@@ -405,8 +532,7 @@ class RuntimeServer:
         re-provision — which requires a live user JWT.
         """
         runtime = self._get_runtime_or_404(request)
-        user = request.get(_AUTHENTICATED_USER_KEY)
-        sub = user.sub if user else "anonymous"
+        sub = self._owner_of(request)
         token = secrets.token_hex(32)
         self._session_tokens[token] = SessionToken(sub=sub, runtime_id=runtime.id)
         return web.json_response({"token": token})
@@ -465,6 +591,17 @@ class RuntimeServer:
         config = _validate_service_configuration(body)
         if config is None:
             raise web.HTTPBadRequest()
+        if self._at_quota(
+            len(runtime.list_services()), self._max_services_per_runtime
+        ):
+            raise web.HTTPTooManyRequests(
+                text=json.dumps(
+                    {
+                        "error": f"Service limit reached ({self._max_services_per_runtime})"
+                    }
+                ),
+                content_type="application/json",
+            )
         try:
             state = runtime.add_service(config)
         except Exception:
@@ -518,13 +655,18 @@ class RuntimeServer:
 
     async def _websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
         runtime_id = request.match_info["runtime_id"]
-        if not self.runtime_app.get_runtime(runtime_id):
+        # The runtime is resolved in the authenticated user's namespace, so a
+        # token cannot open a socket onto another tenant's runtime; an id owned
+        # by someone else is indistinguishable from one that does not exist.
+        owner = self._owner_of(request)
+        if not self.runtime_app.get_runtime(owner, runtime_id):
             raise web.HTTPNotFound()
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        sockets = self._runtime_sockets.setdefault(runtime_id, set())
+        socket_key = _tenant_key(owner, runtime_id)
+        sockets = self._runtime_sockets.setdefault(socket_key, set())
         sockets.add(ws)
 
         try:
@@ -541,7 +683,7 @@ class RuntimeServer:
                     # Mirror hkp-node: any JSON params value is processable —
                     # a plain-text Injector ships a bare string, not an object.
                     if data.get("type") == "processRuntime" and "params" in data:
-                        runtime = self.runtime_app.get_runtime(runtime_id)
+                        runtime = self.runtime_app.get_runtime(owner, runtime_id)
                         if runtime:
                             result = await self._process_off_loop(
                                 runtime, data["params"]
@@ -569,7 +711,7 @@ class RuntimeServer:
                         message = deserialize_message(msg.data)
                     except YasError:
                         continue
-                    runtime = self.runtime_app.get_runtime(runtime_id)
+                    runtime = self.runtime_app.get_runtime(owner, runtime_id)
                     if runtime:
                         result = await self._process_off_loop(runtime, message.data)
                         if not ws.closed:
@@ -593,15 +735,20 @@ class RuntimeServer:
         finally:
             sockets.discard(ws)
             if not sockets:
-                self._runtime_sockets.pop(runtime_id, None)
+                self._runtime_sockets.pop(socket_key, None)
 
         return ws
 
     # ── Utility ────────────────────────────────────────────────────────────────
 
     def _get_runtime_or_404(self, request: web.Request) -> HostedRuntime:
+        """Resolve a runtime inside the caller's namespace.
+
+        A runtime owned by another tenant is reported as 404 rather than 403, so
+        runtime ids belonging to other users cannot be probed for existence.
+        """
         runtime_id = request.match_info["runtime_id"]
-        runtime = self.runtime_app.get_runtime(runtime_id)
+        runtime = self._tenant_of(request).get_runtime(runtime_id)
         if not runtime:
             raise web.HTTPNotFound()
         return runtime
