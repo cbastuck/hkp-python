@@ -136,7 +136,9 @@ class HttpServerSubservicesService:
             "bypass": self._bypass,
             "mode": self._mode,
             # Public endpoint assigned by the runtime; empty while bypassed.
-            "url": self._mount.url if self._mount else "",
+            # Reserved name: generic board machinery reads and rewrites it (see
+            # the frontend's runtime/board/mount).
+            "__hkpMount": self._mount.url if self._mount else "",
             "pipeline": self._get_pipeline_state(),
         }
 
@@ -170,7 +172,7 @@ class HttpServerSubservicesService:
         self._mount = mount
         # A board reads the assigned endpoint from here (or from state), since
         # it is not knowable at design time.
-        self._do_notify({"url": mount.url}, self.uuid)
+        self._do_notify({"__hkpMount": mount.url}, self.uuid)
 
     def _release_mount(self) -> None:
         if self._mount:

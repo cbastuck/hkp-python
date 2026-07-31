@@ -77,7 +77,7 @@ async def make_endpoint(
         f"{base_url}/runtimes/{runtime_id}/services/http-1", headers=headers or {}
     ) as res:
         assert res.status == 200
-        return (await res.json())["url"]
+        return (await res.json())["__hkpMount"]
 
 
 @pytest.mark.asyncio
@@ -145,7 +145,7 @@ async def test_endpoint_released_on_bypass(servers):
             f"{base_url}/runtimes/rt-1/services/http-1", json={"bypass": True}
         ) as res:
             assert res.status == 200
-            assert (await res.json())["url"] == ""
+            assert (await res.json())["__hkpMount"] == ""
 
         async with session.get(f"{endpoint}/hello") as res:
             assert res.status == 404

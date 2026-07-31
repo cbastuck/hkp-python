@@ -461,7 +461,7 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
             f"http://127.0.0.1:{port}/runtimes/rt-1/services/http-sub-1",
             {"bypass": False},
         )
-        endpoint = configure_resp["url"]
+        endpoint = configure_resp["__hkpMount"]
         assert re.search(r"/hosted/[0-9a-f]{32}$", endpoint), endpoint
 
         ws_url = f"ws://127.0.0.1:{port}/rt-1"
