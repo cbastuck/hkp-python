@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .data import ControlFlowData
+from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .types import (
     HostedService,
     JsonRecord,
@@ -18,7 +19,13 @@ from .types import (
 
 
 class HostedRuntime:
-    def __init__(self, config: RuntimeConfiguration, create_service: ServiceCreator) -> None:
+    def __init__(
+        self,
+        config: RuntimeConfiguration,
+        create_service: ServiceCreator,
+        mounts: RuntimeMounts | None = None,
+    ) -> None:
+        self._mounts = mounts
         self.id = config.id
         self.name = config.name
         self.board_name = config.board_name
@@ -137,7 +144,39 @@ class HostedRuntime:
             start_index = self._service_order.index(start_after_uuid) + 1
         except ValueError:
             start_index = len(self._service_order)
+
+        # A service pushing from itself (a Timer tick, an inbound request) was
+        # never called by the loop below, so the loop never reported it. Report
+        # it here, or the UI shows a service producing nothing while the service
+        # after it plainly receives data.
+        self._emit_notification(
+            RuntimeNotification(
+                instance_id=start_after_uuid,
+                payload={"__internal": {"state": "call-process", "data": None}},
+            ),
+            on_notification,
+        )
+        self._emit_notification(
+            RuntimeNotification(
+                instance_id=start_after_uuid,
+                payload={"__internal": {"state": "call-process-finished", "data": data}},
+            ),
+            on_notification,
+        )
+
         return self._process_from_index(start_index, data, on_notification)
+
+    def mount(self, service_uuid: str, handler: MountHandler) -> MountHandle | None:
+        """Claim a publicly reachable endpoint served by the shared server.
+
+        Returns None when the host cannot serve mounts — an inner sub-service
+        pipeline, or a server that is not listening yet — in which case the
+        service has no public endpoint and should say so in its state rather
+        than falling back to a port of its own.
+        """
+        if not self._mounts:
+            return None
+        return self._mounts.mount(service_uuid, handler)
 
     def notify(self, payload: Any, instance_id: str) -> None:
         self._emit_notification(
@@ -227,36 +266,91 @@ class HostedServiceFactory:
         return self._create_fn(config, create_service)
 
 
-class RuntimeApp:
-    def __init__(self, registry: dict[str, HostedServiceFactory]) -> None:
-        self._registry = registry
-        self._runtimes: dict[str, HostedRuntime] = {}
+class TenantRuntimes:
+    """A single tenant's view of the runtime app.
+
+    Runtime ids are only unique within an owner — boards ship stable,
+    human-readable ids (``node``, ``chat-node``), so two users loading the same
+    board must each get their own runtime rather than sharing one. Every route
+    resolves runtimes through one of these views, so a handler cannot reach
+    another tenant's runtime even by id.
+    """
+
+    def __init__(self, owner: str, app: "RuntimeApp") -> None:
+        self.owner = owner
+        self._app = app
 
     def create_runtime(self, config: RuntimeConfiguration) -> HostedRuntime:
-        existing = self._runtimes.get(config.id)
-        if existing:
-            existing.destroy()
-        runtime = HostedRuntime(config, self.create_service)
-        self._runtimes[runtime.id] = runtime
-        return runtime
+        return self._app.create_runtime(self.owner, config)
 
     def get_runtime(self, runtime_id: str) -> HostedRuntime | None:
-        return self._runtimes.get(runtime_id)
+        return self._app.get_runtime(self.owner, runtime_id)
 
     def get_runtimes(self) -> list[HostedRuntime]:
-        return list(self._runtimes.values())
+        return self._app.get_runtimes(self.owner)
 
     def remove_runtime(self, runtime_id: str) -> bool:
-        runtime = self._runtimes.pop(runtime_id, None)
+        return self._app.remove_runtime(self.owner, runtime_id)
+
+    def remove_all_runtimes(self) -> None:
+        self._app.remove_all_runtimes(self.owner)
+
+
+class RuntimeApp:
+    def __init__(
+        self,
+        registry: dict[str, HostedServiceFactory],
+        # Supplied by the server, which owns the listening socket. Absent in
+        # tests and anywhere runtimes need no public endpoints.
+        mounts_for: Callable[[str, str], RuntimeMounts] | None = None,
+    ) -> None:
+        self._registry = registry
+        self._mounts_for = mounts_for
+        # owner key -> runtime id -> runtime. The owner key is the authenticated
+        # ``sub`` (or "anonymous" when auth is off, collapsing to one bucket).
+        self._runtimes: dict[str, dict[str, HostedRuntime]] = {}
+
+    def for_owner(self, owner: str) -> TenantRuntimes:
+        """A tenant-scoped view; the only way route handlers reach runtimes."""
+        return TenantRuntimes(owner, self)
+
+    def create_runtime(self, owner: str, config: RuntimeConfiguration) -> HostedRuntime:
+        owned = self._runtimes.setdefault(owner, {})
+        existing = owned.get(config.id)
+        if existing:
+            existing.destroy()
+        runtime = HostedRuntime(
+            config,
+            self.create_service,
+            self._mounts_for(owner, config.id) if self._mounts_for else None,
+        )
+        owned[runtime.id] = runtime
+        return runtime
+
+    def get_runtime(self, owner: str, runtime_id: str) -> HostedRuntime | None:
+        return self._runtimes.get(owner, {}).get(runtime_id)
+
+    def get_runtimes(self, owner: str) -> list[HostedRuntime]:
+        return list(self._runtimes.get(owner, {}).values())
+
+    def remove_runtime(self, owner: str, runtime_id: str) -> bool:
+        owned = self._runtimes.get(owner)
+        if not owned:
+            return False
+        runtime = owned.pop(runtime_id, None)
+        if not owned:
+            self._runtimes.pop(owner, None)
         if runtime:
             runtime.destroy()
             return True
         return False
 
-    def remove_all_runtimes(self) -> None:
-        for runtime in self._runtimes.values():
+    def remove_all_runtimes(self, owner: str) -> None:
+        owned = self._runtimes.pop(owner, None)
+        if not owned:
+            return
+        for runtime in owned.values():
             runtime.destroy()
-        self._runtimes.clear()
 
     def get_registry(self) -> list[dict[str, Any]]:
         result = []

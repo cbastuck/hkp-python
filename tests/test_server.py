@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import aiohttp
@@ -430,7 +431,6 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
                     "state": {
                         "bypass": False,
                         "mode": "process_on_session",
-                        "port": 0,
                         "pipeline": [
                             {
                                 "serviceId": MAP_DESCRIPTOR.service_id,
@@ -439,8 +439,8 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
                                     "mode": "replace",
                                     "template": {
                                         "source": "http",
-                                        "path=": "params.path",
-                                        "method=": "params.method",
+                                        "path=": "params.meta.path",
+                                        "method=": "params.meta.method",
                                     },
                                 },
                             }
@@ -454,15 +454,15 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
             ],
         )
 
-        # Configure bypass=False to ensure server is started; response should include the port
+        # The endpoint is served by the shared runtime server at an assigned
+        # path, so the service publishes a URL rather than a port it bound.
         configure_resp = await _post_json(
             session,
             f"http://127.0.0.1:{port}/runtimes/rt-1/services/http-sub-1",
             {"bypass": False},
         )
-        inner_port = configure_resp["port"]
-        assert isinstance(inner_port, int)
-        assert inner_port > 0
+        endpoint = configure_resp["__hkpMount"]
+        assert re.search(r"/hosted/[0-9a-f]{32}$", endpoint), endpoint
 
         ws_url = f"ws://127.0.0.1:{port}/rt-1"
 
@@ -501,7 +501,7 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
 
         # Hit the inner HTTP server
         async with aiohttp.ClientSession() as fetch_session:
-            async with fetch_session.get(f"http://127.0.0.1:{inner_port}/hello") as resp:
+            async with fetch_session.get(f"{endpoint}/hello") as resp:
                 assert resp.status == 200
 
         await asyncio.wait_for(lifecycle_done.wait(), timeout=5.0)
@@ -511,7 +511,7 @@ async def test_http_subservice_injects_into_outer_runtime(server_info, port):
 
         # Verify pipeline output
         async with aiohttp.ClientSession() as fetch_session:
-            async with fetch_session.get(f"http://127.0.0.1:{inner_port}/hello") as resp:
+            async with fetch_session.get(f"{endpoint}/hello") as resp:
                 assert resp.status == 200
                 payload = await resp.json()
         assert payload == {"source": "http", "path": "/hello", "method": "GET"}

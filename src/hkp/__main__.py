@@ -129,6 +129,26 @@ async def main() -> None:
             "auth": auth_config,
             "external_host": external_host,
             "host": host,
+            "quotas": {
+                "max_runtimes_per_user": _read_integer(
+                    os.environ.get("HKP_MAX_RUNTIMES_PER_USER"), 0
+                ),
+                "max_services_per_runtime": _read_integer(
+                    os.environ.get("HKP_MAX_SERVICES_PER_RUNTIME"), 0
+                ),
+                "min_timer_interval_ms": _read_integer(
+                    os.environ.get("HKP_MIN_TIMER_INTERVAL_MS"), 0
+                ),
+                **(
+                    {
+                        "max_request_body_bytes": _read_integer(
+                            os.environ["HKP_MAX_REQUEST_BODY_BYTES"], 0
+                        )
+                    }
+                    if os.environ.get("HKP_MAX_REQUEST_BODY_BYTES")
+                    else {}
+                ),
+            },
         }
     )
 

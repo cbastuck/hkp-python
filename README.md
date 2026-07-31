@@ -46,6 +46,10 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `AUTH0_AUDIENCE`  | —           | Expected `aud` claim (the SPA client id — the frontend sends the ID token) |
 | `ALLOWED_EMAILS`  | —           | Comma-separated email allowlist; requires Auth0 config, matched against the **verified** `email` claim |
 | `ALLOW_NO_AUTH`   | —           | `true` permits an unauthenticated non-loopback bind — honored only when running from a source checkout, never for a pip-installed package |
+| `HKP_MAX_RUNTIMES_PER_USER` | — | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Re-creating a runtime that already exists is never refused. |
+| `HKP_MAX_SERVICES_PER_RUNTIME` | — | Maximum services per runtime. Unset or `0` means unlimited. |
+| `HKP_MIN_TIMER_INTERVAL_MS` | — | Lower bound on the Timer service's periodic interval; shorter periods are clamped. Unset or `0` means no floor. |
+| `HKP_MAX_REQUEST_BODY_BYTES` | `26214400` | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token. |
 
 Variables may also be placed in a `.env` file in the project root (real
 environment variables win; set `SKIP_LOADING_ENV=1` to skip it).
@@ -61,6 +65,16 @@ PORT=9000 EXTERNAL_HOST=myhost.local python3 -m hkp
 The auth model mirrors hkp-node exactly, so the same client (hkp-frontend, the
 hkp-node coordinator) works against both runtimes:
 
+- **Multi-tenant.** Runtimes are namespaced by the authenticated `sub` — the
+  same identifier the hkp-node coordinator uses as its `userId`. Every route
+  resolves runtime ids inside the caller's own namespace, so one instance serves
+  many users: `GET /runtimes` lists only yours, `DELETE /runtimes` clears only
+  yours, and a runtime id owned by someone else answers **404, not 403**, so ids
+  cannot be probed. Two users may hold the same runtime id at once — the normal
+  case, since boards ship stable ids (`node`, `chat-node`). Routes are unchanged:
+  identity comes from the `Authorization` header, never the path. With auth off
+  (loopback, or `ALLOW_NO_AUTH`), every request collapses into a single
+  `anonymous` tenant — identical to the pre-tenancy behaviour.
 - With `AUTH0_DOMAIN` + `AUTH0_AUDIENCE` set, every HTTP request needs
   `Authorization: Bearer <token>`; WebSocket upgrades take the token from the
   Authorization header or `?access_token=` (browsers can't set WS headers) and
@@ -76,6 +90,63 @@ hkp-node coordinator) works against both runtimes:
 - Auth0 config always wins over the loopback bypass: with `AUTH0_DOMAIN` +
   `AUTH0_AUDIENCE` set, JWT auth is enforced on any bind — including
   `127.0.0.1`, which is how to test the authenticated path locally.
+
+### Service endpoints (mounts)
+
+Services that must be reachable from outside — currently `http-server-subservices`
+— do not bind a port. The runtime assigns each one an opaque path on this same
+server and publishes the resulting address in the service's state:
+
+```
+http://<EXTERNAL_HOST>:<PORT>/hosted/<mountId>
+```
+
+Ports are a single machine-wide namespace, so on a shared host a service asking
+for a specific port is a land grab: the second claimant fails and whoever wins
+receives traffic the other expected. An assigned id avoids that, and since
+runtime ids are only unique per tenant they could not have appeared in a
+globally-routable path anyway.
+
+These endpoints are deliberately **unauthenticated** — they exist to be called by
+outside parties (webhooks, uploads) that hold no token — so the unguessable
+`mountId` is what gates access. It carries no user identifier. A mount is
+released when its service is bypassed or its runtime goes away.
+
+`port` is still accepted on the service and ignored, so existing boards load.
+
+#### What a request looks like to the pipeline
+
+A request reaches the pipeline as **MixedData** — JSON metadata plus the body —
+matching hkp-node's service of the same name:
+
+```jsonc
+{
+  "meta": {
+    "method": "POST",
+    "path": "/upload",              // path below the mount, not the mount prefix
+    "query": { "a": "1" },
+    "contentType": "application/json",  // when the request carried one
+    "filename": "notes.txt"             // from content-disposition, when present
+  },
+  "body": { "hello": "world" }      // decoded, when the type allows it
+}
+```
+
+The body arrives in **exactly one** form, never both:
+
+| Content type                        | Field    | Value                |
+| ----------------------------------- | -------- | -------------------- |
+| `application/json`, `*+json`        | `body`   | parsed JSON value    |
+| `application/x-www-form-urlencoded` | `body`   | parsed fields object |
+| `text/*`                            | `body`   | string               |
+| anything else                       | `binary` | raw bytes            |
+| no request body (e.g. GET)          | —        | neither field        |
+
+Charset parameters are ignored when matching. Malformed input falls back to
+`binary` rather than failing the request.
+
+**This replaced the previous flat `{ path, method }`.** A pipeline that matched
+on `params.path` now needs `params.meta.path`.
 
 ## Running the server using the run_server.sh script
 
