@@ -189,12 +189,17 @@ class HttpServerSubservicesService:
                 text=json.dumps({"error": "http-server-subservices is bypassed"}),
             )
 
+        answered_by_subservices = False
         if self._mode == "process_on_data":
             process_input = self._latest_data
             output: Any = process_input
         else:
             process_input = await self._read_request(request, context)
+            answered_by_subservices = self._has_subservices()
             output = self._process_session_input(process_input)
+
+        # What the nested pipeline produced, before the outer runtime sees it.
+        answer = output
 
         if self._host:
             # process_from reports this service's own call-process pair, so
@@ -208,10 +213,16 @@ class HttpServerSubservicesService:
             output = self._host.process_from(self.uuid, output, lambda _n: None)
             self._host.emit_result(output)
 
+        # With a nested pipeline configured, that pipeline is the handler and
+        # what it returned is the answer; the outer runtime ran for its side
+        # effects. Without one, the rest of the board is the handler.
+        response_value = answer if answered_by_subservices else output
         return web.Response(
             status=200,
             content_type="application/json",
-            text=json.dumps(output if output is not None else None, default=str),
+            text=json.dumps(
+                response_value if response_value is not None else None, default=str
+            ),
         )
 
     async def _read_request(
@@ -274,6 +285,10 @@ class HttpServerSubservicesService:
         return b"".join(chunks)
 
     # ── Pipeline helpers ───────────────────────────────────────────────────────
+
+    def _has_subservices(self) -> bool:
+        """Whether a nested pipeline is configured to handle requests."""
+        return bool(self._pipeline and self._pipeline.list_services())
 
     def _process_session_input(self, input: Any) -> Any:
         if not self._pipeline or not self._pipeline.list_services():
