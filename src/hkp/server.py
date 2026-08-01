@@ -33,13 +33,19 @@ from .services.http_server import (
     HttpServerSubservicesService,
 )
 from .services.map_service import MAP_DESCRIPTOR, MapService
+from .services.http_client import HTTP_CLIENT_DESCRIPTOR, HttpClientService
+from .services.stopper import STOPPER_DESCRIPTOR, StopperService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
 from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
 from .services.skill_router import SKILL_ROUTER_DESCRIPTOR, SkillRouterService
 from .services.text_to_speech import TEXT_TO_SPEECH_DESCRIPTOR, TextToSpeechService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
-from .services.timer import TIMER_DESCRIPTOR, TimerService
+from .services.timer import (
+    TIMER_DESCRIPTOR,
+    TIMER_LEGACY_SERVICE_ID,
+    TimerService,
+)
 from .types import (
     JsonRecord,
     RuntimeConfiguration,
@@ -141,7 +147,22 @@ class RuntimeServer:
                     cfg, cs, self._max_request_body_bytes
                 ),
             ),
+            HTTP_CLIENT_DESCRIPTOR.service_id: HostedServiceFactory(
+                HTTP_CLIENT_DESCRIPTOR,
+                lambda cfg, _cs: HttpClientService(cfg),
+            ),
+            STOPPER_DESCRIPTOR.service_id: HostedServiceFactory(
+                STOPPER_DESCRIPTOR,
+                lambda cfg, _cs: StopperService(cfg),
+            ),
             TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
+                TIMER_DESCRIPTOR,
+                lambda cfg, _cs: TimerService(cfg, self._min_timer_interval_ms),
+            ),
+            # Same service, under the id it answered to before it matched
+            # hkp-node and hkp-rt. Boards saved against the old id still load;
+            # the registry advertises only the canonical one.
+            TIMER_LEGACY_SERVICE_ID: HostedServiceFactory(
                 TIMER_DESCRIPTOR,
                 lambda cfg, _cs: TimerService(cfg, self._min_timer_interval_ms),
             ),

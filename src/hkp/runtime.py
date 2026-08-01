@@ -354,7 +354,14 @@ class RuntimeApp:
 
     def get_registry(self) -> list[dict[str, Any]]:
         result = []
+        # A service may be registered under more than one id (an alias kept so
+        # older boards still load). The registry advertises each one once, under
+        # the id its descriptor calls canonical.
+        seen: set[str] = set()
         for factory in self._registry.values():
+            if factory.descriptor.service_id in seen:
+                continue
+            seen.add(factory.descriptor.service_id)
             entry: dict[str, Any] = {
                 "serviceId": factory.descriptor.service_id,
                 "serviceName": factory.descriptor.service_name,

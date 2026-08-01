@@ -23,9 +23,14 @@ from ..types import (
 )
 
 TIMER_DESCRIPTOR = ServiceRegistryEntry(
-    service_id="hookup.to/service/timer",
+    service_id="timer",
     service_name="Timer",
 )
+
+#: The id this service used to answer to, from before it matched hkp-node and
+#: hkp-rt. Kept as a creation-time alias so boards saved against it still load;
+#: it is not advertised in the registry.
+TIMER_LEGACY_SERVICE_ID = "hookup.to/service/timer"
 
 _UNIT_MS: dict[str, float] = {
     "ms": 1,

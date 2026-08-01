@@ -22,6 +22,7 @@ from aiohttp import web
 
 from ..mounts import MountContext, MountHandle, decode_body
 from ..runtime import HostedRuntime
+from ..mount import MOUNT_FIELD
 from ..types import (
     JsonRecord,
     NotifyCallback,
@@ -138,7 +139,7 @@ class HttpServerSubservicesService:
             # Public endpoint assigned by the runtime; empty while bypassed.
             # Reserved name: generic board machinery reads and rewrites it (see
             # the frontend's runtime/board/mount).
-            "__hkpMount": self._mount.url if self._mount else "",
+            MOUNT_FIELD: self._mount.url if self._mount else "",
             "pipeline": self._get_pipeline_state(),
         }
 
@@ -172,7 +173,7 @@ class HttpServerSubservicesService:
         self._mount = mount
         # A board reads the assigned endpoint from here (or from state), since
         # it is not knowable at design time.
-        self._do_notify({"__hkpMount": mount.url}, self.uuid)
+        self._do_notify({MOUNT_FIELD: mount.url}, self.uuid)
 
     def _release_mount(self) -> None:
         if self._mount:
