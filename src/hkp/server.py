@@ -541,6 +541,24 @@ class RuntimeServer:
         self._purge_session_tokens(owner, runtime_id)
         return web.json_response({"id": runtime_id})
 
+    def _reap_if_abandoned(self, owner: str, runtime_id: str) -> None:
+        """Tear down a runtime whose creator asked for cleanup, now that its
+        last client has disconnected.
+
+        Whoever created it said whether it should outlive its clients. A browser
+        running a board is that board's controller and asks for cleanup: closing
+        the tab should not leave runtimes behind. A coordinator, a config file
+        or a script says nothing, and their runtimes stay until deleted — a
+        headless runtime is not an abandoned one, and a runtime is never reaped
+        because of who happened to connect to it.
+        """
+        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+        if not runtime or not runtime.garbage_collected:
+            return
+        self.runtime_app.remove_runtime(owner, runtime_id)
+        self._mounts.release_runtime(owner, runtime_id)
+        self._purge_session_tokens(owner, runtime_id)
+
     async def _mint_session_token(self, request: web.Request) -> web.Response:
         """Mint a coordinator session token for a runtime. Gated by the normal
         auth middleware, so the caller must present a valid user JWT (the
@@ -757,6 +775,7 @@ class RuntimeServer:
             sockets.discard(ws)
             if not sockets:
                 self._runtime_sockets.pop(socket_key, None)
+                self._reap_if_abandoned(owner, runtime_id)
 
         return ws
 
@@ -854,6 +873,8 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         id=value["id"],
         name=value["name"],
         board_name=value.get("boardName", ""),
+        # Absent means persist; see RuntimeConfiguration.garbage_collected.
+        garbage_collected=value.get("garbageCollected") is True,
         services=services,
     )
 

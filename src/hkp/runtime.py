@@ -29,6 +29,8 @@ class HostedRuntime:
         self.id = config.id
         self.name = config.name
         self.board_name = config.board_name
+        #: See RuntimeConfiguration.garbage_collected. False means persist.
+        self.garbage_collected = config.garbage_collected
         self._services: dict[str, HostedService] = {}
         self._service_order: list[str] = []
         self._notification_targets: set[NotificationCallback] = set()
