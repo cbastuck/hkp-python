@@ -98,7 +98,21 @@ async def test_registry_shape(server_info, base_url, port):
             "serviceName": "HttpServerSubservices",
             "capabilities": ["subservices"],
         },
-        {"serviceId": "hookup.to/service/timer", "serviceName": "Timer"},
+        {
+            "serviceId": "http-client",
+            "serviceName": "HTTP Client",
+            "version": "v1",
+            "capabilities": [],
+        },
+        {
+            "serviceId": "stopper",
+            "serviceName": "Stopper",
+            "version": "v1",
+            "capabilities": [],
+        },
+        # Canonical id, matching hkp-node and hkp-rt. The legacy
+        # "hookup.to/service/timer" still creates one but is not advertised.
+        {"serviceId": "timer", "serviceName": "Timer"},
         {"serviceId": "speech-to-text", "serviceName": "Speech To Text"},
         {"serviceId": "text-generation", "serviceName": "Text Generation"},
         {"serviceId": "text-to-speech", "serviceName": "Text To Speech"},

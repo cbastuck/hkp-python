@@ -34,6 +34,18 @@ class RuntimeConfiguration:
     id: str
     name: str
     board_name: str = ""
+    #: Whether this runtime should be torn down once the last client that was
+    #: connected to it disconnects.
+    #:
+    #: Declared by whoever creates it, because only they know: a browser
+    #: running a board says ``True`` — it is the controller, and its runtimes
+    #: should not outlive it — while a coordinator, a config file or a script
+    #: says nothing and gets a runtime that lives until it is deleted.
+    #:
+    #: Absent means persist. Cleanup is opted into, so nothing that exists
+    #: today starts disappearing, and a runtime is never reaped because of who
+    #: happened to connect to it.
+    garbage_collected: bool = False
     services: list[ServiceConfiguration] = field(default_factory=list)
 
 

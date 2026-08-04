@@ -52,6 +52,13 @@ class AuthConfig:
       ``domain``/``audience``. When ``allowed_emails`` is set, the token must
       additionally carry a **verified** ``email`` claim that is on the list;
       any other authenticated user of the tenant is rejected.
+
+      ``audience`` may list several accepted values. The frontend sends its
+      id_token, whose ``aud`` is the Auth0 *client id* of whichever application
+      signed the user in — and the web and native apps must be separate Auth0
+      applications (only a SPA-type one can do the browser flows, only a
+      Native-type one the RFC 8252 flow). One runtime serves users from both,
+      so it accepts both client ids.
     - ``none`` — accept everything (no identity). Only ever resolved for a
       local development checkout that opts in via ALLOW_NO_AUTH, or a loopback
       bind (see resolve_server_auth_config in __main__.py).
@@ -59,7 +66,7 @@ class AuthConfig:
 
     mode: str  # "jwt" | "none"
     domain: str = ""
-    audience: str = ""
+    audience: str | list[str] = ""
     allowed_emails: list[str] | None = None
 
 

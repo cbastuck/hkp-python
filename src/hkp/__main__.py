@@ -43,6 +43,17 @@ def _parse_allowed_emails(value: str | None) -> list[str] | None:
     return emails or None
 
 
+def _parse_audiences(value: str | None) -> list[str]:
+    """Accepted ``aud`` values, comma-separated. Several is the normal case: the
+    web and native apps are necessarily separate Auth0 applications, so the
+    id_tokens they issue carry different client ids while both address this one
+    runtime."""
+    if not value:
+        return []
+    audiences = [audience.strip() for audience in value.split(",")]
+    return [audience for audience in audiences if audience]
+
+
 def _parse_allowed_origins(value: str | None) -> AllowedOrigins:
     if not value or value.strip() == "*":
         return "*"
@@ -64,7 +75,7 @@ def resolve_server_auth_config(host: str) -> AuthConfig:
     explicitly opts in via ALLOW_NO_AUTH=true. An installed package bound to a
     public interface can never reach no-auth mode."""
     domain = os.environ.get("AUTH0_DOMAIN")
-    audience = os.environ.get("AUTH0_AUDIENCE")
+    audience = _parse_audiences(os.environ.get("AUTH0_AUDIENCE"))
     allowed_emails = _parse_allowed_emails(os.environ.get("ALLOWED_EMAILS"))
     if domain and audience:
         if allowed_emails:

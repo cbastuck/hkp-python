@@ -33,13 +33,19 @@ from .services.http_server import (
     HttpServerSubservicesService,
 )
 from .services.map_service import MAP_DESCRIPTOR, MapService
+from .services.http_client import HTTP_CLIENT_DESCRIPTOR, HttpClientService
+from .services.stopper import STOPPER_DESCRIPTOR, StopperService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
 from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
 from .services.skill_router import SKILL_ROUTER_DESCRIPTOR, SkillRouterService
 from .services.text_to_speech import TEXT_TO_SPEECH_DESCRIPTOR, TextToSpeechService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
-from .services.timer import TIMER_DESCRIPTOR, TimerService
+from .services.timer import (
+    TIMER_DESCRIPTOR,
+    TIMER_LEGACY_SERVICE_ID,
+    TimerService,
+)
 from .types import (
     JsonRecord,
     RuntimeConfiguration,
@@ -141,7 +147,22 @@ class RuntimeServer:
                     cfg, cs, self._max_request_body_bytes
                 ),
             ),
+            HTTP_CLIENT_DESCRIPTOR.service_id: HostedServiceFactory(
+                HTTP_CLIENT_DESCRIPTOR,
+                lambda cfg, _cs: HttpClientService(cfg),
+            ),
+            STOPPER_DESCRIPTOR.service_id: HostedServiceFactory(
+                STOPPER_DESCRIPTOR,
+                lambda cfg, _cs: StopperService(cfg),
+            ),
             TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
+                TIMER_DESCRIPTOR,
+                lambda cfg, _cs: TimerService(cfg, self._min_timer_interval_ms),
+            ),
+            # Same service, under the id it answered to before it matched
+            # hkp-node and hkp-rt. Boards saved against the old id still load;
+            # the registry advertises only the canonical one.
+            TIMER_LEGACY_SERVICE_ID: HostedServiceFactory(
                 TIMER_DESCRIPTOR,
                 lambda cfg, _cs: TimerService(cfg, self._min_timer_interval_ms),
             ),
@@ -520,6 +541,24 @@ class RuntimeServer:
         self._purge_session_tokens(owner, runtime_id)
         return web.json_response({"id": runtime_id})
 
+    def _reap_if_abandoned(self, owner: str, runtime_id: str) -> None:
+        """Tear down a runtime whose creator asked for cleanup, now that its
+        last client has disconnected.
+
+        Whoever created it said whether it should outlive its clients. A browser
+        running a board is that board's controller and asks for cleanup: closing
+        the tab should not leave runtimes behind. A coordinator, a config file
+        or a script says nothing, and their runtimes stay until deleted — a
+        headless runtime is not an abandoned one, and a runtime is never reaped
+        because of who happened to connect to it.
+        """
+        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+        if not runtime or not runtime.garbage_collected:
+            return
+        self.runtime_app.remove_runtime(owner, runtime_id)
+        self._mounts.release_runtime(owner, runtime_id)
+        self._purge_session_tokens(owner, runtime_id)
+
     async def _mint_session_token(self, request: web.Request) -> web.Response:
         """Mint a coordinator session token for a runtime. Gated by the normal
         auth middleware, so the caller must present a valid user JWT (the
@@ -736,6 +775,7 @@ class RuntimeServer:
             sockets.discard(ws)
             if not sockets:
                 self._runtime_sockets.pop(socket_key, None)
+                self._reap_if_abandoned(owner, runtime_id)
 
         return ws
 
@@ -833,6 +873,8 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         id=value["id"],
         name=value["name"],
         board_name=value.get("boardName", ""),
+        # Absent means persist; see RuntimeConfiguration.garbage_collected.
+        garbage_collected=value.get("garbageCollected") is True,
         services=services,
     )
 

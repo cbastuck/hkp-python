@@ -43,7 +43,7 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `EXTERNAL_HOST`   | `127.0.0.1` | Host used in `outputUrl` / WebSocket URLs returned to clients |
 | `ALLOWED_ORIGINS` | `*`         | CORS + WebSocket Origin allowlist (comma-separated)           |
 | `AUTH0_DOMAIN`    | —           | Auth0 tenant domain; enables JWT auth together with `AUTH0_AUDIENCE` |
-| `AUTH0_AUDIENCE`  | —           | Expected `aud` claim (the SPA client id — the frontend sends the ID token) |
+| `AUTH0_AUDIENCE`  | —           | Accepted `aud` claims, comma-separated — the client id of each Auth0 application whose users this runtime serves (the frontend sends the ID token) |
 | `ALLOWED_EMAILS`  | —           | Comma-separated email allowlist; requires Auth0 config, matched against the **verified** `email` claim |
 | `ALLOW_NO_AUTH`   | —           | `true` permits an unauthenticated non-loopback bind — honored only when running from a source checkout, never for a pip-installed package |
 | `HKP_MAX_RUNTIMES_PER_USER` | — | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Re-creating a runtime that already exists is never refused. |

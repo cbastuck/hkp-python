@@ -29,6 +29,8 @@ class HostedRuntime:
         self.id = config.id
         self.name = config.name
         self.board_name = config.board_name
+        #: See RuntimeConfiguration.garbage_collected. False means persist.
+        self.garbage_collected = config.garbage_collected
         self._services: dict[str, HostedService] = {}
         self._service_order: list[str] = []
         self._notification_targets: set[NotificationCallback] = set()
@@ -354,7 +356,14 @@ class RuntimeApp:
 
     def get_registry(self) -> list[dict[str, Any]]:
         result = []
+        # A service may be registered under more than one id (an alias kept so
+        # older boards still load). The registry advertises each one once, under
+        # the id its descriptor calls canonical.
+        seen: set[str] = set()
         for factory in self._registry.values():
+            if factory.descriptor.service_id in seen:
+                continue
+            seen.add(factory.descriptor.service_id)
             entry: dict[str, Any] = {
                 "serviceId": factory.descriptor.service_id,
                 "serviceName": factory.descriptor.service_name,
