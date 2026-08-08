@@ -12,12 +12,13 @@ from __future__ import annotations
 # MixedData: not native in runtime
 
 import uuid as _uuid_mod
-from typing import Any
+from typing import Any, Callable
 
 from ..runtime import HostedRuntime
 from ..types import (
     JsonRecord,
     NotifyCallback,
+    RuntimeHost,
     ServiceConfiguration,
     ServiceCreator,
     ServiceRegistryEntry,
@@ -41,7 +42,9 @@ class SubService:
         self._bypass = False
         self._pipeline_config: list[ServiceConfiguration] = []
         self._pipeline: HostedRuntime | None = None
+        self._release_pipeline_notifications: Callable[[], None] | None = None
         self._create_service = create_service
+        self._host: RuntimeHost | None = None
 
         if config.state:
             self.configure(config.state)
@@ -92,18 +95,19 @@ class SubService:
             "pipeline": self._get_pipeline_state(),
         }
 
-    def process(self, input: Any, notify: NotifyCallback) -> Any:
+    def process(self, input: Any, _notify: NotifyCallback) -> Any:
         if self._bypass or not self._pipeline or not self._pipeline.list_services():
             return input
-        return self._pipeline.process(
-            input,
-            lambda notification: notify(notification.payload, notification.instance_id),
-        )
+        # The callback is a no-op: the nested runtime fans these out to the
+        # target registered in _rebuild. Forwarding them here as well would
+        # deliver every one twice.
+        return self._pipeline.process(input, lambda _n: None)
 
-    def set_host(self, host: Any) -> None:
-        pass
+    def set_host(self, host: RuntimeHost) -> None:
+        self._host = host
 
     def destroy(self) -> None:
+        self._release_notifications()
         if self._pipeline:
             self._pipeline.destroy()
             self._pipeline = None
@@ -111,10 +115,31 @@ class SubService:
     # ── Private ────────────────────────────────────────────────────────────────
 
     def _rebuild(self) -> None:
+        self._release_notifications()
+        # The pipeline being replaced is about to become unreachable; its
+        # services keep running until told otherwise. State worth carrying over
+        # has already been read into _pipeline_config by _sync_states.
+        if self._pipeline:
+            self._pipeline.destroy()
+
         self._pipeline = HostedRuntime(
             _make_runtime_config(self.uuid, self.service_name, self._pipeline_config),
             self._create_service,
         )
+
+        # A nested runtime has no notification targets of its own, so what its
+        # services report — a Timer's tick, a Hold's counts — reaches nobody
+        # unless the service hosting the pipeline carries it out to the board.
+        # Services report through their host precisely because it is not always
+        # a call they are answering: an autonomous emitter has no caller.
+        self._release_pipeline_notifications = self._pipeline.register_notification_target(
+            lambda n: self._host.notify(n.payload, n.instance_id) if self._host else None
+        )
+
+    def _release_notifications(self) -> None:
+        if self._release_pipeline_notifications:
+            self._release_pipeline_notifications()
+            self._release_pipeline_notifications = None
 
     def _sync_states(self) -> None:
         if not self._pipeline:

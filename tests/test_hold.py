@@ -156,6 +156,72 @@ def test_describes_a_held_value_that_cannot_travel_as_json():
 
 
 @pytest.mark.asyncio
+async def test_answers_a_request_with_the_value_the_data_path_last_produced(servers):
+    _server, base_url = await servers()
+
+    sub_pipeline = [
+        {
+            "serviceId": HOLD_DESCRIPTOR.service_id,
+            "uuid": "hold-1",
+            "state": {"property": "triggerCount"},
+        },
+        {
+            "serviceId": MAP_DESCRIPTOR.service_id,
+            "uuid": "map-1",
+            "state": {
+                "mode": "replace",
+                "template": {"=": "'tick ' + params.triggerCount"},
+            },
+        },
+    ]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/runtimes",
+            json={
+                "id": "rt-1",
+                "name": "Python",
+                "services": [
+                    {
+                        "serviceId": HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id,
+                        "uuid": "http-1",
+                        "state": {
+                            "bypass": False,
+                            # Both entry points run the nested pipeline.
+                            "mode": "process_on_both",
+                            "pipeline": sub_pipeline,
+                        },
+                    }
+                ],
+            },
+        ) as response:
+            assert response.status == 200
+
+        async with session.get(f"{base_url}/runtimes/rt-1/services/http-1") as response:
+            mount_url = (await response.json())["__hkpMount"]
+
+        # The data path: the outer chain drives the pipeline, hold stores.
+        async with session.post(
+            f"{base_url}/runtimes/rt-1", json={"triggerCount": 7}
+        ) as response:
+            assert response.status == 200
+            assert await response.json() == "tick 7"
+
+        # The request path: the same pipeline, but hold replays instead.
+        async with session.get(mount_url) as response:
+            assert await response.json() == "tick 7"
+
+        # A second producer run moves the held value on.
+        async with session.post(
+            f"{base_url}/runtimes/rt-1", json={"triggerCount": 8}
+        ) as response:
+            assert response.status == 200
+
+        async with session.get(mount_url) as response:
+            assert await response.json() == "tick 8"
+
+
+@pytest.mark.asyncio
 async def test_serves_a_nested_timers_latest_tick_to_callers(servers):
     server, base_url = await servers()
 

@@ -15,7 +15,7 @@ import asyncio
 import json
 import re
 import uuid as _uuid_mod
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlparse
 
 from aiohttp import web
@@ -71,6 +71,7 @@ class HttpServerSubservicesService:
         self._mount: MountHandle | None = None
         self._pipeline_config: list[ServiceConfiguration] = []
         self._pipeline: HostedRuntime | None = None
+        self._release_pipeline_notifications: Callable[[], None] | None = None
         self._create_service = create_service
         self._host: RuntimeHost | None = None
 
@@ -85,8 +86,21 @@ class HttpServerSubservicesService:
         # port. Older boards still carry the field, and rejecting it would fail
         # them on load for a setting that no longer means anything.
 
-        # Mode change
-        if config.get("mode") in ("process_on_session", "process_on_data"):
+        # Where the nested pipeline is entered from:
+        #
+        # - process_on_session — requests only; data from the outer chain passes
+        #   through untouched.
+        # - process_on_data — data from the outer chain is stored and served
+        #   back to requests verbatim; the nested pipeline is not used.
+        # - process_on_both — both entry points run the nested pipeline. The
+        #   pipeline is a single ordered list either way, so a service inside it
+        #   that needs to tell a request from a data arrival has to do so from
+        #   the input.
+        if config.get("mode") in (
+            "process_on_session",
+            "process_on_data",
+            "process_on_both",
+        ):
             self._mode = config["mode"]
 
         # Pipeline replacement
@@ -155,10 +169,25 @@ class HttpServerSubservicesService:
     def process(self, input: Any, _notify: NotifyCallback) -> Any:
         if self._mode == "process_on_data":
             self._latest_data = input
+            return input
+
+        # Routing only: the nested pipeline handles data arriving from the outer
+        # chain exactly as it handles a request, and what it returns carries on
+        # down the chain. Whatever has to survive between the two — a value one
+        # side produces and the other reads — is a service's job, not this one's.
+        if self._mode == "process_on_both" and not self._bypass:
+            return self._process_session_input(input)
+
         return input
 
     def destroy(self) -> None:
         self._release_mount()
+        self._release_notifications()
+        # Nested services hold the same things top-level ones do — timers,
+        # sockets, mounts — and nothing else will ever reach them once this
+        # service is gone.
+        if self._pipeline:
+            self._pipeline.destroy()
         self._pipeline = None
         self._pipeline_config = []
 
@@ -294,10 +323,10 @@ class HttpServerSubservicesService:
     def _process_session_input(self, input: Any) -> Any:
         if not self._pipeline or not self._pipeline.list_services():
             return input
-        return self._pipeline.process(
-            input,
-            lambda n: self._do_notify(n.payload, n.instance_id),
-        )
+        # The callback is a no-op: the nested runtime fans these out to the
+        # target registered in _rebuild. Forwarding them here as well would
+        # deliver every one twice.
+        return self._pipeline.process(input, lambda _n: None)
 
     def _do_notify(self, payload: Any, instance_id: str | None = None) -> None:
         if self._host:
@@ -305,6 +334,14 @@ class HttpServerSubservicesService:
 
     def _rebuild(self) -> None:
         from ..types import RuntimeConfiguration
+
+        self._release_notifications()
+        # The pipeline being replaced is about to become unreachable; its
+        # services keep running until told otherwise. State worth carrying over
+        # has already been read into _pipeline_config by _sync_states.
+        if self._pipeline:
+            self._pipeline.destroy()
+
         self._pipeline = HostedRuntime(
             RuntimeConfiguration(
                 id=f"{self.uuid}:http-sub-runtime",
@@ -314,6 +351,20 @@ class HttpServerSubservicesService:
             ),
             self._create_service,
         )
+
+        # A nested runtime has no notification targets of its own, so what its
+        # services report — a Timer's tick, a Hold's counts — reaches nobody
+        # unless the service hosting the pipeline carries it out to the board.
+        # Services report through their host precisely because it is not always
+        # a call they are answering: an autonomous emitter has no caller.
+        self._release_pipeline_notifications = self._pipeline.register_notification_target(
+            lambda n: self._do_notify(n.payload, n.instance_id)
+        )
+
+    def _release_notifications(self) -> None:
+        if self._release_pipeline_notifications:
+            self._release_pipeline_notifications()
+            self._release_pipeline_notifications = None
 
     def _sync_states(self) -> None:
         if not self._pipeline:
