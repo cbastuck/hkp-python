@@ -35,6 +35,7 @@ from .services.http_server import (
 from .services.map_service import MAP_DESCRIPTOR, MapService
 from .services.http_client import HTTP_CLIENT_DESCRIPTOR, HttpClientService
 from .services.stopper import STOPPER_DESCRIPTOR, StopperService
+from .services.hold import HOLD_DESCRIPTOR, HoldService
 from .services.monitor import MONITOR_DESCRIPTOR, MonitorService
 from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextService
 from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
@@ -154,6 +155,10 @@ class RuntimeServer:
             STOPPER_DESCRIPTOR.service_id: HostedServiceFactory(
                 STOPPER_DESCRIPTOR,
                 lambda cfg, _cs: StopperService(cfg),
+            ),
+            HOLD_DESCRIPTOR.service_id: HostedServiceFactory(
+                HOLD_DESCRIPTOR,
+                lambda cfg, _cs: HoldService(cfg),
             ),
             TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
                 TIMER_DESCRIPTOR,
