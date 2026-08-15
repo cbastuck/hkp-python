@@ -20,7 +20,13 @@ from .auth import (
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
-from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp, TenantRuntimes
+from .runtime import (
+    context_from_wire,
+    HostedRuntime,
+    HostedServiceFactory,
+    RuntimeApp,
+    TenantRuntimes,
+)
 from .yas import (
     MessagePurpose,
     YasError,
@@ -48,6 +54,7 @@ from .services.timer import (
     TimerService,
 )
 from .types import (
+    ProcessContext,
     JsonRecord,
     RuntimeConfiguration,
     RuntimeNotification,
@@ -393,11 +400,16 @@ class RuntimeServer:
 
     # ── Processing ─────────────────────────────────────────────────────────────
 
-    async def _process_off_loop(self, runtime: HostedRuntime, body: Any) -> Any:
+    async def _process_off_loop(
+        self,
+        runtime: HostedRuntime,
+        body: Any,
+        context: ProcessContext | None = None,
+    ) -> Any:
         """Run the pipeline in the worker thread so slow services (e.g. ML
         inference) don't stall the event loop."""
         return await asyncio.get_running_loop().run_in_executor(
-            self._process_executor, runtime.process, body, lambda _n: None
+            self._process_executor, runtime.process, body, lambda _n: None, context
         )
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
@@ -729,8 +741,13 @@ class RuntimeServer:
                     if data.get("type") == "processRuntime" and "params" in data:
                         runtime = self.runtime_app.get_runtime(owner, runtime_id)
                         if runtime:
+                            # A peer driving this runtime names the run its
+                            # call belongs to, so that a board spanning several
+                            # runtimes reads as one trace rather than one each.
                             result = await self._process_off_loop(
-                                runtime, data["params"]
+                                runtime,
+                                data["params"],
+                                context_from_wire(data.get("context")),
                             )
                             if not ws.closed:
                                 if _is_binary_result(result):
@@ -880,6 +897,21 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         board_name=value.get("boardName", ""),
         # Absent means persist; see RuntimeConfiguration.garbage_collected.
         garbage_collected=value.get("garbageCollected") is True,
+        # Both absent mean off; see RuntimeConfiguration.logging / log_data.
+        logging=isinstance(value.get("state"), dict)
+        and value["state"].get("logging") is True,
+        log_level=(
+            value["state"]["logLevel"]
+            if isinstance(value.get("state"), dict)
+            and value["state"].get("logLevel")
+            in ("debug", "info", "warn", "error")
+            else "info"
+        ),
+        # Absent means allowed; see RuntimeConfiguration.log_data.
+        log_data=not (
+            isinstance(value.get("state"), dict)
+            and value["state"].get("logData") is False
+        ),
         services=services,
     )
 

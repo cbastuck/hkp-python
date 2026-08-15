@@ -25,9 +25,14 @@ class HostSpy:
         self.pushed: list[Any] = []
         self.emitted: list[Any] = []
 
-    def process_from(self, _uuid: str, data: Any, _on_notification: Any) -> Any:
+    def process_from(
+        self, _uuid: str, data: Any, _on_notification: Any, _context: Any = None
+    ) -> Any:
         self.pushed.append(data)
         return data
+
+    def current_context(self) -> Any:
+        return None
 
     def notify(self, _payload: Any, _instance_id: str) -> None:
         pass

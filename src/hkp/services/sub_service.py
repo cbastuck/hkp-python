@@ -14,8 +14,9 @@ from __future__ import annotations
 import uuid as _uuid_mod
 from typing import Any, Callable
 
-from ..runtime import HostedRuntime
+from ..runtime import HostedRuntime, child_run
 from ..types import (
+    ProcessContext,
     JsonRecord,
     NotifyCallback,
     RuntimeHost,
@@ -43,6 +44,7 @@ class SubService:
         self._pipeline_config: list[ServiceConfiguration] = []
         self._pipeline: HostedRuntime | None = None
         self._release_pipeline_notifications: Callable[[], None] | None = None
+        self._release_pipeline_logs: Callable[[], None] | None = None
         self._create_service = create_service
         self._host: RuntimeHost | None = None
 
@@ -101,10 +103,30 @@ class SubService:
         # The callback is a no-op: the nested runtime fans these out to the
         # target registered in _rebuild. Forwarding them here as well would
         # deliver every one twice.
-        return self._pipeline.process(input, lambda _n: None)
+        #
+        # The nested pipeline runs as a run of its own, descended from the one
+        # calling it, so what happens inside stays attributable to this service
+        # rather than blending into the pipeline around it.
+        return self._pipeline.process(
+            input,
+            lambda _n: None,
+            child_run(self._host.current_context() if self._host else None),
+        )
 
     def set_host(self, host: RuntimeHost) -> None:
         self._host = host
+        # A pipeline built in the constructor was built before there was a host
+        # to ask, so what the board records reaches it here rather than never.
+        self._apply_log_settings()
+
+    def _apply_log_settings(self) -> None:
+        """Hands the board's log settings to the nested pipeline, if any."""
+        if not self._host or not self._pipeline:
+            return
+        settings = self._host.log_settings()
+        self._pipeline.set_logging(settings["logging"])
+        self._pipeline.set_log_data(settings["log_data"])
+        self._pipeline.set_log_level(settings["log_level"])
 
     def destroy(self) -> None:
         self._release_notifications()
@@ -123,7 +145,9 @@ class SubService:
             self._pipeline.destroy()
 
         self._pipeline = HostedRuntime(
-            _make_runtime_config(self.uuid, self.service_name, self._pipeline_config),
+            _make_runtime_config(
+                self.uuid, self.service_name, self._pipeline_config
+            ),
             self._create_service,
         )
 
@@ -136,10 +160,22 @@ class SubService:
             lambda n: self._host.notify(n.payload, n.instance_id) if self._host else None
         )
 
+        # A nested pipeline's entries belong to the same board log as everything
+        # else; only the runtime hosting this service can carry them there,
+        # since a nested runtime has no route out of its own.
+        self._release_pipeline_logs = self._pipeline.register_log_target(
+            lambda entry: self._host.forward_log(entry) if self._host else None
+        )
+
+        self._apply_log_settings()
+
     def _release_notifications(self) -> None:
         if self._release_pipeline_notifications:
             self._release_pipeline_notifications()
             self._release_pipeline_notifications = None
+        if self._release_pipeline_logs:
+            self._release_pipeline_logs()
+            self._release_pipeline_logs = None
 
     def _sync_states(self) -> None:
         if not self._pipeline:

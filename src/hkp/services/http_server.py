@@ -21,9 +21,10 @@ from urllib.parse import parse_qsl, urlparse
 from aiohttp import web
 
 from ..mounts import MountContext, MountHandle, decode_body
-from ..runtime import HostedRuntime
+from ..runtime import HostedRuntime, child_run, new_run
 from ..mount import MOUNT_FIELD
 from ..types import (
+    ProcessContext,
     JsonRecord,
     NotifyCallback,
     RuntimeHost,
@@ -72,6 +73,7 @@ class HttpServerSubservicesService:
         self._pipeline_config: list[ServiceConfiguration] = []
         self._pipeline: HostedRuntime | None = None
         self._release_pipeline_notifications: Callable[[], None] | None = None
+        self._release_pipeline_logs: Callable[[], None] | None = None
         self._create_service = create_service
         self._host: RuntimeHost | None = None
 
@@ -159,6 +161,18 @@ class HttpServerSubservicesService:
 
     def set_host(self, host: RuntimeHost) -> None:
         self._host = host
+        # A pipeline built in the constructor was built before there was a host
+        # to ask, so what the board records reaches it here rather than never.
+        self._apply_log_settings()
+
+    def _apply_log_settings(self) -> None:
+        """Hands the board's log settings to the nested pipeline, if any."""
+        if not self._host or not self._pipeline:
+            return
+        settings = self._host.log_settings()
+        self._pipeline.set_logging(settings["logging"])
+        self._pipeline.set_log_data(settings["log_data"])
+        self._pipeline.set_log_level(settings["log_level"])
         # State is applied in the constructor, before the host exists, so a
         # service configured as already-active has nothing to claim its mount
         # from until now. Claiming here is what makes a board load into a live
@@ -219,6 +233,13 @@ class HttpServerSubservicesService:
                 text=json.dumps({"error": "http-server-subservices is bypassed"}),
             )
 
+        # Serving a request is one run, however many pipelines it passes
+        # through: the nested handler below descends from it, and the outer
+        # chain afterwards continues it. Minting one here rather than letting
+        # each leg mint its own is what keeps a request's trace joined up
+        # instead of arriving as two unrelated runs sharing a timestamp.
+        run_context = new_run()
+
         answered_by_subservices = False
         if self._mode == "process_on_data":
             process_input = self._latest_data
@@ -226,7 +247,7 @@ class HttpServerSubservicesService:
         else:
             process_input = await self._read_request(request, context)
             answered_by_subservices = self._has_subservices()
-            output = self._process_session_input(process_input)
+            output = self._process_session_input(process_input, run_context)
 
         # What the nested pipeline produced, before the outer runtime sees it.
         answer = output
@@ -240,7 +261,9 @@ class HttpServerSubservicesService:
             #
             # The callback is a no-op: the runtime already fans notifications
             # out to its targets, and re-notifying would deliver each twice.
-            output = self._host.process_from(self.uuid, output, lambda _n: None)
+            output = self._host.process_from(
+                self.uuid, output, lambda _n: None, run_context
+            )
             self._host.emit_result(output)
 
         # With a nested pipeline configured, that pipeline is the handler and
@@ -320,13 +343,26 @@ class HttpServerSubservicesService:
         """Whether a nested pipeline is configured to handle requests."""
         return bool(self._pipeline and self._pipeline.list_services())
 
-    def _process_session_input(self, input: Any) -> Any:
+    def _process_session_input(
+        self, input: Any, parent: ProcessContext | None = None
+    ) -> Any:
+        """Runs the nested pipeline as a run descended from ``parent``.
+
+        Both entry points land here, and they differ only in what they descend
+        from: a request brings the run its caller minted for the whole exchange,
+        while data from the outer chain arrives mid-call and descends from
+        whatever that call is running as.
+        """
         if not self._pipeline or not self._pipeline.list_services():
             return input
         # The callback is a no-op: the nested runtime fans these out to the
         # target registered in _rebuild. Forwarding them here as well would
         # deliver every one twice.
-        return self._pipeline.process(input, lambda _n: None)
+        return self._pipeline.process(
+            input,
+            lambda _n: None,
+            child_run(parent or (self._host.current_context() if self._host else None)),
+        )
 
     def _do_notify(self, payload: Any, instance_id: str | None = None) -> None:
         if self._host:
@@ -361,10 +397,22 @@ class HttpServerSubservicesService:
             lambda n: self._do_notify(n.payload, n.instance_id)
         )
 
+        # A nested pipeline's entries belong to the same board log as everything
+        # else; only the runtime hosting this service can carry them there, since
+        # a nested runtime has no route out of its own.
+        self._release_pipeline_logs = self._pipeline.register_log_target(
+            lambda entry: self._host.forward_log(entry) if self._host else None
+        )
+
+        self._apply_log_settings()
+
     def _release_notifications(self) -> None:
         if self._release_pipeline_notifications:
             self._release_pipeline_notifications()
             self._release_pipeline_notifications = None
+        if self._release_pipeline_logs:
+            self._release_pipeline_logs()
+            self._release_pipeline_logs = None
 
     def _sync_states(self) -> None:
         if not self._pipeline:
