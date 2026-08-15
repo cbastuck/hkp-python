@@ -19,9 +19,13 @@ def _read_integer(value: str | None, fallback: int) -> int:
 
 
 def _load_env_file() -> None:
-    """Minimal .env loader (KEY=VALUE lines next to the project root), matching
-    hkp-node's dotenv behaviour: real environment variables win."""
+    """Minimal .env loader (KEY=VALUE lines), matching hkp-node's dotenv
+    behaviour: real environment variables win. Looks next to the project root
+    first, then in the working directory, which is where the file sits when the
+    package is installed rather than run from a checkout."""
     env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.is_file():
+        env_path = Path.cwd() / ".env"
     if not env_path.is_file():
         return
     for line in env_path.read_text().splitlines():

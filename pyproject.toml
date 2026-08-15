@@ -4,13 +4,35 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hkp-python"
-version = "0.1.0"
+version = "1.0.0"
+description = "Python Readymade runtime server — an asyncio HKP runtime hosting services over REST."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "cbastuck", email = "mail@cbastuck.de" }]
+keywords = ["hkp", "readymade", "runtime", "aiohttp", "asyncio", "dataflow"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "aiohttp>=3.9",
     "aiohttp-cors>=0.7",
     "PyJWT[crypto]>=2.8",
 ]
+
+[project.urls]
+Homepage = "https://readymadeit.com"
+Repository = "https://github.com/cbastuck/hkp-python"
+Issues = "https://github.com/cbastuck/hkp-python/issues"
 
 [project.scripts]
 hkp-python = "hkp.__main__:run"
