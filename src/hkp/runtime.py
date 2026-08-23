@@ -209,6 +209,35 @@ class HostedRuntime:
         with self._with_context(context or new_run()):
             return self._process_from_index(0, input, on_notification)
 
+    def process_at(
+        self,
+        start_at_uuid: str,
+        data: Any,
+        on_notification: NotificationCallback,
+        context: ProcessContext | None = None,
+    ) -> Any:
+        """Run the pipeline starting **at** a service rather than after it.
+
+        `process_from` exists for a service handing work onward — it means
+        "carry on behind me", so it advances past the caller. This is the other
+        question: something outside the pipeline wants a particular service to
+        do its job with a given payload, and that service must actually run.
+
+        hkp-rt spells the same distinction as
+        ``processFrom(service, data, advanceBefore)``; kept as a separate entry
+        point here so the advancing call, which every service uses, cannot
+        change shape by accident.
+        """
+        try:
+            start_index = self._service_order.index(start_at_uuid)
+        except ValueError:
+            raise KeyError(start_at_uuid)
+
+        # Nothing to continue: whoever asked for this is outside the board, so
+        # it begins a run rather than joining one.
+        with self._with_context(context or new_run()):
+            return self._process_from_index(start_index, data, on_notification)
+
     # ── RuntimeHost interface ──────────────────────────────────────────────────
 
     def current_context(self) -> ProcessContext | None:

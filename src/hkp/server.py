@@ -348,6 +348,10 @@ class RuntimeServer:
         app.router.add_post(
             "/runtimes/{runtime_id}/services/{instance_id}", self._configure_service
         )
+        app.router.add_post(
+            "/runtimes/{runtime_id}/services/{instance_id}/process",
+            self._process_service,
+        )
         app.router.add_get(
             "/runtimes/{runtime_id}/services/{instance_id}", self._get_service
         )
@@ -623,6 +627,48 @@ class RuntimeServer:
                 raise web.HTTPBadRequest()
 
         result = await self._process_off_loop(runtime, body)
+        if _is_binary_result(result):
+            return web.Response(
+                body=serialize_message(result, purpose=MessagePurpose.RESULT),
+                content_type="application/octet-stream",
+            )
+        return web.json_response(_jsonable_result(result))
+
+    async def _process_service(self, request: web.Request) -> web.Response:
+        """Run the pipeline starting at one service, with a given payload.
+
+        Distinct from configuring it: configure says what a service *is*, this
+        says do your job with this. A facade button had only the former, so
+        anything it needed to cause had to be smuggled in as a config field that
+        a service read as a command.
+        """
+        runtime = self._get_runtime_or_404(request)
+        instance_id = request.match_info["instance_id"]
+        raw = await request.read()
+
+        if request.content_type == "application/octet-stream" or is_yas_message(raw):
+            try:
+                body = deserialize_message(raw).data
+            except YasError:
+                raise web.HTTPBadRequest()
+        else:
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                raise web.HTTPBadRequest()
+
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                self._process_executor,
+                runtime.process_at,
+                instance_id,
+                body,
+                lambda _n: None,
+                None,
+            )
+        except KeyError:
+            raise web.HTTPNotFound()
+
         if _is_binary_result(result):
             return web.Response(
                 body=serialize_message(result, purpose=MessagePurpose.RESULT),
