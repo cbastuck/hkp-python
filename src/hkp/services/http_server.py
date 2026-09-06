@@ -71,6 +71,15 @@ class HttpServerSubservicesService:
         self._latest_data: Any = None
         self._mount: MountHandle | None = None
         self._pipeline_config: list[ServiceConfiguration] = []
+        #: Which of a request's headers the pipeline is shown, or None for all.
+        #:
+        #: Headers are where a caller puts a credential, and ``meta`` goes
+        #: wherever the pipeline takes it — including into a board, if a service
+        #: is wired to write it there. Naming the ones a board actually reads is
+        #: how it stops carrying the ones it does not: an empty list forwards
+        #: none, and no list at all forwards everything, which is what a board
+        #: that has not thought about it gets.
+        self._forward_headers: list[str] | None = None
         self._pipeline: HostedRuntime | None = None
         self._release_pipeline_notifications: Callable[[], None] | None = None
         self._release_pipeline_logs: Callable[[], None] | None = None
@@ -98,6 +107,16 @@ class HttpServerSubservicesService:
         #   pipeline is a single ordered list either way, so a service inside it
         #   that needs to tell a request from a data arrival has to do so from
         #   the input.
+        # An array is a decision, including an empty one. Anything else —
+        # absent, None, a string — leaves the default of forwarding all of them.
+        if "forwardHeaders" in config:
+            names = config["forwardHeaders"]
+            self._forward_headers = (
+                [n.lower() for n in names if isinstance(n, str)]
+                if isinstance(names, list)
+                else None
+            )
+
         if config.get("mode") in (
             "process_on_session",
             "process_on_data",
@@ -148,6 +167,21 @@ class HttpServerSubservicesService:
 
         return self.get_state()
 
+    def _request_headers(self, request: Any) -> JsonRecord:
+        """The headers this pipeline is shown, lower-cased as HTTP names compare.
+
+        A caller that has to prove who it is does so in a header — a shared
+        secret, a signature, a bearer token — so a pipeline that cannot see them
+        cannot check one. What a board does not name, it does not receive.
+        """
+        headers: JsonRecord = {}
+        for name, value in request.headers.items():
+            lowered = name.lower()
+            if self._forward_headers is not None and lowered not in self._forward_headers:
+                continue
+            headers[lowered] = value
+        return headers
+
     def get_state(self) -> JsonRecord:
         return {
             "bypass": self._bypass,
@@ -156,6 +190,7 @@ class HttpServerSubservicesService:
             # Reserved name: generic board machinery reads and rewrites it (see
             # the frontend's runtime/board/mount).
             MOUNT_FIELD: self._mount.url if self._mount else "",
+            "forwardHeaders": self._forward_headers,
             "pipeline": self._get_pipeline_state(),
         }
 
@@ -294,6 +329,7 @@ class HttpServerSubservicesService:
             "method": request.method,
             "path": parsed.path or "/",
             "query": dict(parse_qsl(parsed.query)),
+            "headers": self._request_headers(request),
         }
 
         content_type = request.headers.get("Content-Type")

@@ -118,6 +118,23 @@ class SubService:
         # A pipeline built in the constructor was built before there was a host
         # to ask, so what the board records reaches it here rather than never.
         self._apply_log_settings()
+        self._apply_secrets()
+
+    def _apply_secrets(self) -> None:
+        """Points the nested pipeline at the surrounding runtime's secrets.
+
+        Nothing provisions a nested runtime, so its vault is always empty: a
+        service inside the pipeline holds the same ``{{secret.…}}`` reference as
+        one at the top level and would have nothing to resolve it against. The
+        host is read on each lookup rather than now, both because a value may be
+        pushed after the board is running and because a pipeline nested deeper
+        reaches its own host the same way — so the chain composes to whichever
+        runtime was actually given something.
+        """
+        if self._pipeline:
+            self._pipeline.delegate_secrets(
+                lambda: self._host.secrets() if self._host else None
+            )
 
     def _apply_log_settings(self) -> None:
         """Hands the board's log settings to the nested pipeline, if any."""
@@ -168,6 +185,7 @@ class SubService:
         )
 
         self._apply_log_settings()
+        self._apply_secrets()
 
     def _release_notifications(self) -> None:
         if self._release_pipeline_notifications:

@@ -20,6 +20,8 @@ from .auth import (
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
+from .runtime import set_server_loop
+from .secrets import read_secrets_payload
 from .runtime import (
     context_from_wire,
     HostedRuntime,
@@ -225,6 +227,9 @@ class RuntimeServer:
 
     async def start(self, port: int = 0, host: str = "127.0.0.1") -> dict[str, Any]:
         self._loop = asyncio.get_running_loop()
+        # Services schedule their own work — a request, a timer — from a pass
+        # that runs on a worker thread, where there is no loop to schedule on.
+        set_server_loop(self._loop)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
@@ -337,6 +342,7 @@ class RuntimeServer:
         app.router.add_post(
             "/runtimes/{runtime_id}/session-token", self._mint_session_token
         )
+        app.router.add_post("/runtimes/{runtime_id}/secrets", self._post_secrets)
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
         app.router.add_post("/runtimes/{runtime_id}", self._process_runtime)
 
@@ -596,6 +602,35 @@ class RuntimeServer:
         token = secrets.token_hex(32)
         self._session_tokens[token] = SessionToken(sub=sub, runtime_id=runtime.id)
         return web.json_response({"token": token})
+
+    async def _post_secrets(self, request: web.Request) -> web.Response:
+        """Values for the references this runtime's services hold.
+
+        Provisioning carries them already; this is for the moments it cannot
+        cover — a board being built a service at a time, an entry edited while a
+        board is running, and a re-push after a restart where the services
+        survived but the vault did not. It merges, so a client sending one entry
+        does not strip the rest.
+
+        POST rather than PUT: it merges rather than replaces, and every other
+        mutation this server takes is a POST — the CORS allowlist says so, and a
+        lone PUT is a method each runtime implementation would have to remember
+        to allow separately.
+
+        There is deliberately no GET. The values go one way: in, and then only
+        to a service resolving a reference for a call it is making. What is held
+        can be *named* — the response says which aliases the runtime now has —
+        because a client needs to show whether a credential is configured.
+        """
+        runtime = self._get_runtime_or_404(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest()
+        runtime.set_secrets(read_secrets_payload(body))
+        return web.json_response({"aliases": runtime.secrets().aliases()})
 
     async def _rearrange_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
@@ -958,6 +993,10 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
             isinstance(value.get("state"), dict)
             and value["state"].get("logData") is False
         ),
+        # Values for the references the services carry. Read out of the payload
+        # here and handed to the runtime's vault; they are never put back into
+        # any service's state, and never appear in a serialized runtime.
+        secrets=read_secrets_payload(value.get("secrets")),
         services=services,
     )
 

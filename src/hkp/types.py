@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
+from .secrets import SecretEntry, SecretVault
+
 # Generic JSON object type
 JsonRecord = dict[str, Any]
 
@@ -68,6 +70,18 @@ class RuntimeConfiguration:
     #: is the real gate, which is why this defaults to allowed. Setting it False
     #: is a board-wide override for a deployment that must never write payloads.
     log_data: bool = True
+    #: Values for the ``{{secret.<alias>}}`` references this runtime's services
+    #: carry, by alias.
+    #:
+    #: They ride with the create payload because provisioning is one call: the
+    #: services in it are constructed *and* configured before it returns, and a
+    #: service that opens a connection while being configured needs its
+    #: credential by then. Sending them later would be too late for exactly the
+    #: services that have one.
+    #:
+    #: They are unpacked into the runtime's vault and go no further — never into
+    #: a service's state, never into a serialized runtime, never back out.
+    secrets: dict[str, SecretEntry] = field(default_factory=dict)
     services: list[ServiceConfiguration] = field(default_factory=list)
 
 
@@ -170,6 +184,15 @@ class RuntimeHost(Protocol):
     def notify(self, payload: Any, instance_id: str) -> None: ...
 
     def emit_result(self, output: Any) -> None: ...
+
+    def spawn(self, coro: Any) -> bool:
+        """Run a coroutine on the server's loop, from wherever this is called.
+
+        A service that starts work during ``process`` is running on a worker
+        thread, where there is no loop to schedule on. False means there was
+        none to schedule on at all, so the caller can say so in its own words.
+        """
+        ...
 
     def log(self, level: LogLevel, event: str, data: Any = None) -> None:
         """Record something about the run in progress.

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+
 import time
 import uuid as _uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterator
+from typing import Any, Coroutine, Callable, Iterator
 
 from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
+from .secrets import SecretEntry, SecretVault
 from .types import (
     LogEntry,
     LogLevel,
@@ -69,6 +72,22 @@ def child_run(parent: ProcessContext | None) -> ProcessContext:
     return ProcessContext(run_id=str(_uuid.uuid4()), parent_run_id=parent.run_id)
 
 
+#: The loop the server runs on, for work a service starts from a worker thread.
+#:
+#: A runtime's ``process`` is called on a thread pool, so a service scheduling
+#: something during a pass has no running loop to schedule it on. The server
+#: records its loop here once, and every runtime — nested ones included, which
+#: are built during a pass and would otherwise capture nothing — schedules
+#: through it.
+_server_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_server_loop(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Told once by the server, at startup."""
+    global _server_loop
+    _server_loop = loop
+
+
 class HostedRuntime:
     def __init__(
         self,
@@ -104,6 +123,15 @@ class HostedRuntime:
         self._logging = config.logging
         self._log_level = config.log_level if config.log_level in LOG_LEVELS else "info"
         self._create_service = create_service
+        #: Values for the references this runtime's services carry. Held apart
+        #: from every service's state, and reachable only through secrets().
+        #: Filled before any service is built, because a service that opens a
+        #: connection while being configured asks for its credential then.
+        self._vault = SecretVault()
+        self._vault.replace(config.secrets)
+        #: Where this runtime's secrets come from when they are not its own;
+        #: see delegate_secrets.
+        self._secrets_from: Callable[[], SecretVault | None] | None = None
 
         for svc_config in config.services:
             self.add_service(svc_config)
@@ -393,6 +421,71 @@ class HostedRuntime:
             "log_data": self._log_data,
             "log_level": self._log_level,
         }
+
+    def secrets(self) -> SecretVault:
+        """The runtime's secrets, for a service that has a credential to send.
+
+        A service holds the reference it was configured with and asks here for
+        the value, naming where it is about to send it. What comes back is used
+        and dropped: assigning it to state would put it back on the path a board
+        is saved from, which is the whole thing this arrangement exists to
+        prevent.
+        """
+        if self._secrets_from is not None:
+            delegated = self._secrets_from()
+            if delegated is not None:
+                return delegated
+        return self._vault
+
+    def set_secrets(self, entries: dict[str, SecretEntry]) -> None:
+        """Takes in values for references this runtime's services already hold.
+
+        Merges rather than replaces, because this is what a client editing one
+        entry sends, and what a client re-pushes after a restart. Replacing on a
+        partial push would strip credentials from services nobody touched.
+        """
+        self._vault.merge(entries)
+
+    def delegate_secrets(
+        self, source: Callable[[], SecretVault | None]
+    ) -> None:
+        """Take secrets from somewhere else rather than from this runtime's own.
+
+        A nested pipeline is a runtime nobody provisions: no create payload
+        reaches it, so its own vault stays empty and a service inside it could
+        never resolve a reference. What it does have is the runtime around it,
+        which was provisioned — so it asks that one instead.
+
+        Asked for each time rather than copied, so that a value pushed after a
+        board is running reaches a nested service as immediately as a top-level
+        one, and so that nesting composes: each level delegates outward until it
+        reaches the runtime that was actually given something.
+        """
+        self._secrets_from = source
+
+    def spawn(self, coro: Coroutine[Any, Any, Any]) -> bool:
+        """Run a coroutine on the server's loop, from wherever this is called.
+
+        A service that starts work during ``process`` — a request, a timer — is
+        running on a worker thread, where there is no loop to schedule on.
+        Answering False rather than raising lets a caller say so in its own
+        words; the coroutine is closed either way, so nothing is left
+        un-awaited.
+        """
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is not None:
+            running.create_task(coro)
+            return True
+        if _server_loop is not None:
+            asyncio.run_coroutine_threadsafe(coro, _server_loop)
+            return True
+
+        coro.close()
+        return False
 
     def emit_result(self, output: Any) -> None:
         for target in list(self._result_targets):
