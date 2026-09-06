@@ -49,6 +49,7 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `HKP_MAX_RUNTIMES_PER_USER` | — | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Re-creating a runtime that already exists is never refused. |
 | `HKP_MAX_SERVICES_PER_RUNTIME` | — | Maximum services per runtime. Unset or `0` means unlimited. |
 | `HKP_MIN_TIMER_INTERVAL_MS` | — | Lower bound on the Timer service's periodic interval; shorter periods are clamped. Unset or `0` means no floor. |
+| `HKP_MOUNT_SECRET` | — | Keys the derivation of service endpoint addresses. Unset, a key is drawn once and kept at `~/.hkp/python/mount-secret`, so addresses survive a restart on this machine; set it to share one across instances. |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400` | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token. |
 
 Variables may also be placed in a `.env` file in the project root (real
@@ -111,6 +112,14 @@ These endpoints are deliberately **unauthenticated** — they exist to be called
 outside parties (webhooks, uploads) that hold no token — so the unguessable
 `mountId` is what gates access. It carries no user identifier. A mount is
 released when its service is bypassed or its runtime goes away.
+
+The id is **derived, not drawn**: an HMAC of the tenant, the board, the runtime
+and what the mount is called (`mountName` on the service, defaulting to its
+uuid), keyed by `HKP_MOUNT_SECRET` or the key persisted beside this runtime's
+data. So the address is the same every time the board is loaded and after a
+restart — an outside party configured with it by hand keeps working — while
+staying uncomputable without the key. Renaming a mount rotates that one address;
+rotating the key rotates all of them.
 
 `port` is still accepted on the service and ignored, so existing boards load.
 

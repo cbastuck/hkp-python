@@ -200,12 +200,24 @@ class RuntimeServer:
 
         # Public service endpoints. Declared before the runtime app because
         # runtimes hand mounts to their services as they are created.
-        self._mounts = MountRegistry(self._public_mount_url)
+        # Keys the derivation of public endpoint addresses. Given none, the
+        # registry draws one for this process, so addresses work but change on
+        # restart; `__main__` persists one so they do not.
+        self._mounts = MountRegistry(
+            self._public_mount_url, options.get("mount_secret")
+        )
         self.runtime_app = RuntimeApp(
             factories,
             mounts_for=lambda owner, runtime_id: RuntimeMounts(
-                mount=lambda service_uuid, handler: self._mounts.register(
-                    owner, runtime_id, service_uuid, handler
+                mount=lambda service_uuid, handler, board_name="", mount_name=None: (
+                    self._mounts.register(
+                        owner,
+                        runtime_id,
+                        service_uuid,
+                        handler,
+                        board_name=board_name,
+                        mount_name=mount_name,
+                    )
                 )
             ),
         )

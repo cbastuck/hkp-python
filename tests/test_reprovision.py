@@ -1,8 +1,7 @@
 """What happens when a runtime that already exists is provisioned again.
 
 hkp-node reuses the running runtime, so a browser attaching to a
-coordinator-managed board does not kill services the coordinator started, and
-mounts keep the addresses already handed to their consumers
+coordinator-managed board does not kill services the coordinator started
 (hkp-node/tests/cloud-reprovision.test.ts).
 
 **hkp-python rebuilds it instead.** These tests pin that difference rather than
@@ -64,9 +63,10 @@ async def published_mount(base_url: str, runtime_id: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_reprovisioning_replaces_the_runtime_and_its_mounts(servers):
-    # Divergence: on hkp-node the address survives. Flip this to == when python
-    # adopts reuse.
+async def test_reprovisioning_keeps_the_published_endpoint(servers):
+    # Not a divergence any more: the runtime is still rebuilt, but an address is
+    # derived from what identifies the mount rather than drawn when it is
+    # claimed, so the new registration lands on the one already handed out.
     _server, base_url = await servers()
     await provision(base_url, "rt-1", [ENDPOINT_SERVICE])
     first = await published_mount(base_url, "rt-1")
@@ -74,14 +74,11 @@ async def test_reprovisioning_replaces_the_runtime_and_its_mounts(servers):
     await provision(base_url, "rt-1", [ENDPOINT_SERVICE])
     second = await published_mount(base_url, "rt-1")
 
-    assert second != first
+    assert second == first
 
-    # The address the first registration published no longer serves, so anything
-    # already pointed at it — a coordinator's consumer, say — is stranded.
+    # And it is the rebuilt service answering there, not a stale record.
     async with aiohttp.ClientSession() as session:
         async with session.get(first) as res:
-            assert res.status == 404
-        async with session.get(second) as res:
             assert res.status == 200
 
 

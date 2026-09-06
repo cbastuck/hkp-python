@@ -70,6 +70,11 @@ class HttpServerSubservicesService:
         self._mode: str = "process_on_session"
         self._latest_data: Any = None
         self._mount: MountHandle | None = None
+        #: What this endpoint is called, which is what its public address is
+        #: derived from. Empty falls back to the service's uuid, which is stable
+        #: in a board file too — so an address only changes when a board
+        #: deliberately renames it.
+        self._mount_name = ""
         self._pipeline_config: list[ServiceConfiguration] = []
         #: Which of a request's headers the pipeline is shown, or None for all.
         #:
@@ -90,8 +95,6 @@ class HttpServerSubservicesService:
             self.configure(config.state)
 
     def configure(self, config: JsonRecord) -> JsonRecord:
-        previous_bypass = self._bypass
-
         # `port` is accepted and ignored: the endpoint is served by the shared
         # runtime server under an assigned path, so a service no longer picks a
         # port. Older boards still carry the field, and rejecting it would fail
@@ -116,6 +119,15 @@ class HttpServerSubservicesService:
                 if isinstance(names, list)
                 else None
             )
+
+        if isinstance(config.get("mountName"), str):
+            # Renaming rotates this endpoint's address, so an already-claimed
+            # mount is released and claimed again under the new name rather than
+            # left answering on the old one.
+            renamed = config["mountName"] != self._mount_name
+            self._mount_name = config["mountName"]
+            if renamed and self._mount:
+                self._release_mount()
 
         if config.get("mode") in (
             "process_on_session",
@@ -161,8 +173,10 @@ class HttpServerSubservicesService:
             else:
                 self._claim_mount()
 
-        # Claim if we transitioned from bypassed to active without a mount yet
-        if previous_bypass and not self._bypass and not self._mount:
+        # Anything above may have left this without an endpoint it should have —
+        # coming out of bypass, or a rename that released the old address. One
+        # check covers them rather than one per cause.
+        if not self._bypass and not self._mount:
             self._claim_mount()
 
         return self.get_state()
@@ -186,6 +200,8 @@ class HttpServerSubservicesService:
         return {
             "bypass": self._bypass,
             "mode": self._mode,
+            # Name this endpoint is known by; see the field on the service.
+            "mountName": self._mount_name,
             # Public endpoint assigned by the runtime; empty while bypassed.
             # Reserved name: generic board machinery reads and rewrites it (see
             # the frontend's runtime/board/mount).
@@ -245,7 +261,7 @@ class HttpServerSubservicesService:
     def _claim_mount(self) -> None:
         if self._mount or not self._host:
             return
-        mount = self._host.mount(self.uuid, self._handle_request)
+        mount = self._host.mount(self.uuid, self._handle_request, self._mount_name)
         if not mount:
             return
         self._mount = mount

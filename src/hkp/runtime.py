@@ -321,17 +321,31 @@ class HostedRuntime:
         with self._with_context(run_context):
             return self._process_from_index(start_index, data, on_notification)
 
-    def mount(self, service_uuid: str, handler: MountHandler) -> MountHandle | None:
+    def mount(
+        self,
+        service_uuid: str,
+        handler: MountHandler,
+        mount_name: str | None = None,
+    ) -> MountHandle | None:
         """Claim a publicly reachable endpoint served by the shared server.
 
         Returns None when the host cannot serve mounts — an inner sub-service
         pipeline, or a server that is not listening yet — in which case the
         service has no public endpoint and should say so in its state rather
         than falling back to a port of its own.
+
+        The board is named here rather than by the caller: a service knows what
+        its endpoint is called, and the runtime knows which board it is in, and
+        the address is derived from both.
         """
         if not self._mounts:
             return None
-        return self._mounts.mount(service_uuid, handler)
+        return self._mounts.mount(
+            service_uuid,
+            handler,
+            board_name=self.board_name,
+            mount_name=mount_name,
+        )
 
     def notify(self, payload: Any, instance_id: str) -> None:
         self._emit_notification(
