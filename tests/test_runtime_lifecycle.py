@@ -134,6 +134,23 @@ async def test_a_runtime_nobody_connected_to_is_never_reaped(servers):
 
 
 @pytest.mark.asyncio
+async def test_deleting_a_runtime_the_disconnect_already_reaped_succeeds(servers):
+    # What a client removing a runtime actually does: it closes its notification
+    # socket and then sends the DELETE. The close reaps a garbage-collected
+    # runtime on its own, so the DELETE arrives for a runtime that is already
+    # gone — the desired end state, not an error.
+    _server, base_url = await servers()
+    output_url = await create_runtime(base_url, {"garbageCollected": True})
+
+    await connect_then_close(output_url)
+    assert await runtime_status(base_url) == 404
+
+    async with aiohttp.ClientSession() as session:
+        async with session.delete(f"{base_url}/runtimes/rt-1") as res:
+            assert res.status == 200
+
+
+@pytest.mark.asyncio
 async def test_deleting_still_works(servers):
     _server, base_url = await servers()
     await create_runtime(base_url, {})

@@ -187,10 +187,12 @@ async def test_cannot_delete_another_tenants_runtime(servers):
     async with aiohttp.ClientSession() as session:
         await create_runtime_as(session, base_url, ALICE, "alice-rt", "m1")
 
+        # DELETE is idempotent and always reports success, so the check is that
+        # Alice's runtime is still there afterwards.
         async with session.delete(
             f"{base_url}/runtimes/alice-rt", headers=auth(BOB)
         ) as res:
-            assert res.status == 404
+            assert res.status == 200
 
         async with session.get(
             f"{base_url}/runtimes/alice-rt", headers=auth(ALICE)

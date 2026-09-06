@@ -560,10 +560,16 @@ class RuntimeServer:
     async def _delete_runtime(self, request: web.Request) -> web.Response:
         runtime_id = request.match_info["runtime_id"]
         owner = self._owner_of(request)
+        # Idempotent: a runtime already gone is the desired end state, not an
+        # error. A client removing a runtime closes its notification socket
+        # first, and that close reaps a garbage-collected runtime on its own —
+        # so by the time this explicit DELETE arrives the runtime is frequently
+        # already removed. Reporting NOT_FOUND there surfaces a spurious
+        # "Failed to remove runtime" to the user.
+        #
         # Scoped to the caller, so this can only ever remove their own runtime;
         # an id owned by another tenant is indistinguishable from a missing one.
-        if not self.runtime_app.remove_runtime(owner, runtime_id):
-            raise web.HTTPNotFound()
+        self.runtime_app.remove_runtime(owner, runtime_id)
         self._mounts.release_runtime(owner, runtime_id)
         self._purge_session_tokens(owner, runtime_id)
         return web.json_response({"id": runtime_id})
