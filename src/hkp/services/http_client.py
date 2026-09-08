@@ -14,13 +14,17 @@ from __future__ import annotations
 # provide, sharing their state contract (url, method, headers, userAgent, body)
 # and therefore the same UI panel.
 #
-# What it adds, like hkp-node's, is __hkpMount, which takes precedence over url
-# when set: an address, or a hkp-mount://<runtimeId>/<serviceUuid> reference to
-# the service that owns the mount. A reference is resolved by the board's
-# coordinator, the only instance that can see across runtimes, and this service
-# is configured with the resulting address before it runs. Seeing a reference
-# here therefore means the owner has not published an address yet — a normal
-# state while a board is still coming up, not an error.
+# What it adds, like hkp-node's, is the ability to call a mount. url may hold a
+# hkp-mount://<runtimeId>/<serviceUuid> reference instead of an address: it names
+# the service that owns the endpoint, which is what a board can know when an
+# address is only assigned at load. The board's coordinator — the only instance
+# that can see across runtimes — resolves it and configures __hkpMount with the
+# address, which then takes precedence.
+#
+# So url is what a person writes and __hkpMount is what the run produced, and
+# neither overwrites the other. An unresolved reference in either means the owner
+# has not published yet: a normal state while a board comes up, and a reason to
+# wait rather than to dial anything.
 #
 # The response shape mirrors what http-server-subservices produces for an
 # incoming request, so a pipeline that handles one handles the other.
@@ -152,11 +156,19 @@ class HttpClientService:
             # Either nothing is configured, or the mount's owner has not
             # published an address yet. Say so and stop; the next input tries
             # again, by which time the coordinator has usually handed it over.
+            pending = next(
+                (
+                    value
+                    for value in (self._mount, self._url)
+                    if is_mount_reference(value)
+                ),
+                "",
+            )
             notify(
                 {
                     "error": (
-                        f'Waiting for "{self._mount}" to publish an endpoint'
-                        if is_mount_reference(self._mount)
+                        f'Waiting for "{pending}" to publish an endpoint'
+                        if pending
                         else "No target configured"
                     )
                 }
@@ -188,17 +200,20 @@ class HttpClientService:
     def _target_url(self) -> str | None:
         """The URL to call, or None while there is nothing callable.
 
-        A mount takes precedence over a typed URL — a board that names a service
-        is being explicit about which endpoint it means, and the address is not
-        knowable when the board is written. An unresolved reference is therefore
-        "not ready yet" rather than a reason to fall back to ``url``, which would
-        silently call something else.
+        A resolved mount address wins over a typed URL — a board that names a
+        service is being explicit about which endpoint it means, and the address
+        is not knowable when the board is written.
+
+        A reference in either field is "not ready yet" rather than something to
+        dial: it names a service whose address nobody has published, and falling
+        back past it would silently call something else. Boards written before
+        the split carry the reference in ``__hkpMount``; both read the same way.
         """
         if self._mount:
             if is_mount_reference(self._mount):
                 return None
             return join_mount_path(self._mount, self._path)
-        if not self._url:
+        if not self._url or is_mount_reference(self._url):
             return None
         return join_mount_path(self._url, self._path)
 
