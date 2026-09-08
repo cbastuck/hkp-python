@@ -21,9 +21,10 @@ from urllib.parse import parse_qsl, urlparse
 from aiohttp import web
 
 from ..mounts import MountContext, MountHandle, decode_body
-from ..runtime import HostedRuntime
+from ..runtime import HostedRuntime, child_run, new_run
 from ..mount import MOUNT_FIELD
 from ..types import (
+    ProcessContext,
     JsonRecord,
     NotifyCallback,
     RuntimeHost,
@@ -69,9 +70,24 @@ class HttpServerSubservicesService:
         self._mode: str = "process_on_session"
         self._latest_data: Any = None
         self._mount: MountHandle | None = None
+        #: What this endpoint is called, which is what its public address is
+        #: derived from. Empty falls back to the service's uuid, which is stable
+        #: in a board file too — so an address only changes when a board
+        #: deliberately renames it.
+        self._mount_name = ""
         self._pipeline_config: list[ServiceConfiguration] = []
+        #: Which of a request's headers the pipeline is shown, or None for all.
+        #:
+        #: Headers are where a caller puts a credential, and ``meta`` goes
+        #: wherever the pipeline takes it — including into a board, if a service
+        #: is wired to write it there. Naming the ones a board actually reads is
+        #: how it stops carrying the ones it does not: an empty list forwards
+        #: none, and no list at all forwards everything, which is what a board
+        #: that has not thought about it gets.
+        self._forward_headers: list[str] | None = None
         self._pipeline: HostedRuntime | None = None
         self._release_pipeline_notifications: Callable[[], None] | None = None
+        self._release_pipeline_logs: Callable[[], None] | None = None
         self._create_service = create_service
         self._host: RuntimeHost | None = None
 
@@ -79,8 +95,6 @@ class HttpServerSubservicesService:
             self.configure(config.state)
 
     def configure(self, config: JsonRecord) -> JsonRecord:
-        previous_bypass = self._bypass
-
         # `port` is accepted and ignored: the endpoint is served by the shared
         # runtime server under an assigned path, so a service no longer picks a
         # port. Older boards still carry the field, and rejecting it would fail
@@ -96,6 +110,25 @@ class HttpServerSubservicesService:
         #   pipeline is a single ordered list either way, so a service inside it
         #   that needs to tell a request from a data arrival has to do so from
         #   the input.
+        # An array is a decision, including an empty one. Anything else —
+        # absent, None, a string — leaves the default of forwarding all of them.
+        if "forwardHeaders" in config:
+            names = config["forwardHeaders"]
+            self._forward_headers = (
+                [n.lower() for n in names if isinstance(n, str)]
+                if isinstance(names, list)
+                else None
+            )
+
+        if isinstance(config.get("mountName"), str):
+            # Renaming rotates this endpoint's address, so an already-claimed
+            # mount is released and claimed again under the new name rather than
+            # left answering on the old one.
+            renamed = config["mountName"] != self._mount_name
+            self._mount_name = config["mountName"]
+            if renamed and self._mount:
+                self._release_mount()
+
         if config.get("mode") in (
             "process_on_session",
             "process_on_data",
@@ -140,25 +173,57 @@ class HttpServerSubservicesService:
             else:
                 self._claim_mount()
 
-        # Claim if we transitioned from bypassed to active without a mount yet
-        if previous_bypass and not self._bypass and not self._mount:
+        # Anything above may have left this without an endpoint it should have —
+        # coming out of bypass, or a rename that released the old address. One
+        # check covers them rather than one per cause.
+        if not self._bypass and not self._mount:
             self._claim_mount()
 
         return self.get_state()
+
+    def _request_headers(self, request: Any) -> JsonRecord:
+        """The headers this pipeline is shown, lower-cased as HTTP names compare.
+
+        A caller that has to prove who it is does so in a header — a shared
+        secret, a signature, a bearer token — so a pipeline that cannot see them
+        cannot check one. What a board does not name, it does not receive.
+        """
+        headers: JsonRecord = {}
+        for name, value in request.headers.items():
+            lowered = name.lower()
+            if self._forward_headers is not None and lowered not in self._forward_headers:
+                continue
+            headers[lowered] = value
+        return headers
 
     def get_state(self) -> JsonRecord:
         return {
             "bypass": self._bypass,
             "mode": self._mode,
+            # Name this endpoint is known by; see the field on the service.
+            "mountName": self._mount_name,
             # Public endpoint assigned by the runtime; empty while bypassed.
             # Reserved name: generic board machinery reads and rewrites it (see
             # the frontend's runtime/board/mount).
             MOUNT_FIELD: self._mount.url if self._mount else "",
+            "forwardHeaders": self._forward_headers,
             "pipeline": self._get_pipeline_state(),
         }
 
     def set_host(self, host: RuntimeHost) -> None:
         self._host = host
+        # A pipeline built in the constructor was built before there was a host
+        # to ask, so what the board records reaches it here rather than never.
+        self._apply_log_settings()
+
+    def _apply_log_settings(self) -> None:
+        """Hands the board's log settings to the nested pipeline, if any."""
+        if not self._host or not self._pipeline:
+            return
+        settings = self._host.log_settings()
+        self._pipeline.set_logging(settings["logging"])
+        self._pipeline.set_log_data(settings["log_data"])
+        self._pipeline.set_log_level(settings["log_level"])
         # State is applied in the constructor, before the host exists, so a
         # service configured as already-active has nothing to claim its mount
         # from until now. Claiming here is what makes a board load into a live
@@ -196,7 +261,7 @@ class HttpServerSubservicesService:
     def _claim_mount(self) -> None:
         if self._mount or not self._host:
             return
-        mount = self._host.mount(self.uuid, self._handle_request)
+        mount = self._host.mount(self.uuid, self._handle_request, self._mount_name)
         if not mount:
             return
         self._mount = mount
@@ -219,6 +284,13 @@ class HttpServerSubservicesService:
                 text=json.dumps({"error": "http-server-subservices is bypassed"}),
             )
 
+        # Serving a request is one run, however many pipelines it passes
+        # through: the nested handler below descends from it, and the outer
+        # chain afterwards continues it. Minting one here rather than letting
+        # each leg mint its own is what keeps a request's trace joined up
+        # instead of arriving as two unrelated runs sharing a timestamp.
+        run_context = new_run()
+
         answered_by_subservices = False
         if self._mode == "process_on_data":
             process_input = self._latest_data
@@ -226,7 +298,7 @@ class HttpServerSubservicesService:
         else:
             process_input = await self._read_request(request, context)
             answered_by_subservices = self._has_subservices()
-            output = self._process_session_input(process_input)
+            output = self._process_session_input(process_input, run_context)
 
         # What the nested pipeline produced, before the outer runtime sees it.
         answer = output
@@ -240,7 +312,9 @@ class HttpServerSubservicesService:
             #
             # The callback is a no-op: the runtime already fans notifications
             # out to its targets, and re-notifying would deliver each twice.
-            output = self._host.process_from(self.uuid, output, lambda _n: None)
+            output = self._host.process_from(
+                self.uuid, output, lambda _n: None, run_context
+            )
             self._host.emit_result(output)
 
         # With a nested pipeline configured, that pipeline is the handler and
@@ -271,6 +345,7 @@ class HttpServerSubservicesService:
             "method": request.method,
             "path": parsed.path or "/",
             "query": dict(parse_qsl(parsed.query)),
+            "headers": self._request_headers(request),
         }
 
         content_type = request.headers.get("Content-Type")
@@ -320,13 +395,26 @@ class HttpServerSubservicesService:
         """Whether a nested pipeline is configured to handle requests."""
         return bool(self._pipeline and self._pipeline.list_services())
 
-    def _process_session_input(self, input: Any) -> Any:
+    def _process_session_input(
+        self, input: Any, parent: ProcessContext | None = None
+    ) -> Any:
+        """Runs the nested pipeline as a run descended from ``parent``.
+
+        Both entry points land here, and they differ only in what they descend
+        from: a request brings the run its caller minted for the whole exchange,
+        while data from the outer chain arrives mid-call and descends from
+        whatever that call is running as.
+        """
         if not self._pipeline or not self._pipeline.list_services():
             return input
         # The callback is a no-op: the nested runtime fans these out to the
         # target registered in _rebuild. Forwarding them here as well would
         # deliver every one twice.
-        return self._pipeline.process(input, lambda _n: None)
+        return self._pipeline.process(
+            input,
+            lambda _n: None,
+            child_run(parent or (self._host.current_context() if self._host else None)),
+        )
 
     def _do_notify(self, payload: Any, instance_id: str | None = None) -> None:
         if self._host:
@@ -361,10 +449,22 @@ class HttpServerSubservicesService:
             lambda n: self._do_notify(n.payload, n.instance_id)
         )
 
+        # A nested pipeline's entries belong to the same board log as everything
+        # else; only the runtime hosting this service can carry them there, since
+        # a nested runtime has no route out of its own.
+        self._release_pipeline_logs = self._pipeline.register_log_target(
+            lambda entry: self._host.forward_log(entry) if self._host else None
+        )
+
+        self._apply_log_settings()
+
     def _release_notifications(self) -> None:
         if self._release_pipeline_notifications:
             self._release_pipeline_notifications()
             self._release_pipeline_notifications = None
+        if self._release_pipeline_logs:
+            self._release_pipeline_logs()
+            self._release_pipeline_logs = None
 
     def _sync_states(self) -> None:
         if not self._pipeline:

@@ -92,11 +92,9 @@ async def test_endpoint_is_served_without_a_token(servers):
             assert res.status == 200
             received = await res.json()
 
-        assert received["meta"] == {
-            "method": "GET",
-            "path": "/hello",
-            "query": {"a": "1"},
-        }
+        assert received["meta"]["method"] == "GET"
+        assert received["meta"]["path"] == "/hello"
+        assert received["meta"]["query"] == {"a": "1"}
         # No body at all, so neither representation is carried.
         assert "binary" not in received
         assert "body" not in received
@@ -228,3 +226,89 @@ async def test_unknown_mount_is_404(servers):
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{base_url}/hosted/{'0' * 32}/x") as res:
             assert res.status == 404
+
+
+class TestRequestHeaders:
+    """A caller that has to prove who it is does so in a header.
+
+    A shared secret, a signature, a bearer token — a pipeline that cannot see
+    them cannot check one. They are also where a credential arrives, and ``meta``
+    goes wherever the pipeline takes it, so a board can say which ones it reads.
+    """
+
+    async def _endpoint(
+        self, session: aiohttp.ClientSession, base_url: str, state: dict
+    ) -> str:
+        async with session.post(
+            f"{base_url}/runtimes",
+            json={
+                "id": "rt-1",
+                "name": "Python",
+                "services": [
+                    {
+                        **HTTP_SERVICE,
+                        "state": {**HTTP_SERVICE["state"], **state},
+                    }
+                ],
+            },
+        ) as res:
+            assert res.status == 200
+        async with session.get(f"{base_url}/runtimes/rt-1/services/http-1") as res:
+            return (await res.json())["__hkpMount"]
+
+    @pytest.mark.asyncio
+    async def test_reach_the_pipeline_so_a_caller_can_be_checked(self, servers) -> None:
+        _server, base_url = await servers()
+        async with aiohttp.ClientSession() as session:
+            endpoint = await self._endpoint(session, base_url, {})
+
+            async with session.get(
+                f"{endpoint}/hello",
+                headers={"authorization": "123", "x-signature": "abc"},
+            ) as res:
+                meta = (await res.json())["meta"]
+
+            assert meta["headers"]["authorization"] == "123"
+            assert meta["headers"]["x-signature"] == "abc"
+
+    @pytest.mark.asyncio
+    async def test_are_narrowed_to_the_ones_a_board_names(self, servers) -> None:
+        _server, base_url = await servers()
+        async with aiohttp.ClientSession() as session:
+            endpoint = await self._endpoint(
+                session, base_url, {"forwardHeaders": ["X-Signature"]}
+            )
+
+            async with session.get(
+                f"{endpoint}/hello",
+                headers={"authorization": "123", "x-signature": "abc"},
+            ) as res:
+                meta = (await res.json())["meta"]
+
+            # Named case-insensitively, as HTTP header names compare.
+            assert meta["headers"] == {"x-signature": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_are_withheld_entirely_by_an_empty_list(self, servers) -> None:
+        # An empty array is a decision too, and the way to opt out.
+        _server, base_url = await servers()
+        async with aiohttp.ClientSession() as session:
+            endpoint = await self._endpoint(session, base_url, {"forwardHeaders": []})
+
+            async with session.get(
+                f"{endpoint}/hello", headers={"authorization": "123"}
+            ) as res:
+                meta = (await res.json())["meta"]
+
+            assert meta["headers"] == {}
+
+    @pytest.mark.asyncio
+    async def test_says_which_it_forwards_so_a_board_saves_the_decision(
+        self, servers
+    ) -> None:
+        _server, base_url = await servers()
+        async with aiohttp.ClientSession() as session:
+            await self._endpoint(session, base_url, {"forwardHeaders": ["Authorization"]})
+
+            async with session.get(f"{base_url}/runtimes/rt-1/services/http-1") as res:
+                assert (await res.json())["forwardHeaders"] == ["authorization"]

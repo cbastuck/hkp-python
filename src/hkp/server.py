@@ -20,7 +20,15 @@ from .auth import (
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
-from .runtime import HostedRuntime, HostedServiceFactory, RuntimeApp, TenantRuntimes
+from .runtime import set_server_loop
+from .secrets import read_secrets_payload
+from .runtime import (
+    context_from_wire,
+    HostedRuntime,
+    HostedServiceFactory,
+    RuntimeApp,
+    TenantRuntimes,
+)
 from .yas import (
     MessagePurpose,
     YasError,
@@ -48,6 +56,7 @@ from .services.timer import (
     TimerService,
 )
 from .types import (
+    ProcessContext,
     JsonRecord,
     RuntimeConfiguration,
     RuntimeNotification,
@@ -191,12 +200,24 @@ class RuntimeServer:
 
         # Public service endpoints. Declared before the runtime app because
         # runtimes hand mounts to their services as they are created.
-        self._mounts = MountRegistry(self._public_mount_url)
+        # Keys the derivation of public endpoint addresses. Given none, the
+        # registry draws one for this process, so addresses work but change on
+        # restart; `__main__` persists one so they do not.
+        self._mounts = MountRegistry(
+            self._public_mount_url, options.get("mount_secret")
+        )
         self.runtime_app = RuntimeApp(
             factories,
             mounts_for=lambda owner, runtime_id: RuntimeMounts(
-                mount=lambda service_uuid, handler: self._mounts.register(
-                    owner, runtime_id, service_uuid, handler
+                mount=lambda service_uuid, handler, board_name="", mount_name=None: (
+                    self._mounts.register(
+                        owner,
+                        runtime_id,
+                        service_uuid,
+                        handler,
+                        board_name=board_name,
+                        mount_name=mount_name,
+                    )
                 )
             ),
         )
@@ -218,6 +239,9 @@ class RuntimeServer:
 
     async def start(self, port: int = 0, host: str = "127.0.0.1") -> dict[str, Any]:
         self._loop = asyncio.get_running_loop()
+        # Services schedule their own work — a request, a timer — from a pass
+        # that runs on a worker thread, where there is no loop to schedule on.
+        set_server_loop(self._loop)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
@@ -330,6 +354,7 @@ class RuntimeServer:
         app.router.add_post(
             "/runtimes/{runtime_id}/session-token", self._mint_session_token
         )
+        app.router.add_post("/runtimes/{runtime_id}/secrets", self._post_secrets)
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
         app.router.add_post("/runtimes/{runtime_id}", self._process_runtime)
 
@@ -340,6 +365,10 @@ class RuntimeServer:
         )
         app.router.add_post(
             "/runtimes/{runtime_id}/services/{instance_id}", self._configure_service
+        )
+        app.router.add_post(
+            "/runtimes/{runtime_id}/services/{instance_id}/process",
+            self._process_service,
         )
         app.router.add_get(
             "/runtimes/{runtime_id}/services/{instance_id}", self._get_service
@@ -393,11 +422,16 @@ class RuntimeServer:
 
     # ── Processing ─────────────────────────────────────────────────────────────
 
-    async def _process_off_loop(self, runtime: HostedRuntime, body: Any) -> Any:
+    async def _process_off_loop(
+        self,
+        runtime: HostedRuntime,
+        body: Any,
+        context: ProcessContext | None = None,
+    ) -> Any:
         """Run the pipeline in the worker thread so slow services (e.g. ML
         inference) don't stall the event loop."""
         return await asyncio.get_running_loop().run_in_executor(
-            self._process_executor, runtime.process, body, lambda _n: None
+            self._process_executor, runtime.process, body, lambda _n: None, context
         )
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
@@ -538,10 +572,16 @@ class RuntimeServer:
     async def _delete_runtime(self, request: web.Request) -> web.Response:
         runtime_id = request.match_info["runtime_id"]
         owner = self._owner_of(request)
+        # Idempotent: a runtime already gone is the desired end state, not an
+        # error. A client removing a runtime closes its notification socket
+        # first, and that close reaps a garbage-collected runtime on its own —
+        # so by the time this explicit DELETE arrives the runtime is frequently
+        # already removed. Reporting NOT_FOUND there surfaces a spurious
+        # "Failed to remove runtime" to the user.
+        #
         # Scoped to the caller, so this can only ever remove their own runtime;
         # an id owned by another tenant is indistinguishable from a missing one.
-        if not self.runtime_app.remove_runtime(owner, runtime_id):
-            raise web.HTTPNotFound()
+        self.runtime_app.remove_runtime(owner, runtime_id)
         self._mounts.release_runtime(owner, runtime_id)
         self._purge_session_tokens(owner, runtime_id)
         return web.json_response({"id": runtime_id})
@@ -581,6 +621,35 @@ class RuntimeServer:
         self._session_tokens[token] = SessionToken(sub=sub, runtime_id=runtime.id)
         return web.json_response({"token": token})
 
+    async def _post_secrets(self, request: web.Request) -> web.Response:
+        """Values for the references this runtime's services hold.
+
+        Provisioning carries them already; this is for the moments it cannot
+        cover — a board being built a service at a time, an entry edited while a
+        board is running, and a re-push after a restart where the services
+        survived but the vault did not. It merges, so a client sending one entry
+        does not strip the rest.
+
+        POST rather than PUT: it merges rather than replaces, and every other
+        mutation this server takes is a POST — the CORS allowlist says so, and a
+        lone PUT is a method each runtime implementation would have to remember
+        to allow separately.
+
+        There is deliberately no GET. The values go one way: in, and then only
+        to a service resolving a reference for a call it is making. What is held
+        can be *named* — the response says which aliases the runtime now has —
+        because a client needs to show whether a credential is configured.
+        """
+        runtime = self._get_runtime_or_404(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest()
+        runtime.set_secrets(read_secrets_payload(body))
+        return web.json_response({"aliases": runtime.secrets().aliases()})
+
     async def _rearrange_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
         try:
@@ -611,6 +680,48 @@ class RuntimeServer:
                 raise web.HTTPBadRequest()
 
         result = await self._process_off_loop(runtime, body)
+        if _is_binary_result(result):
+            return web.Response(
+                body=serialize_message(result, purpose=MessagePurpose.RESULT),
+                content_type="application/octet-stream",
+            )
+        return web.json_response(_jsonable_result(result))
+
+    async def _process_service(self, request: web.Request) -> web.Response:
+        """Run the pipeline starting at one service, with a given payload.
+
+        Distinct from configuring it: configure says what a service *is*, this
+        says do your job with this. A facade button had only the former, so
+        anything it needed to cause had to be smuggled in as a config field that
+        a service read as a command.
+        """
+        runtime = self._get_runtime_or_404(request)
+        instance_id = request.match_info["instance_id"]
+        raw = await request.read()
+
+        if request.content_type == "application/octet-stream" or is_yas_message(raw):
+            try:
+                body = deserialize_message(raw).data
+            except YasError:
+                raise web.HTTPBadRequest()
+        else:
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                raise web.HTTPBadRequest()
+
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                self._process_executor,
+                runtime.process_at,
+                instance_id,
+                body,
+                lambda _n: None,
+                None,
+            )
+        except KeyError:
+            raise web.HTTPNotFound()
+
         if _is_binary_result(result):
             return web.Response(
                 body=serialize_message(result, purpose=MessagePurpose.RESULT),
@@ -729,8 +840,13 @@ class RuntimeServer:
                     if data.get("type") == "processRuntime" and "params" in data:
                         runtime = self.runtime_app.get_runtime(owner, runtime_id)
                         if runtime:
+                            # A peer driving this runtime names the run its
+                            # call belongs to, so that a board spanning several
+                            # runtimes reads as one trace rather than one each.
                             result = await self._process_off_loop(
-                                runtime, data["params"]
+                                runtime,
+                                data["params"],
+                                context_from_wire(data.get("context")),
                             )
                             if not ws.closed:
                                 if _is_binary_result(result):
@@ -880,6 +996,25 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         board_name=value.get("boardName", ""),
         # Absent means persist; see RuntimeConfiguration.garbage_collected.
         garbage_collected=value.get("garbageCollected") is True,
+        # Both absent mean off; see RuntimeConfiguration.logging / log_data.
+        logging=isinstance(value.get("state"), dict)
+        and value["state"].get("logging") is True,
+        log_level=(
+            value["state"]["logLevel"]
+            if isinstance(value.get("state"), dict)
+            and value["state"].get("logLevel")
+            in ("debug", "info", "warn", "error")
+            else "info"
+        ),
+        # Absent means allowed; see RuntimeConfiguration.log_data.
+        log_data=not (
+            isinstance(value.get("state"), dict)
+            and value["state"].get("logData") is False
+        ),
+        # Values for the references the services carry. Read out of the payload
+        # here and handed to the runtime's vault; they are never put back into
+        # any service's state, and never appear in a serialized runtime.
+        secrets=read_secrets_payload(value.get("secrets")),
         services=services,
     )
 

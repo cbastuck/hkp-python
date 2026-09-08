@@ -32,7 +32,14 @@ from typing import Any
 import aiohttp
 
 from ..mount import MOUNT_FIELD, is_mount_reference, join_mount_path
-from ..types import JsonRecord, NotifyCallback, ServiceConfiguration, ServiceRegistryEntry
+from ..secrets import resolve_credential
+from ..types import (
+    JsonRecord,
+    NotifyCallback,
+    ProcessContext,
+    ServiceConfiguration,
+    ServiceRegistryEntry,
+)
 
 HTTP_CLIENT_DESCRIPTOR = ServiceRegistryEntry(
     service_id="http-client",
@@ -156,15 +163,21 @@ class HttpClientService:
             )
             return None
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No event loop (e.g. a unit test calling process directly). Nothing
-            # can be scheduled, so say so rather than failing silently.
+        # Captured here, while still inside the call this request belongs to.
+        # By the time the response arrives the pass has long returned, so this
+        # is the only moment at which the run that asked for it can be named.
+        context = self._host.current_context() if self._host else None
+
+        # A pass runs on a worker thread, so there is no loop here to schedule
+        # on — the runtime knows the server's and schedules through it. Without
+        # a host there is none to ask, which is a unit test calling process
+        # directly rather than anything a board can reach.
+        coro = self._send(target, input, notify, context)
+        if self._host is None or not self._host.spawn(coro):
+            if self._host is None:
+                coro.close()
             notify({"error": "No event loop to run the request on"})
             return None
-
-        loop.create_task(self._send(target, input, notify))
         return None
 
     def destroy(self) -> None:
@@ -189,9 +202,26 @@ class HttpClientService:
             return None
         return join_mount_path(self._url, self._path)
 
-    async def _send(self, url: str, input: Any, notify: NotifyCallback) -> None:
+    async def _send(
+        self,
+        url: str,
+        input: Any,
+        notify: NotifyCallback,
+        context: ProcessContext | None = None,
+    ) -> None:
         body, content_type = self._request_body(input)
-        headers = dict(self._headers)
+        # Headers are a free-form map, and a credential is as likely to be part
+        # of one — ``Bearer <token>`` — as to be a field of its own. Resolved
+        # against the address being called, so a header bound to one host cannot
+        # be sent to another by repointing this service. What comes back is used
+        # for this request and dropped; nothing resolved goes back into state.
+        credential = resolve_credential(
+            self._host.secrets() if self._host else None, self._headers, url
+        )
+        if credential.problem:
+            notify({"requesting": False, "url": url, "error": credential.problem})
+            return
+        headers = dict(credential.value)
         if content_type and "content-type" not in {k.lower() for k in headers}:
             headers["content-type"] = content_type
         if self._user_agent and "user-agent" not in {k.lower() for k in headers}:
@@ -215,7 +245,7 @@ class HttpClientService:
                             "inFlight": self._in_flight - 1,
                         }
                     )
-            self._push(result, notify)
+            self._push(result, notify, context)
         except Exception as err:  # noqa: BLE001 - reported, not swallowed
             notify({"requesting": False, "url": url, "error": str(err)})
             # A failed request produces no result to pass on: the pipeline behind
@@ -291,7 +321,12 @@ class HttpClientService:
 
         return {"meta": meta, "binary": raw}
 
-    def _push(self, result: JsonRecord, notify: NotifyCallback) -> None:
+    def _push(
+        self,
+        result: JsonRecord,
+        notify: NotifyCallback,
+        context: ProcessContext | None = None,
+    ) -> None:
         """Run the rest of the pipeline with the response, then emit the runtime's
         result. A service that produces data outside the push has to emit it
         itself; nothing else will, and running the remaining services alone would
@@ -305,6 +340,7 @@ class HttpClientService:
             # No-op: the runtime already fans these out to its notification
             # targets. Re-notifying through the host would deliver each twice.
             lambda _n: None,
+            context,
         )
         # A downstream service returning None means "stop" — honour it rather
         # than forwarding a dead result to the next runtime.

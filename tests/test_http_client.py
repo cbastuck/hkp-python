@@ -16,6 +16,7 @@ from aiohttp import web
 from hkp.mount import is_mount_reference, join_mount_path
 from hkp.services.http_client import HttpClientService
 from hkp.types import ServiceConfiguration
+from hkp.secrets import SecretVault, read_secrets_payload
 
 
 class HostSpy:
@@ -24,10 +25,26 @@ class HostSpy:
     def __init__(self) -> None:
         self.pushed: list[Any] = []
         self.emitted: list[Any] = []
+        #: What a header naming a secret resolves against.
+        self.vault = SecretVault()
 
-    def process_from(self, _uuid: str, data: Any, _on_notification: Any) -> Any:
+    def secrets(self) -> SecretVault:
+        return self.vault
+
+    def spawn(self, coro: Any) -> bool:
+        # These tests already run on a loop, which is the case a board never is
+        # in — see test_secrets_endpoint for the pass that runs off it.
+        asyncio.get_running_loop().create_task(coro)
+        return True
+
+    def process_from(
+        self, _uuid: str, data: Any, _on_notification: Any, _context: Any = None
+    ) -> Any:
         self.pushed.append(data)
         return data
+
+    def current_context(self) -> Any:
+        return None
 
     def notify(self, _payload: Any, _instance_id: str) -> None:
         pass

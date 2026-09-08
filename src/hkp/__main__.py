@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -18,10 +19,51 @@ def _read_integer(value: str | None, fallback: int) -> int:
         return fallback
 
 
+def _resolve_mount_secret() -> str:
+    """The key public mount addresses are derived from.
+
+    Taken from the environment where there is one, so a deployment can hold it
+    with its other secrets and several instances behind a load balancer agree on
+    the addresses they serve. Otherwise drawn once and kept beside the rest of
+    this runtime's data, because the alternative — a fresh key per start — is
+    what makes an endpoint configured in somebody else's product stop working
+    after a restart.
+    """
+    from_env = os.environ.get("HKP_MOUNT_SECRET")
+    if from_env:
+        return from_env
+
+    file = Path.home() / ".hkp" / "python" / "mount-secret"
+    try:
+        existing = file.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        # Not written yet, which is the first start on this machine.
+        pass
+
+    secret = secrets.token_hex(32)
+    try:
+        file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        file.write_text(f"{secret}\n")
+        file.chmod(0o600)
+    except OSError as err:
+        print(
+            "[hkp-python] Could not persist the mount secret, so public endpoint "
+            f"addresses will change on restart: {err}",
+            file=sys.stderr,
+        )
+    return secret
+
+
 def _load_env_file() -> None:
-    """Minimal .env loader (KEY=VALUE lines next to the project root), matching
-    hkp-node's dotenv behaviour: real environment variables win."""
+    """Minimal .env loader (KEY=VALUE lines), matching hkp-node's dotenv
+    behaviour: real environment variables win. Looks next to the project root
+    first, then in the working directory, which is where the file sits when the
+    package is installed rather than run from a checkout."""
     env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.is_file():
+        env_path = Path.cwd() / ".env"
     if not env_path.is_file():
         return
     for line in env_path.read_text().splitlines():
@@ -140,6 +182,7 @@ async def main() -> None:
             "auth": auth_config,
             "external_host": external_host,
             "host": host,
+            "mount_secret": _resolve_mount_secret(),
             "quotas": {
                 "max_runtimes_per_user": _read_integer(
                     os.environ.get("HKP_MAX_RUNTIMES_PER_USER"), 0
