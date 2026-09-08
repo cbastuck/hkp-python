@@ -168,6 +168,35 @@ async def test_waits_while_a_reference_is_unresolved():
 
 
 @pytest.mark.asyncio
+async def test_waits_while_a_reference_sits_in_the_url():
+    # The field a person writes is the one the service already calls its target.
+    # A reference there names a service whose address nobody has published, so
+    # there is nothing to call — and falling through to dial the reference would
+    # call something the board never asked for.
+    service, host = make_client({"url": "hkp-mount://other/peer-1"})
+    notifications: list[Any] = []
+
+    assert service.process(None, notifications.append) is None
+    await asyncio.sleep(0.05)
+    assert host.pushed == []
+    assert "hkp-mount://other/peer-1" in notifications[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_address_wins_over_the_url_that_named_it(endpoint):
+    # What the coordinator resolved goes in the address field, leaving the url
+    # exactly as the board wrote it.
+    target = await endpoint(lambda _p: {"contentType": "text/plain", "body": "live"})
+    service, host = make_client({"url": "hkp-mount://other/peer-1"})
+    service.configure({"__hkpMount": target.url})
+
+    assert service.process(None, lambda _n: None) is None
+    result = await next_push(host)
+    assert result["body"] == "live"
+    assert service.get_state()["url"] == "hkp-mount://other/peer-1"
+
+
+@pytest.mark.asyncio
 async def test_calls_the_address_once_the_coordinator_hands_it_over(endpoint):
     target = await endpoint(lambda _p: {"contentType": "text/plain", "body": "live"})
     service, host = make_client({"__hkpMount": "hkp-mount://other/peer-1"})
