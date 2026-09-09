@@ -171,6 +171,31 @@ class LogEntry:
     data: Any = None
     duration_ms: float | None = None
 
+    def to_wire(self) -> dict[str, Any]:
+        """The entry as the other runtimes spell it.
+
+        A board's log is one file assembled from every runtime it spans, so an
+        entry leaving this process has to be indistinguishable from one written
+        by hkp-node or hkp-rt — camelCase, and the optional fields absent rather
+        than null, since a reader that filters on ``data`` being present would
+        otherwise see every entry as carrying one.
+        """
+        wire: dict[str, Any] = {
+            "runId": self.run_id,
+            "ts": self.ts,
+            "runtimeId": self.runtime_id,
+            "serviceUuid": self.service_uuid,
+            "level": self.level,
+            "event": self.event,
+        }
+        if self.parent_run_id:
+            wire["parentRunId"] = self.parent_run_id
+        if self.data is not None:
+            wire["data"] = self.data
+        if self.duration_ms is not None:
+            wire["durationMs"] = self.duration_ms
+        return wire
+
 
 class RuntimeHost(Protocol):
     def process_from(

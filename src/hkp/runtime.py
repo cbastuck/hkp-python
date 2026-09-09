@@ -32,6 +32,19 @@ from .types import (
 LOG_LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
 
 
+def iso_timestamp() -> str:
+    """UTC, ISO 8601, to milliseconds — what every runtime stamps an entry with.
+
+    Not ``datetime.isoformat()``, which writes microseconds and ``+00:00``. A
+    board's log holds entries from every runtime it spans in one file, and it is
+    ordered and filtered by comparing this field as text — so a stamp that spells
+    the same instant differently to hkp-node's and hkp-rt's sorts against them
+    rather than among them.
+    """
+    now = datetime.now(timezone.utc)
+    return f"{now.strftime('%Y-%m-%dT%H:%M:%S')}.{now.microsecond // 1000:03d}Z"
+
+
 def new_run() -> ProcessContext:
     """A run with no parent: something outside the board asked for this."""
     return ProcessContext(run_id=str(_uuid.uuid4()))
@@ -370,7 +383,7 @@ class HostedRuntime:
         entry = LogEntry(
             run_id=self._context.run_id,
             parent_run_id=self._context.parent_run_id,
-            ts=datetime.now(timezone.utc).isoformat(),
+            ts=iso_timestamp(),
             runtime_id=self.id,
             service_uuid=self._current_service or "",
             level=level,
@@ -392,7 +405,7 @@ class HostedRuntime:
         entry = LogEntry(
             run_id=self._context.run_id,
             parent_run_id=self._context.parent_run_id,
-            ts=datetime.now(timezone.utc).isoformat(),
+            ts=iso_timestamp(),
             runtime_id=self.id,
             service_uuid=self._current_service or "",
             level="debug",

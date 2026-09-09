@@ -26,6 +26,7 @@ from .runtime import (
     context_from_wire,
     HostedRuntime,
     HostedServiceFactory,
+    LOG_LEVELS,
     RuntimeApp,
     TenantRuntimes,
 )
@@ -58,6 +59,7 @@ from .services.timer import (
 from .types import (
     ProcessContext,
     JsonRecord,
+    LogEntry,
     RuntimeConfiguration,
     RuntimeNotification,
     ServiceConfiguration,
@@ -356,6 +358,7 @@ class RuntimeServer:
         )
         app.router.add_post("/runtimes/{runtime_id}/secrets", self._post_secrets)
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
+        app.router.add_patch("/runtimes/{runtime_id}/state", self._patch_runtime_state)
         app.router.add_post("/runtimes/{runtime_id}", self._process_runtime)
 
         app.router.add_get("/runtimes/{runtime_id}/services", self._get_services)
@@ -468,6 +471,33 @@ class RuntimeServer:
             if not ws.closed:
                 self._spawn(ws.send_str(message))
 
+    def _send_log(self, socket_key: str, entry: LogEntry) -> None:
+        """Carry a log entry to whoever is collecting this runtime's output.
+
+        The same socket a notification takes, and for the same reason: it is the
+        connection the board's coordinator already holds, authenticated with a
+        credential minted to outlive the user's session. An entry differs in
+        what it is for — a notification is for whoever is watching, an entry has
+        to survive with nobody attached — but not in how it travels.
+
+        Nobody listening is not a reason to buffer: an entry exists to be
+        written down by the coordinator, and there is no coordinator here to
+        write it. A runtime nothing is collecting from is a runtime whose board
+        has no log.
+        """
+        sockets = self._runtime_sockets.get(socket_key)
+        if not sockets:
+            return
+        # `data` is whatever a service passed, which on this runtime may be a
+        # ring buffer or raw bytes — the same placeholder a notification uses,
+        # rather than failing to send the entry at all.
+        message = json.dumps(
+            {"type": "log", "entry": entry.to_wire()}, default=_json_placeholder
+        )
+        for ws in list(sockets):
+            if not ws.closed:
+                self._spawn(ws.send_str(message))
+
     def _send_result(self, socket_key: str, result: Any) -> None:
         sockets = self._runtime_sockets.get(socket_key)
         if not sockets:
@@ -491,6 +521,7 @@ class RuntimeServer:
         runtime.register_result_target(
             lambda result: self._send_result(socket_key, result)
         )
+        runtime.register_log_target(lambda entry: self._send_log(socket_key, entry))
 
     # ── /runtimes handlers ─────────────────────────────────────────────────────
 
@@ -661,6 +692,40 @@ class RuntimeServer:
         if not runtime.rearrange_services(body):
             raise web.HTTPBadRequest()
         return web.json_response(self._serialize_runtime(runtime))
+
+    async def _patch_runtime_state(self, request: web.Request) -> web.Response:
+        """Change what a running runtime records, without rebuilding it.
+
+        Logging is a decision a board revisits — switched on to look into
+        something, off again afterwards — and re-provisioning to carry it would
+        restart every service in the runtime to change one boolean. That is what
+        the coordinator's per-board log switch calls, and a runtime that does
+        not answer it is reported as one the switch did not reach.
+
+        Separate from POST /runtimes/{id}, which processes data rather than
+        configuring anything.
+        """
+        runtime = self._get_runtime_or_404(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest()
+        if isinstance(body.get("logging"), bool):
+            runtime.set_logging(body["logging"])
+        if body.get("logLevel") in LOG_LEVELS:
+            runtime.set_log_level(body["logLevel"])
+        if isinstance(body.get("logData"), bool):
+            runtime.set_log_data(body["logData"])
+        settings = runtime.log_settings()
+        return web.json_response(
+            {
+                "logging": settings["logging"],
+                "logData": settings["log_data"],
+                "logLevel": settings["log_level"],
+            }
+        )
 
     async def _process_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
