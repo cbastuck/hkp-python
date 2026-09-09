@@ -194,7 +194,10 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `map`                     | Transforms payloads via templates (modes: `overwrite`, `add`, `replace`)   |
 | `sub-service`             | Embeds an inner pipeline of services                                       |
 | `http-server-subservices` | Runs an embedded HTTP server that drives an inner pipeline on each request |
-| `hookup.to/service/timer` | Emits ticks on an interval                                                  |
+| `http-client`             | Issues HTTP requests and emits the response                                |
+| `hold`                    | Keeps the latest value one side produced and replays it to the other       |
+| `stopper`                 | Stops the pipeline unconditionally by returning `null`                     |
+| `timer`                   | Emits ticks on an interval (the older `hookup.to/service/timer` still resolves) |
 | `speech-to-text`          | Transcribes mono `FloatRingBuffer` audio with a local Whisper model (requires the `asr` extra); `sampleRate` config declares the incoming rate (default 16000), other rates are resampled internally |
 | `text-generation`         | Generates text with a local LLM — either via an OpenAI-compatible server (llama-server, Ollama, ...) or by loading a GGUF in-process (requires the `llm` extra); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
 | `text-to-speech`          | Synthesizes speech with the local Kokoro-82M model (requires the `tts` extra); accepts a String or JSON with `text`/`prompt`, emits a 24 kHz `FloatRingBuffer` |
