@@ -75,6 +75,7 @@ async def endpoint():
                 {
                     "method": request.method,
                     "path": request.path,
+                    "pathQs": request.path_qs,
                     "contentType": request.headers.get("content-type"),
                     "userAgent": request.headers.get("user-agent"),
                     "body": await request.read(),
@@ -311,6 +312,67 @@ async def test_decodes_what_the_content_type_explains_and_keeps_the_rest(endpoin
 
 
 @pytest.mark.asyncio
+async def test_appends_the_configured_parameters_encoded(endpoint):
+    target = await endpoint()
+    # Written as a number or a flag, sent as the text the wire uses — what an
+    # editor produces is what a board means.
+    service, host = make_client(
+        {
+            "url": target.url,
+            "path": "/search",
+            "query": {"q": "a b&c", "page": 2, "draft": True},
+        }
+    )
+
+    service.process(None, lambda _n: None)
+    await next_push(host)
+
+    assert target.received[0]["pathQs"] == "/search?q=a+b%26c&page=2&draft=true"
+
+
+@pytest.mark.asyncio
+async def test_keeps_the_parameters_the_target_already_carries(endpoint):
+    target = await endpoint()
+    service, host = make_client(
+        {"url": target.url, "path": "/search?q=written", "query": {"page": "2"}}
+    )
+
+    service.process(None, lambda _n: None)
+    await next_push(host)
+
+    assert target.received[0]["pathQs"] == "/search?q=written&page=2"
+
+
+@pytest.mark.asyncio
+async def test_reports_the_response_headers_in_meta(endpoint):
+    target = await endpoint(lambda _p: {"contentType": "text/plain", "body": "ok"})
+    service, host = make_client({"url": target.url})
+
+    service.process(None, lambda _n: None)
+
+    meta = (await next_push(host))["meta"]
+    assert meta["headers"]["content-type"] == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_names_the_method_and_says_there_is_no_error(endpoint):
+    target = await endpoint()
+    service, host = make_client({"url": target.url, "method": "post"})
+    notifications: list[Any] = []
+
+    service.process("payload", notifications.append)
+    await next_push(host)
+
+    # A panel showing one of these has to be able to read the whole outcome off
+    # it: which request this was, and that nothing went wrong with it — an
+    # omitted error would leave the last failure's reason standing.
+    assert notifications[0]["method"] == "post"
+    done = next(n for n in notifications if n["requesting"] is False)
+    assert done["status"] == 200
+    assert done["error"] == ""
+
+
+@pytest.mark.asyncio
 async def test_passes_a_failure_status_on_as_a_result(endpoint):
     # The request completed; what the server said is the pipeline's business.
     target = await endpoint(lambda _p: {"status": 404, "body": "nope"})
@@ -334,7 +396,10 @@ async def test_pushes_nothing_when_the_request_itself_fails():
 
     # No fabricated result travels down the pipeline.
     assert host.pushed == []
-    assert any("error" in n for n in notifications)
+    failed = next(n for n in notifications if n.get("error"))
+    # No response, so the status of the request before this one does not stand
+    # as if it were this one's.
+    assert failed["status"] == 0
 
 
 @pytest.mark.asyncio
@@ -357,6 +422,7 @@ def test_reports_its_target_and_settings_in_state():
         "url": "",
         "__hkpMount": "hkp-mount://node/http-1",
         "path": "/upload",
+        "query": {},
         # Stored lower case, as hkp-rt's http-client does and the shared UI expects.
         "method": "post",
         "headers": {"x-token": "abc"},

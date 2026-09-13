@@ -5,7 +5,8 @@ from __future__ import annotations
 # Service Name: HTTP Client
 # Runtime: hkp-python
 # Modes: none (method is configuration, not a mode)
-# Key Config: url, __hkpMount (target), path, method, headers, userAgent, body
+# Key Config: url, __hkpMount (target), path, query, method, headers, userAgent,
+#             body
 # IO: in=body to send (str | dict | bytes | {meta, body|binary})
 #     out=None immediately; the response is pushed through the rest of the
 #     pipeline when it arrives, shaped {meta, body?, binary?}
@@ -26,12 +27,20 @@ from __future__ import annotations
 # has not published yet: a normal state while a board comes up, and a reason to
 # wait rather than to dial anything.
 #
+# query holds the request's parameters as a map, encoded onto the target when it
+# is called — the same shape http-server-subservices reports an incoming
+# request's parameters in, and what a board has instead of escaping them into
+# path by hand.
+#
 # The response shape mirrors what http-server-subservices produces for an
-# incoming request, so a pipeline that handles one handles the other.
+# incoming request, so a pipeline that handles one handles the other — metadata
+# including the response headers, then the body in whichever form its content
+# type explains.
 
 import asyncio
 import json
 from typing import Any
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -54,6 +63,13 @@ HTTP_CLIENT_DESCRIPTOR = ServiceRegistryEntry(
 
 # Lower case, as hkp-rt's http-client stores them and the shared UI sends them.
 _METHODS = ("get", "post", "put", "patch", "delete")
+
+
+def _as_parameter(value: str | int | float | bool) -> str:
+    """A query parameter's value as the text it is sent as."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _media_type(content_type: str | None) -> str:
@@ -83,6 +99,7 @@ class HttpClientService:
         self._url = ""
         self._mount = ""
         self._path = ""
+        self._query: dict[str, str] = {}
         self._method = "get"
         self._headers: dict[str, str] = {}
         self._user_agent = ""
@@ -105,6 +122,7 @@ class HttpClientService:
             # unresolved.
             MOUNT_FIELD: self._mount,
             "path": self._path,
+            "query": self._query,
             "method": self._method,
             "headers": self._headers,
             "userAgent": self._user_agent,
@@ -120,6 +138,16 @@ class HttpClientService:
             self._mount = config[MOUNT_FIELD]
         if isinstance(config.get("path"), str):
             self._path = config["path"]
+        query = config.get("query")
+        if isinstance(query, dict):
+            # A parameter is sent as text whatever it was written as, so a number
+            # or a flag typed in an editor arrives as the value it reads as — and
+            # a flag as the word the wire uses, not Python's.
+            self._query = {
+                key: _as_parameter(value)
+                for key, value in query.items()
+                if isinstance(value, (str, int, float, bool))
+            }
         method = config.get("method")
         if isinstance(method, str) and method.lower() in _METHODS:
             self._method = method.lower()
@@ -212,10 +240,27 @@ class HttpClientService:
         if self._mount:
             if is_mount_reference(self._mount):
                 return None
-            return join_mount_path(self._mount, self._path)
+            return self._request_url(self._mount)
         if not self._url or is_mount_reference(self._url):
             return None
-        return join_mount_path(self._url, self._path)
+        return self._request_url(self._url)
+
+    def _request_url(self, base: str) -> str:
+        """The address to call: the path joined to the base, then the parameters."""
+        return self._with_query(join_mount_path(base, self._path))
+
+    def _with_query(self, target: str) -> str:
+        """Append the configured parameters, encoded.
+
+        Appended rather than replacing what the target already carries: a url or
+        a path may have been written with parameters of its own, and a mount
+        address is not the board's to rewrite.
+        """
+        if not self._query:
+            return target
+        params = urlencode(self._query)
+        separator = "&" if "?" in target else "?"
+        return f"{target}{separator}{params}"
 
     async def _send(
         self,
@@ -234,7 +279,15 @@ class HttpClientService:
             self._host.secrets() if self._host else None, self._headers, url
         )
         if credential.problem:
-            notify({"requesting": False, "url": url, "error": credential.problem})
+            notify(
+                {
+                    "requesting": False,
+                    "method": self._method,
+                    "url": url,
+                    "status": 0,
+                    "error": credential.problem,
+                }
+            )
             return
         headers = dict(credential.value)
         if content_type and "content-type" not in {k.lower() for k in headers}:
@@ -243,7 +296,14 @@ class HttpClientService:
             headers["user-agent"] = self._user_agent
 
         self._in_flight += 1
-        notify({"requesting": True, "url": url, "inFlight": self._in_flight})
+        notify(
+            {
+                "requesting": True,
+                "method": self._method,
+                "url": url,
+                "inFlight": self._in_flight,
+            }
+        )
 
         try:
             timeout = aiohttp.ClientTimeout(total=self._timeout_ms / 1000)
@@ -255,14 +315,29 @@ class HttpClientService:
                     notify(
                         {
                             "requesting": False,
+                            "method": self._method,
                             "url": url,
                             "status": response.status,
+                            # Said on every outcome, so what a panel shows is
+                            # this request's and not the last failure's still
+                            # standing.
+                            "error": "",
                             "inFlight": self._in_flight - 1,
                         }
                     )
             self._push(result, notify, context)
         except Exception as err:  # noqa: BLE001 - reported, not swallowed
-            notify({"requesting": False, "url": url, "error": str(err)})
+            # Status 0: there was no response to have one, so the status of the
+            # request before this stops standing as if it were this one's.
+            notify(
+                {
+                    "requesting": False,
+                    "method": self._method,
+                    "url": url,
+                    "status": 0,
+                    "error": str(err),
+                }
+            )
             # A failed request produces no result to pass on: the pipeline behind
             # this service is not called, rather than called with a fabricated
             # one.
@@ -315,6 +390,9 @@ class HttpClientService:
             "url": url,
             "status": response.status,
             "statusText": response.reason or "",
+            # Lower-cased as HTTP names compare, the way the request shape
+            # reports the headers a caller sent.
+            "headers": {key.lower(): value for key, value in response.headers.items()},
         }
         if content_type:
             meta["contentType"] = content_type
