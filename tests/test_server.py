@@ -322,6 +322,96 @@ async def test_websocket_process_accepts_string_params(server_info, port):
 
 
 @pytest.mark.asyncio
+async def test_process_runtime_accepts_null_payload(server_info, port):
+    """`null` is a run with nothing on the input, not a malformed body.
+
+    JSON has no undefined, so that is how a caller says the pipeline starts
+    with nothing — what the Run entry sends, and what a service that answers an
+    empty input with its own configuration depends on.
+    """
+    async with aiohttp.ClientSession() as session:
+        await create_runtime(
+            session,
+            port,
+            services=[
+                {
+                    "serviceId": MAP_DESCRIPTOR.service_id,
+                    "uuid": "map-1",
+                    "state": {"mode": "add", "template": {"ran": "yes"}},
+                }
+            ],
+        )
+
+        # Posted as raw text: aiohttp reads `json=None` as "no payload" and
+        # would send no body at all, which is the case this is distinguishing
+        # itself from.
+        async with session.post(
+            f"http://127.0.0.1:{port}/runtimes/rt-1",
+            data="null",
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            assert resp.status == 200, await resp.text()
+            result = await resp.json()
+        assert result["ran"] == "yes"
+
+
+async def _run_over_socket(ws_url: str, params, present: bool = True):
+    """Runs a runtime over its output socket and answers with the run's result.
+
+    `present=False` leaves the params key out of the frame entirely, which is a
+    malformed message rather than a run — the distinction the null payload
+    exists to make.
+    """
+    frame = {"type": "processRuntime", "context": None}
+    if present:
+        frame["params"] = params
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            await ws.send_str(json.dumps({"type": "readwrite", "id": "rt-1"}))
+            await ws.send_str(json.dumps(frame))
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data.get("type") == "result":
+                        await ws.close()
+                        return data.get("data")
+    raise AssertionError("socket closed without a result message")
+
+
+@pytest.mark.asyncio
+async def test_websocket_process_accepts_null_payload(server_info, port):
+    """`null` over the socket is a run with nothing on the input.
+
+    The transport a runtime attached in the playground actually uses; the REST
+    entry point is the fallback for a socket that is not open. A monitor passes
+    its input through, so the run's result is what the pipeline started with.
+    """
+    async with aiohttp.ClientSession() as session:
+        runtime = await create_runtime(
+            session,
+            port,
+            services=[{"serviceId": MONITOR_DESCRIPTOR.service_id, "uuid": "svc-1"}],
+        )
+        ws_url = runtime["outputUrl"]
+
+    assert await asyncio.wait_for(_run_over_socket(ws_url, None), timeout=5.0) is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_keeps_empty_object_a_payload(server_info, port):
+    async with aiohttp.ClientSession() as session:
+        runtime = await create_runtime(
+            session,
+            port,
+            services=[{"serviceId": MONITOR_DESCRIPTOR.service_id, "uuid": "svc-1"}],
+        )
+        ws_url = runtime["outputUrl"]
+
+    assert await asyncio.wait_for(_run_over_socket(ws_url, {}), timeout=5.0) == {}
+
+
+@pytest.mark.asyncio
 async def test_map_templates(server_info, port):
     async with aiohttp.ClientSession() as session:
         await create_runtime(

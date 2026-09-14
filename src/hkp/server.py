@@ -741,7 +741,11 @@ class RuntimeServer:
                 body = json.loads(raw)
             except Exception:
                 raise web.HTTPBadRequest()
-            if not isinstance(body, dict):
+            # `null` is a payload: it says run with nothing on the input, which
+            # is how a caller writes "no input" in a format that has no
+            # undefined. The websocket path already accepts it, and a service
+            # that answers an empty input with its own configuration needs it.
+            if body is not None and not isinstance(body, dict):
                 raise web.HTTPBadRequest()
 
         result = await self._process_off_loop(runtime, body)

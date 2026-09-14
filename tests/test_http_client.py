@@ -318,8 +318,7 @@ async def test_appends_the_configured_parameters_encoded(endpoint):
     # editor produces is what a board means.
     service, host = make_client(
         {
-            "url": target.url,
-            "path": "/search",
+            "url": f"{target.url}/search",
             "query": {"q": "a b&c", "page": 2, "draft": True},
         }
     )
@@ -334,13 +333,27 @@ async def test_appends_the_configured_parameters_encoded(endpoint):
 async def test_keeps_the_parameters_the_target_already_carries(endpoint):
     target = await endpoint()
     service, host = make_client(
-        {"url": target.url, "path": "/search?q=written", "query": {"page": "2"}}
+        {"url": f"{target.url}/search?q=written", "query": {"page": "2"}}
     )
 
     service.process(None, lambda _n: None)
     await next_push(host)
 
     assert target.received[0]["pathQs"] == "/search?q=written&page=2"
+
+
+@pytest.mark.asyncio
+async def test_ignores_path_when_the_target_is_a_typed_url(endpoint):
+    # path is the sub-path of a mount. A url is a whole url and carries its own
+    # path, so appending a second one would call somewhere the board did not
+    # write.
+    target = await endpoint()
+    service, host = make_client({"url": f"{target.url}/written", "path": "/ignored"})
+
+    service.process(None, lambda _n: None)
+    await next_push(host)
+
+    assert target.received[0]["path"] == "/written"
 
 
 @pytest.mark.asyncio

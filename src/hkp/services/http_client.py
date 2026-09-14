@@ -30,7 +30,13 @@ from __future__ import annotations
 # query holds the request's parameters as a map, encoded onto the target when it
 # is called — the same shape http-server-subservices reports an incoming
 # request's parameters in, and what a board has instead of escaping them into
-# path by hand.
+# the URL by hand. Unlike path it applies to every target, because escaping is a
+# service a map performs and a written URL cannot.
+#
+# path is the sub-path of a mount, and applies to nothing else: a typed url is a
+# whole URL and carries its own path. A mount's address is assigned by a runtime
+# and resolved by the coordinator, so it is not the board's to write — which
+# leaves a sub-path of it nowhere else to go.
 #
 # The response shape mirrors what http-server-subservices produces for an
 # incoming request, so a pipeline that handles one handles the other — metadata
@@ -240,14 +246,10 @@ class HttpClientService:
         if self._mount:
             if is_mount_reference(self._mount):
                 return None
-            return self._request_url(self._mount)
+            return self._with_query(join_mount_path(self._mount, self._path))
         if not self._url or is_mount_reference(self._url):
             return None
-        return self._request_url(self._url)
-
-    def _request_url(self, base: str) -> str:
-        """The address to call: the path joined to the base, then the parameters."""
-        return self._with_query(join_mount_path(base, self._path))
+        return self._with_query(self._url)
 
     def _with_query(self, target: str) -> str:
         """Append the configured parameters, encoded.
