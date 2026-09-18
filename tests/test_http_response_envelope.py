@@ -186,3 +186,53 @@ def test_anything_without_a_status_is_json():
 )
 def test_a_range_is_read_the_way_a_player_writes_one(header, length, expected):
     assert _requested_range(header, length) == expected
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_answers_its_own_document(servers):
+    # `process_on_data` serves what the board handed it. If the chain's tail
+    # answered instead, an endpoint could only ever be the last service in its
+    # runtime, and a runtime could publish exactly one document.
+    _, base_url = await servers()
+
+    def document(body: str) -> dict[str, Any]:
+        return {
+            "mode": "replace",
+            "template": {
+                "meta": {"status": 200, "contentType": "text/plain"},
+                "body": body,
+            },
+        }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/runtimes",
+            json={
+                "id": "rt-1",
+                "name": "Python",
+                "services": [
+                    {"serviceId": "map", "uuid": "doc", "state": document("the document")},
+                    {
+                        "serviceId": HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id,
+                        "uuid": "http-1",
+                        "state": {"bypass": False, "mode": "process_on_data", "pipeline": []},
+                    },
+                    # What a board does after serving — here something that would
+                    # be a fine answer, if answers came from the chain's tail.
+                    {"serviceId": "map", "uuid": "after", "state": document("something else")},
+                ],
+            },
+        ) as res:
+            assert res.status == 200
+
+        async with session.post(
+            f"{base_url}/runtimes/rt-1/services/doc/process", json={}
+        ) as res:
+            assert res.status == 200
+
+        async with session.get(f"{base_url}/runtimes/rt-1/services/http-1") as res:
+            mount = (await res.json())["__hkpMount"]
+
+        async with session.get(mount) as res:
+            assert res.status == 200
+            assert await res.text() == "the document"
