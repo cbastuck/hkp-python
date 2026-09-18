@@ -224,3 +224,51 @@ def test_inject_pushes_nothing_when_the_mapping_stops_the_flow():
 
     assert host.processed == []
     assert host.results == []
+
+
+# ── An address a board mentions rather than dials ─────────────────────────────
+
+
+def _map_with(state: dict) -> MapService:
+    return MapService(ServiceConfiguration(service_id="map", uuid="map-1", state=state))
+
+
+def test_a_mount_reference_becomes_the_address_handed_over():
+    service = _map_with({"mode": "replace", "template": {"base": "hkp-mount://library/listen"}})
+
+    service.configure({"__hkpMount": "http://host:8080/hosted/abc"})
+
+    assert service.process({}) == {"base": "http://host:8080/hosted/abc"}
+
+
+def test_a_reference_an_expression_produced_is_covered_too():
+    service = _map_with(
+        {
+            "mode": "replace",
+            "template": {"base=": "params.target"},
+            "__hkpMount": "http://host:8080/hosted/abc",
+        }
+    )
+
+    assert service.process({"target": "hkp-mount://library/listen"}) == {
+        "base": "http://host:8080/hosted/abc"
+    }
+
+
+def test_an_unresolved_reference_is_left_as_it_stands():
+    # Visibly not an address beats an empty field that looks unfilled.
+    service = _map_with({"mode": "replace", "template": {"base": "hkp-mount://library/listen"}})
+
+    assert service.process({}) == {"base": "hkp-mount://library/listen"}
+
+
+def test_everything_that_is_not_a_reference_is_untouched():
+    service = _map_with(
+        {
+            "mode": "replace",
+            "template": {"url": "https://example.test/feed.xml", "n": 3},
+            "__hkpMount": "http://host:8080/hosted/abc",
+        }
+    )
+
+    assert service.process({}) == {"url": "https://example.test/feed.xml", "n": 3}

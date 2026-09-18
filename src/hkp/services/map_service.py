@@ -5,7 +5,8 @@ from __future__ import annotations
 # Service Name: Map
 # Runtime: hkp-python
 # Modes: replace | add | overwrite | sensingMode
-# Key Config: template, mode, arrayMode, sensingMode
+# Key Config: template, mode, arrayMode, sensingMode, __hkpMount (an address
+#             this template mentions)
 # IO: in=object|array|scalar -> out=mapped payload
 # Arrays: maps each element (arrayMode "single" maps the array as a whole)
 # Binary: not intended for raw binary
@@ -29,6 +30,7 @@ from ..types import (
     ServiceConfiguration,
     ServiceRegistryEntry,
 )
+from ..mount import MOUNT_FIELD, is_mount_reference
 from .expression import compile_expression
 
 MAP_DESCRIPTOR = ServiceRegistryEntry(
@@ -57,6 +59,12 @@ class MapService:
         # evaluated node by node, rather than being flattened into dotted keys.
         self._structured: Any = None
         self._host: RuntimeHost | None = None
+        # The address a mount reference in this template resolves to. A board
+        # that has to *mention* an endpoint — an enclosure URL in a feed, a link
+        # somebody is handed — cannot write one down: it is assigned when the
+        # board loads. Reserved name: the coordinator writes it, nobody authors
+        # it.
+        self._mount = ""
 
         if config.state:
             self.configure(config.state)
@@ -82,6 +90,10 @@ class MapService:
         if isinstance(config.get("command"), dict):
             self._run_command(config["command"])
 
+        if isinstance(config.get(MOUNT_FIELD), str):
+            self._mount = config[MOUNT_FIELD]
+            self._notify({MOUNT_FIELD: self._mount})
+
         return self.get_state()
 
     def get_state(self) -> JsonRecord:
@@ -90,6 +102,7 @@ class MapService:
             "arrayMode": self._array_mode,
             "template": copy.deepcopy(self._template),
             "sensingMode": self._sensing_mode,
+            MOUNT_FIELD: self._mount,
         }
 
     def process(self, input: Any, _notify: NotifyCallback | None = None) -> Any:
@@ -101,17 +114,39 @@ class MapService:
             return None
 
         if self._array_mode != "single" and isinstance(input, list):
-            return [self._mapper(entry) for entry in input]
+            return self._addressed([self._mapper(entry) for entry in input])
 
         if self._structured is None and not self._terms and not self._properties:
             return {} if self._mode == "replace" else input
 
-        return self._mapper(input)
+        return self._addressed(self._mapper(input))
 
     def destroy(self) -> None:
         pass
 
     # ── Private ────────────────────────────────────────────────────────────────
+
+    def _addressed(self, value: Any) -> Any:
+        """Replaces a mount reference in what was produced with its address.
+
+        Applied to the output rather than to the template, so it covers a
+        reference written as a static value and one an expression produced, and
+        so a template still reads as what the board author wrote.
+
+        An unresolved reference is left as it stands, the same choice a unit
+        parameter makes: the owner has not published yet, and a value saying
+        ``hkp-mount://…`` is visibly not an address where an empty string would
+        look like a field nobody filled in.
+        """
+        if not self._mount or is_mount_reference(self._mount):
+            return value
+        if isinstance(value, str):
+            return self._mount if is_mount_reference(value) else value
+        if isinstance(value, list):
+            return [self._addressed(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._addressed(item) for key, item in value.items()}
+        return value
 
     def _mapper(self, input: Any) -> Any:
         try:

@@ -54,6 +54,9 @@ tts = [
 llm = [
     "llama-cpp-python>=0.3",
 ]
+mp3 = [
+    "lameenc>=1.7",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hkp"]

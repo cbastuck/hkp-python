@@ -50,7 +50,9 @@ from .services.speech_to_text import SPEECH_TO_TEXT_DESCRIPTOR, SpeechToTextServ
 from .services.text_generation import TEXT_GENERATION_DESCRIPTOR, TextGenerationService
 from .services.skill_router import SKILL_ROUTER_DESCRIPTOR, SkillRouterService
 from .services.text_to_speech import TEXT_TO_SPEECH_DESCRIPTOR, TextToSpeechService
+from .services.audio_encode import AUDIO_ENCODE_DESCRIPTOR, AudioEncodeService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
+from .services.join import JOIN_DESCRIPTOR, JoinService
 from .services.timer import (
     TIMER_DESCRIPTOR,
     TIMER_LEGACY_SERVICE_ID,
@@ -153,6 +155,10 @@ class RuntimeServer:
                 SUB_SERVICE_DESCRIPTOR,
                 lambda cfg, cs: SubService(cfg, cs),
             ),
+            JOIN_DESCRIPTOR.service_id: HostedServiceFactory(
+                JOIN_DESCRIPTOR,
+                lambda cfg, cs: JoinService(cfg, cs),
+            ),
             HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id: HostedServiceFactory(
                 HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
                 lambda cfg, cs: HttpServerSubservicesService(
@@ -193,6 +199,10 @@ class RuntimeServer:
             TEXT_TO_SPEECH_DESCRIPTOR.service_id: HostedServiceFactory(
                 TEXT_TO_SPEECH_DESCRIPTOR,
                 lambda cfg, _cs: TextToSpeechService(cfg),
+            ),
+            AUDIO_ENCODE_DESCRIPTOR.service_id: HostedServiceFactory(
+                AUDIO_ENCODE_DESCRIPTOR,
+                lambda cfg, _cs: AudioEncodeService(cfg),
             ),
             SKILL_ROUTER_DESCRIPTOR.service_id: HostedServiceFactory(
                 SKILL_ROUTER_DESCRIPTOR,

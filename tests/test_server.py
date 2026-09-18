@@ -94,6 +94,12 @@ async def test_registry_shape(server_info, base_url, port):
         {"serviceId": "map", "serviceName": "Map", "version": "v1", "capabilities": []},
         {"serviceId": "sub-service", "serviceName": "SubService", "capabilities": ["subservices"]},
         {
+            "serviceId": "join",
+            "serviceName": "Join",
+            "version": "v1",
+            "capabilities": ["subservices"],
+        },
+        {
             "serviceId": "http-server-subservices",
             "serviceName": "HttpServerSubservices",
             "capabilities": ["subservices"],
@@ -122,6 +128,7 @@ async def test_registry_shape(server_info, base_url, port):
         {"serviceId": "speech-to-text", "serviceName": "Speech To Text"},
         {"serviceId": "text-generation", "serviceName": "Text Generation"},
         {"serviceId": "text-to-speech", "serviceName": "Text To Speech"},
+        {"serviceId": "audio-encode", "serviceName": "Audio Encode", "version": "v1"},
         {"serviceId": "skill-router", "serviceName": "Skill Router"},
     ]
 
