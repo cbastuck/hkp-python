@@ -417,13 +417,23 @@ class HttpServerSubservicesService:
         # instead of arriving as two unrelated runs sharing a timestamp.
         run_context = new_run()
 
-        answered_by_subservices = False
+        # Whether the answer is already decided here, or is whatever the rest
+        # of the outer chain makes of what this service emitted.
+        answered_here = False
         if self._mode == "process_on_data":
             process_input = self._latest_data
             output: Any = process_input
+            # The mode's whole contract: what the board handed this endpoint is
+            # what a caller gets back, verbatim. The services after it still run
+            # — having served a request is something a board may want to act on
+            # — but what they make of it is theirs, not the answer. Letting the
+            # chain's tail answer instead would mean an endpoint could only ever
+            # be the last service in its runtime, so a runtime could publish
+            # only one document.
+            answered_here = True
         else:
             process_input = await self._read_request(request, context)
-            answered_by_subservices = self._has_subservices()
+            answered_here = self._has_subservices()
             output = self._process_session_input(process_input, run_context)
 
         # What the nested pipeline produced, before the outer runtime sees it.
@@ -445,8 +455,9 @@ class HttpServerSubservicesService:
 
         # With a nested pipeline configured, that pipeline is the handler and
         # what it returned is the answer; the outer runtime ran for its side
-        # effects. Without one, the rest of the board is the handler.
-        response_value = answer if answered_by_subservices else output
+        # effects. Without one, the rest of the board is the handler — except in
+        # `process_on_data`, where the stored document is the answer.
+        response_value = answer if answered_here else output
         return self._answer(request, response_value)
 
     def _answer(self, request: web.Request, value: Any) -> web.Response:
