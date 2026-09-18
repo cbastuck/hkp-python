@@ -10,6 +10,17 @@ from __future__ import annotations
 # Arrays: not primary
 # Binary: depends on endpoint + nested services
 # MixedData: not native in runtime
+#
+# What the handler answers with is the envelope read backwards: a value carrying
+# `meta.status` beside `body` or `binary` sets the status, the content type and
+# the headers, and anything else is answered as JSON — which is what a board
+# written before this got. Raw bytes are the one value whose own type decides.
+# That is what lets one endpoint serve a feed as XML and the next serve audio as
+# audio; without it an endpoint can only ever say `application/json`, whatever
+# it is holding. Byte answers are seekable: `Range` is honoured against the
+# bytes the handler produced.
+#
+# Mirrors hkp-node's `http-server-subservices`, which reads the same shapes.
 
 import asyncio
 import json
@@ -48,6 +59,121 @@ def _filename_from_disposition(disposition: str | None) -> str | None:
         return None
     match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", disposition, re.I)
     return match.group(1) if match else None
+
+
+def _as_response_envelope(value: Any) -> dict[str, Any] | None:
+    """A value read as a response envelope, or None when it is not one.
+
+    **A status is what tells a response from a request.** Both are the same
+    shape — ``meta`` beside ``body`` or ``binary`` — so a pipeline that passes
+    its input through returns a request, and reading any ``meta`` as a response
+    would answer the caller with the content type they sent. A request carries
+    no status and a response always does, which makes ``meta.status`` the one
+    field that cannot be a coincidence. It is also what ``http-client`` reports
+    a call's response as, so proxying one takes no translation.
+    """
+    if not isinstance(value, dict):
+        return None
+    meta = value.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    if not isinstance(meta.get("status"), int) or isinstance(meta.get("status"), bool):
+        return None
+    return value if ("binary" in value or "body" in value) else None
+
+
+def _envelope_headers(meta: dict[str, Any]) -> dict[str, str]:
+    """Header map from an envelope's ``meta.headers``, names lower-cased."""
+    declared = meta.get("headers")
+    if not isinstance(declared, dict):
+        return {}
+    return {
+        str(name).lower(): str(value)
+        for name, value in declared.items()
+        if value is not None
+    }
+
+
+def _to_answer(value: Any) -> tuple[int, dict[str, str], bytes]:
+    """The status, headers and bytes a value stands for.
+
+    Without an envelope the answer is JSON, which is what every board written
+    before this got and still gets. The single exception is raw bytes, which are
+    sent as bytes: there is no JSON encoding of them anybody wanted.
+    """
+    envelope = _as_response_envelope(value)
+    if envelope is not None:
+        meta = envelope.get("meta") or {}
+        headers = _envelope_headers(meta)
+        status = int(meta["status"])
+        declared = meta.get("contentType")
+        declared = declared if isinstance(declared, str) else None
+
+        binary = envelope.get("binary")
+        if isinstance(binary, (bytes, bytearray, memoryview)):
+            headers["content-type"] = (
+                declared or headers.get("content-type") or "application/octet-stream"
+            )
+            return status, headers, bytes(binary)
+
+        body = envelope.get("body")
+        if isinstance(body, str):
+            headers["content-type"] = (
+                declared or headers.get("content-type") or "text/plain; charset=utf-8"
+            )
+            return status, headers, body.encode("utf-8")
+
+        headers["content-type"] = (
+            declared or headers.get("content-type") or "application/json"
+        )
+        return status, headers, json.dumps(body, default=str).encode("utf-8")
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return 200, {"content-type": "application/octet-stream"}, bytes(value)
+
+    return (
+        200,
+        {"content-type": "application/json"},
+        json.dumps(value if value is not None else None, default=str).encode("utf-8"),
+    )
+
+
+def _charset_of(content_type: str) -> str | None:
+    """The charset a content type declares, which aiohttp takes separately."""
+    for parameter in content_type.split(";")[1:]:
+        name, _, value = parameter.partition("=")
+        if name.strip().lower() == "charset":
+            return value.strip() or None
+    return None
+
+
+def _requested_range(header: str | None, length: int) -> tuple[int, int] | None:
+    """The range a ``Range: bytes=…`` header asks for, clamped to what there is.
+
+    None when the header asks for nothing this can serve — absent, a unit other
+    than bytes, several ranges, or a start past the end. A player seeking inside
+    an audio file sends one of these, and a server that ignores it re-sends the
+    whole file every time somebody drags the scrubber.
+    """
+    if not header:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+    if not match:
+        return None
+    raw_start, raw_end = match.groups()
+    if not raw_start and not raw_end:
+        return None
+
+    # "bytes=-500" is the last 500 bytes, not a range starting at zero.
+    if not raw_start:
+        span = int(raw_end)
+        return (max(0, length - span), length - 1) if span else None
+
+    start = int(raw_start)
+    if start >= length:
+        return None
+    end = min(int(raw_end), length - 1) if raw_end else length - 1
+    return (start, end) if end >= start else None
 
 
 class HttpServerSubservicesService:
@@ -321,12 +447,34 @@ class HttpServerSubservicesService:
         # what it returned is the answer; the outer runtime ran for its side
         # effects. Without one, the rest of the board is the handler.
         response_value = answer if answered_by_subservices else output
+        return self._answer(request, response_value)
+
+    def _answer(self, request: web.Request, value: Any) -> web.Response:
+        """Writes what the handler produced, honouring a range request when the
+        answer is bytes a caller can seek inside."""
+        status, headers, payload = _to_answer(value)
+        content_type = headers.pop("content-type", "application/octet-stream")
+
+        if status == 200:
+            headers["accept-ranges"] = "bytes"
+            wanted = _requested_range(request.headers.get("Range"), len(payload))
+            if wanted:
+                start, end = wanted
+                headers["content-range"] = f"bytes {start}-{end}/{len(payload)}"
+                return web.Response(
+                    status=206,
+                    headers=headers,
+                    content_type=content_type.split(";")[0].strip(),
+                    charset=_charset_of(content_type),
+                    body=payload[start : end + 1],
+                )
+
         return web.Response(
-            status=200,
-            content_type="application/json",
-            text=json.dumps(
-                response_value if response_value is not None else None, default=str
-            ),
+            status=status,
+            headers=headers,
+            content_type=content_type.split(";")[0].strip(),
+            charset=_charset_of(content_type),
+            body=payload,
         )
 
     async def _read_request(
