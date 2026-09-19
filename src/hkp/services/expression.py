@@ -706,6 +706,35 @@ def _slice(args: list[Any]) -> Any:
     return array[max(0, offset) : end : step]
 
 
+# A web address in running text, with whatever label introduced it. The label
+# goes because it is only there to introduce the address: "Article URL:" with
+# nothing after it says less than nothing. Bounded to a short run of words so it
+# cannot swallow a sentence.
+_URL_IN_TEXT = re.compile(
+    r"(?:[A-Za-z][\w ]{0,30}:[ \t]*)?(?:https?://|www\.)\S+", re.IGNORECASE
+)
+
+
+def _without_urls(value: Any) -> str:
+    """Text with the web addresses taken out of it.
+
+    Feeds are written for programs as much as for people, and some of them are
+    mostly machinery: a summary reading "Article URL: https://… Comments URL:
+    https://… Points: 48" is a fine thing for a reader to show as a link and a
+    miserable thing to hear read aloud, where an address becomes a minute of
+    punctuation. This is for text on its way to something that speaks or
+    summarises it — never for what a board stores or publishes, where the
+    address is the useful part.
+    """
+    # An absent value is empty text, not the word "null": this answers with
+    # text, and a board reading a field that is not there wants nothing said.
+    text = _URL_IN_TEXT.sub(" ", "" if value is None else to_text(value))
+    # What removal leaves behind: doubled spaces, and punctuation adrift from
+    # the word it belonged to.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return re.sub(r"\s+([.,;:!?])", r"\1", text).strip()
+
+
 def _parse_json(args: list[Any]) -> Any:
     value = _arg(args, 0)
     if not isinstance(value, str):
@@ -787,6 +816,7 @@ def _builtins() -> dict[str, Callable[[list[Any]], Any]]:
         "concat": lambda args: "".join(to_text(a) for a in args),
         "encodeURI": lambda args: quote(to_text(_arg(args, 0)), safe="-_.!~*'();/?:@&=+$,#"),
         "slug": lambda args: re.sub(r"[^a-z0-9_-]", "", to_text(_arg(args, 0)).lower()),
+        "withoutUrls": lambda args: _without_urls(_arg(args, 0)),
         "now": lambda args: _now_millis(),
         "range": lambda args: list(range(max(0, int(round(to_number(_arg(args, 0, 0))))))),
         "sum": _sum,
