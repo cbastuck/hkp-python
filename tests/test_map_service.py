@@ -272,3 +272,29 @@ def test_everything_that_is_not_a_reference_is_untouched():
     )
 
     assert service.process({}) == {"url": "https://example.test/feed.xml", "n": 3}
+
+
+def test_without_urls_strips_addresses_and_the_labels_that_introduced_them():
+    """Text on its way to a voice.
+
+    Feed summaries are written for programs as much as for people. Spoken, an
+    address is a minute of punctuation, and the label that introduced it says
+    nothing once it is gone.
+    """
+    hacker_news = (
+        "Article URL: https://overreacted.io/how-i-vibed-a-proof/ "
+        "Comments URL: https://news.ycombinator.com/item?id=49755024 "
+        "Points: 48 # Comments: 31"
+    )
+    service = create_map(
+        {"mode": "replace", "template": {"text=": "withoutUrls(params.summary)"}}
+    )
+
+    assert service.process({"summary": hacker_news}, lambda _n: None) == {
+        "text": "Points: 48 # Comments: 31"
+    }
+    # Prose keeps every word it had; an absent field is nothing said, not "null".
+    assert service.process({"summary": "Police said so."}, lambda _n: None) == {
+        "text": "Police said so."
+    }
+    assert service.process({}, lambda _n: None) == {"text": ""}
