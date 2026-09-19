@@ -100,6 +100,12 @@ async def test_registry_shape(server_info, base_url, port):
             "capabilities": ["subservices"],
         },
         {
+            "serviceId": "tracks",
+            "serviceName": "Tracks",
+            "version": "v1",
+            "capabilities": ["subservices"],
+        },
+        {
             "serviceId": "http-server-subservices",
             "serviceName": "HttpServerSubservices",
             "capabilities": ["subservices"],

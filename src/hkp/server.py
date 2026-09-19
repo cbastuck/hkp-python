@@ -53,6 +53,7 @@ from .services.text_to_speech import TEXT_TO_SPEECH_DESCRIPTOR, TextToSpeechServ
 from .services.audio_encode import AUDIO_ENCODE_DESCRIPTOR, AudioEncodeService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.join import JOIN_DESCRIPTOR, JoinService
+from .services.tracks import TRACKS_DESCRIPTOR, TracksService
 from .services.timer import (
     TIMER_DESCRIPTOR,
     TIMER_LEGACY_SERVICE_ID,
@@ -158,6 +159,10 @@ class RuntimeServer:
             JOIN_DESCRIPTOR.service_id: HostedServiceFactory(
                 JOIN_DESCRIPTOR,
                 lambda cfg, cs: JoinService(cfg, cs),
+            ),
+            TRACKS_DESCRIPTOR.service_id: HostedServiceFactory(
+                TRACKS_DESCRIPTOR,
+                lambda cfg, cs: TracksService(cfg, cs),
             ),
             HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id: HostedServiceFactory(
                 HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
