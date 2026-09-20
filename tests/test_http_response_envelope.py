@@ -236,3 +236,74 @@ async def test_an_endpoint_answers_its_own_document(servers):
         async with session.get(mount) as res:
             assert res.status == 200
             assert await res.text() == "the document"
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_publishes_a_document_out_of_two_pipelines_and_a_slot(servers):
+    # The same board as above with the mode replaced by what it stood for: the
+    # pass writes the document into a slot, the request reads it back. Nothing
+    # in either pipeline looks at the value, which is why the two sides being
+    # indistinguishable envelopes no longer matters.
+    _, base_url = await servers()
+
+    def document(body: str) -> dict[str, Any]:
+        return {
+            "mode": "replace",
+            "template": {
+                "meta": {"status": 200, "contentType": "text/plain"},
+                "body": body,
+            },
+        }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/runtimes",
+            json={
+                "id": "rt-1",
+                "name": "Python",
+                "services": [
+                    {"serviceId": "map", "uuid": "doc", "state": document("the document")},
+                    {
+                        "serviceId": HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id,
+                        "uuid": "http-1",
+                        "state": {
+                            "bypass": False,
+                            "onProcess": [
+                                {
+                                    "serviceId": "hold",
+                                    "instanceId": "keep",
+                                    "state": {"slot": "document", "op": "write"},
+                                }
+                            ],
+                            "onRequest": [
+                                {
+                                    "serviceId": "hold",
+                                    "instanceId": "serve",
+                                    "state": {"slot": "document", "op": "read"},
+                                }
+                            ],
+                        },
+                    },
+                    {"serviceId": "map", "uuid": "after", "state": document("something else")},
+                ],
+            },
+        ) as res:
+            assert res.status == 200
+
+        async with session.post(
+            f"{base_url}/runtimes/rt-1/services/doc/process", json={}
+        ) as res:
+            assert res.status == 200
+
+        async with session.get(f"{base_url}/runtimes/rt-1/services/http-1") as res:
+            state = await res.json()
+            mount = state["__hkpMount"]
+            # State reports what was declared. Reporting a canonical form would
+            # rewrite every board that used the other spelling.
+            assert "mode" not in state
+            assert "pipeline" not in state
+            assert len(state["onRequest"]) == 1
+
+        async with session.get(mount) as res:
+            assert res.status == 200
+            assert await res.text() == "the document"

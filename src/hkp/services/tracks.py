@@ -46,7 +46,6 @@ the wall clock differs.
 
 from typing import Any, Callable
 
-from ..runtime import HostedRuntime, child_run
 from ..types import (
     JsonRecord,
     NotifyCallback,
@@ -55,12 +54,8 @@ from ..types import (
     ServiceCreator,
     ServiceRegistryEntry,
 )
-from .sub_service import (
-    _is_json_record,
-    _make_runtime_config,
-    _normalize_pipeline_array,
-    _normalize_pipeline_entry,
-)
+from .nested_pipeline import NestedPipeline
+from .sub_service import _is_json_record
 
 TRACKS_DESCRIPTOR = ServiceRegistryEntry(
     service_id="tracks",
@@ -75,164 +70,8 @@ RUN_MODES = ("serial", "parallel")
 REDUCE = "reduce"
 
 
-class _Pipeline:
-    """One nested pipeline, with everything a nested runtime cannot do itself.
-
-    It has no notification target, no route to the board's log and no vault of
-    its own, so the service hosting it carries all three in. Tracks owns one of
-    these per track, and one more for the reducer.
-    """
-
-    def __init__(self, label: str, create_service: ServiceCreator) -> None:
-        self._label = label
-        self._create_service = create_service
-        self._config: list[ServiceConfiguration] = []
-        self._runtime: HostedRuntime | None = None
-        self._release_notifications: Callable[[], None] | None = None
-        self._release_logs: Callable[[], None] | None = None
-        self._host: RuntimeHost | None = None
-
-    def attach(self, host: RuntimeHost) -> None:
-        self._host = host
-        self._apply_log_settings()
-        self._apply_secrets()
-
-    def is_empty(self) -> bool:
-        return not self._runtime or not self._runtime.list_services()
-
-    def set_pipeline(self, value: Any) -> None:
-        if not isinstance(value, list):
-            raise ValueError(f"Invalid pipeline format for '{self._label}'")
-        nxt = _normalize_pipeline_array(value)
-        if nxt is None:
-            raise ValueError(f"Invalid pipeline format for '{self._label}'")
-        # A pipeline it already is, is not a change. Rebuilding destroys what is
-        # running inside it, and the commonest configure a service gets is the
-        # board handing back the state it just read.
-        if self._matches_live(nxt):
-            return
-        self._config = nxt
-        self._rebuild()
-
-    def append(self, entry: Any) -> None:
-        appended = _normalize_pipeline_entry(entry)
-        if not appended:
-            raise ValueError(f"Invalid appendService payload for '{self._label}'")
-        self._sync_states()
-        self._config.append(appended)
-        self._rebuild()
-
-    def remove(self, uuid: str) -> None:
-        self._sync_states()
-        self._config = [e for e in self._config if e.uuid != uuid]
-        self._rebuild()
-
-    def configure_service(self, instance_id: str, state: JsonRecord) -> None:
-        if not self._runtime:
-            return
-        self._runtime.configure_service(instance_id, state)
-        self._sync_states()
-
-    def process(self, input: Any, parent: Any) -> Any:
-        if not self._runtime or self.is_empty():
-            return input
-        # The callback is a no-op: the nested runtime already fans notifications
-        # out to the target registered in _rebuild.
-        return self._runtime.process(input, lambda _n: None, child_run(parent))
-
-    def state(self) -> list[dict[str, Any]]:
-        if not self._runtime:
-            return [
-                {"serviceId": e.service_id, "instanceId": e.uuid, "state": e.state or {}}
-                for e in self._config
-            ]
-        return [
-            {"serviceId": svc.service_id, "instanceId": svc.uuid, "state": svc.state}
-            for svc in self._runtime.list_services()
-        ]
-
-    def services(self) -> list[Any]:
-        return self._runtime.list_services() if self._runtime else []
-
-    def destroy(self) -> None:
-        self._release()
-        if self._runtime:
-            self._runtime.destroy()
-            self._runtime = None
-
-    # ── Private ────────────────────────────────────────────────────────────────
-
-    def _matches_live(self, nxt: list[ServiceConfiguration]) -> bool:
-        if not self._runtime:
-            return False
-        live = self.state()
-        if len(live) != len(nxt):
-            return False
-        return all(
-            current["serviceId"] == entry.service_id
-            and current["instanceId"] == entry.uuid
-            and current["state"] == (entry.state or {})
-            for current, entry in zip(live, nxt)
-        )
-
-    def _rebuild(self) -> None:
-        self._release()
-        if self._runtime:
-            self._runtime.destroy()
-
-        self._runtime = HostedRuntime(
-            _make_runtime_config(self._label, "Tracks", self._config),
-            self._create_service,
-        )
-        self._release_notifications = self._runtime.register_notification_target(
-            lambda n: self._host.notify(n.payload, n.instance_id) if self._host else None
-        )
-        self._release_logs = self._runtime.register_log_target(
-            lambda entry: self._host.forward_log(entry) if self._host else None
-        )
-        self._apply_log_settings()
-        self._apply_secrets()
-
-    def _release(self) -> None:
-        if self._release_notifications:
-            self._release_notifications()
-            self._release_notifications = None
-        if self._release_logs:
-            self._release_logs()
-            self._release_logs = None
-
-    def _apply_secrets(self) -> None:
-        if self._runtime:
-            self._runtime.delegate_secrets(
-                lambda: self._host.secrets() if self._host else None
-            )
-
-    def _apply_log_settings(self) -> None:
-        if not self._host or not self._runtime:
-            return
-        settings = self._host.log_settings()
-        self._runtime.set_logging(settings["logging"])
-        self._runtime.set_log_data(settings["log_data"])
-        self._runtime.set_log_level(settings["log_level"])
-
-    def _sync_states(self) -> None:
-        if not self._runtime:
-            return
-        by_id = {svc.uuid: svc.state for svc in self._runtime.list_services()}
-        self._config = [
-            ServiceConfiguration(
-                service_id=e.service_id,
-                uuid=e.uuid,
-                name=e.name,
-                service_name=e.service_name,
-                state=by_id.get(e.uuid, e.state),
-            )
-            for e in self._config
-        ]
-
-
 class _Track:
-    def __init__(self, name: str, bypass: bool, pipeline: _Pipeline) -> None:
+    def __init__(self, name: str, bypass: bool, pipeline: NestedPipeline) -> None:
         self.name = name
         self.bypass = bypass
         self.pipeline = pipeline
@@ -251,7 +90,7 @@ class TracksService:
         self._bypass = False
         self._run = "serial"
         self._tracks: list[_Track] = []
-        self._reduce = _Pipeline(f"{self.uuid}:{REDUCE}", create_service)
+        self._reduce = NestedPipeline(f"{self.uuid}:{REDUCE}", create_service, "Tracks")
         self._last_error = ""
 
         if config.state:
@@ -349,7 +188,7 @@ class TracksService:
             # destroy what is running inside it because a track beside it was
             # edited.
             existing = previous.pop(name, None)
-            pipeline = existing.pipeline if existing else _Pipeline(f"{self.uuid}:{name}", self._create_service)
+            pipeline = existing.pipeline if existing else NestedPipeline(f"{self.uuid}:{name}", self._create_service, "Tracks")
             if isinstance(entry.get("pipeline"), list):
                 pipeline.set_pipeline(entry["pipeline"])
             if existing is None and self._host:

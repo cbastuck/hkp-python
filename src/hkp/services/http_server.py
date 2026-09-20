@@ -4,12 +4,39 @@ from __future__ import annotations
 # Service ID: http-server-subservices
 # Service Name: HttpServerSubservices
 # Runtime: hkp-python
-# Modes: session pipeline hosting
-# Key Config: host/port/routes/subservices
+# Modes: none — the entry points a board declares say what it is for
+# Key Config: bypass/onProcess/onRequest (the endpoint is assigned, not configured)
 # IO: in=request envelope -> out=response envelope
 # Arrays: not primary
 # Binary: depends on endpoint + nested services
 # MixedData: not native in runtime
+#
+# **There are two ways in, and a board names the ones it uses.** `onRequest` is
+# a caller arriving; `onProcess` is a pass of the board's own chain. Each is a
+# pipeline of its own, because they are different jobs:
+#
+#     { "onRequest": [ … ] }                      requests; a pass goes through
+#     { "onProcess": [ … ] }                      passes; the board answers
+#     { "onProcess": [ … ], "onRequest": [ … ] }  both, separately
+#     { "pipeline":  [ … ] }                      one pipeline, entered from both
+#
+# **Declaring `onRequest` is what takes the answer away from the chain.** With
+# one, that pipeline is the handler and what it returns is what the caller gets;
+# the services after this one still run — that is where a board acts on having
+# served a request — but after the answer is decided. Without one, the request
+# flows into the services after this one and whatever they return is the answer,
+# which is the inversion of control this service is built around.
+#
+# So an endpoint can have something to run on a pass without silently becoming
+# an HTTP handler, which is what a single unnamed pipeline could not express:
+# having one at all decided who answered.
+#
+# **A value does not survive between the two on its own.** They are separate
+# pipelines, and a pass ends where it ends — so an endpoint that publishes what
+# the board last handed it holds that value in a slot (see `hold`), in cells
+# this service owns and lends to both of its pipelines. Legacy boards say the
+# same thing as `mode: "process_on_data"`, which is this arrangement built in
+# and unnamed; `_entry_for` is where the older spellings are read.
 #
 # What the handler answers with is the envelope read backwards: a value carrying
 # `meta.status` beside `body` or `binary` sets the status, the content type and
@@ -32,7 +59,7 @@ from urllib.parse import parse_qsl, urlparse
 from aiohttp import web
 
 from ..mounts import MountContext, MountHandle, decode_body
-from ..runtime import HostedRuntime, child_run, new_run
+from ..runtime import new_run
 from ..mount import MOUNT_FIELD
 from ..types import (
     ProcessContext,
@@ -43,8 +70,18 @@ from ..types import (
     ServiceConfiguration,
     ServiceCreator,
     ServiceRegistryEntry,
+    SlotStore,
 )
-from .sub_service import _is_json_record, _normalize_pipeline_array, _normalize_pipeline_entry
+from .nested_pipeline import NestedPipeline
+from .sub_service import _is_json_record
+
+#: The two ways into this service, named.
+#:
+#: ``onProcess`` is a pass of the board's own chain arriving; ``onRequest`` is a
+#: caller. They are declared as separate pipelines because they are separate
+#: jobs — which is what the ``mode`` flag was standing in for, badly: one
+#: unnamed list could not say what it was for, so a flag beside it had to.
+ENTRY_NAMES = ("onProcess", "onRequest")
 
 HTTP_SERVER_SUBSERVICES_DESCRIPTOR = ServiceRegistryEntry(
     service_id="http-server-subservices",
@@ -201,7 +238,28 @@ class HttpServerSubservicesService:
         #: in a board file too — so an address only changes when a board
         #: deliberately renames it.
         self._mount_name = ""
-        self._pipeline_config: list[ServiceConfiguration] = []
+        #: Which way the board declared its pipelines; see the module header.
+        #:
+        #: Kept because state reports what was declared rather than a canonical
+        #: form: a board saved after being loaded has to come back out the way
+        #: it went in, or every board on the older spelling rewrites itself the
+        #: first time somebody saves it.
+        self._form = "legacy"
+        #: The one pipeline a legacy board declares, entered from whichever side
+        #: its `mode` says.
+        self._legacy: NestedPipeline | None = None
+        self._entries: dict[str, NestedPipeline | None] = {
+            "onProcess": None,
+            "onRequest": None,
+        }
+        #: The cells this endpoint's pipelines hold values in.
+        #:
+        #: Owned here because the two entry points are pipelines that never
+        #: meet: a value one of them produces has nowhere to live until the
+        #: other runs. One store per endpoint is also what keeps the names in it
+        #: private, so two endpoints on a runtime may both call a slot
+        #: ``document``.
+        self._slot_store = SlotStore()
         #: Which of a request's headers the pipeline is shown, or None for all.
         #:
         #: Headers are where a caller puts a credential, and ``meta`` goes
@@ -211,9 +269,6 @@ class HttpServerSubservicesService:
         #: none, and no list at all forwards everything, which is what a board
         #: that has not thought about it gets.
         self._forward_headers: list[str] | None = None
-        self._pipeline: HostedRuntime | None = None
-        self._release_pipeline_notifications: Callable[[], None] | None = None
-        self._release_pipeline_logs: Callable[[], None] | None = None
         self._create_service = create_service
         self._host: RuntimeHost | None = None
 
@@ -226,16 +281,6 @@ class HttpServerSubservicesService:
         # port. Older boards still carry the field, and rejecting it would fail
         # them on load for a setting that no longer means anything.
 
-        # Where the nested pipeline is entered from:
-        #
-        # - process_on_session — requests only; data from the outer chain passes
-        #   through untouched.
-        # - process_on_data — data from the outer chain is stored and served
-        #   back to requests verbatim; the nested pipeline is not used.
-        # - process_on_both — both entry points run the nested pipeline. The
-        #   pipeline is a single ordered list either way, so a service inside it
-        #   that needs to tell a request from a data arrival has to do so from
-        #   the input.
         # An array is a decision, including an empty one. Anything else —
         # absent, None, a string — leaves the default of forwarding all of them.
         if "forwardHeaders" in config:
@@ -255,6 +300,10 @@ class HttpServerSubservicesService:
             if renamed and self._mount:
                 self._release_mount()
 
+        # How a board that predates named entry points says which side enters
+        # the one pipeline it declares. Still accepted, and still reported back
+        # to a board that arrived carrying it; _entry_for is the whole of what
+        # it means now.
         if config.get("mode") in (
             "process_on_session",
             "process_on_data",
@@ -262,34 +311,32 @@ class HttpServerSubservicesService:
         ):
             self._mode = config["mode"]
 
-        # Pipeline replacement
-        if isinstance(config.get("pipeline"), list):
-            next_pipeline = _normalize_pipeline_array(config["pipeline"])
-            if next_pipeline is None:
-                raise ValueError("Invalid http-server-subservices pipeline format")
-            self._pipeline_config = next_pipeline
-            self._rebuild()
-        elif _is_json_record(config.get("appendService")):
-            appended = _normalize_pipeline_entry(config["appendService"])
-            if not appended:
-                raise ValueError("Invalid appendService payload")
-            self._sync_states()
-            self._pipeline_config.append(appended)
-            self._rebuild()
-        elif isinstance(config.get("removeService"), str):
-            self._sync_states()
-            target = config["removeService"]
-            self._pipeline_config = [e for e in self._pipeline_config if e.uuid != target]
-            self._rebuild()
-        elif _is_json_record(config.get("configureService")):
-            payload = config["configureService"]
-            if (
-                isinstance(payload.get("instanceId"), str)
-                and _is_json_record(payload.get("state"))
-                and self._pipeline
-            ):
-                self._pipeline.configure_service(payload["instanceId"], payload["state"])
-                self._sync_states()
+        # Declaring an entry point by name is what puts this endpoint in the
+        # newer form, and from then on its state is reported that way.
+        for name in ENTRY_NAMES:
+            if isinstance(config.get(name), list):
+                self._form = "entries"
+                self._entry_pipeline(name).set_pipeline(config[name])
+
+        # An edit aimed at one named entry. The unscoped verbs below cannot say
+        # which pipeline they mean once there is more than one.
+        if _is_json_record(config.get("configurePipeline")):
+            payload = config["configurePipeline"]
+            if payload.get("entry") in ENTRY_NAMES:
+                self._form = "entries"
+                self._edit_pipeline(self._entry_pipeline(payload["entry"]), payload)
+
+        if (
+            isinstance(config.get("pipeline"), list)
+            or _is_json_record(config.get("appendService"))
+            or isinstance(config.get("removeService"), str)
+            or _is_json_record(config.get("configureService"))
+        ):
+            # The unscoped verbs belong to the one pipeline a legacy board
+            # declares. Left working rather than redirected at an entry, because
+            # which entry they would mean is exactly what the older form cannot
+            # say.
+            self._edit_pipeline(self._legacy_pipeline(), config)
 
         # Bypass toggle
         if isinstance(config.get("bypass"), bool) and config["bypass"] != self._bypass:
@@ -323,9 +370,8 @@ class HttpServerSubservicesService:
         return headers
 
     def get_state(self) -> JsonRecord:
-        return {
+        common = {
             "bypass": self._bypass,
-            "mode": self._mode,
             # Name this endpoint is known by; see the field on the service.
             "mountName": self._mount_name,
             # Public endpoint assigned by the runtime; empty while bypassed.
@@ -333,23 +379,112 @@ class HttpServerSubservicesService:
             # the frontend's runtime/board/mount).
             MOUNT_FIELD: self._mount.url if self._mount else "",
             "forwardHeaders": self._forward_headers,
-            "pipeline": self._get_pipeline_state(),
         }
+
+        # What was declared, not what it was understood as. A board that named
+        # its entries gets them back; one that carries a `mode` keeps it,
+        # because that is the version an older runtime can still load.
+        if self._form == "entries":
+            state: JsonRecord = dict(common)
+            for name in ENTRY_NAMES:
+                pipeline = self._entries[name]
+                if pipeline is not None:
+                    state[name] = pipeline.state()
+            return state
+
+        return {
+            **common,
+            "mode": self._mode,
+            "pipeline": self._legacy.state() if self._legacy else [],
+        }
+
+    # ── Pipelines ──────────────────────────────────────────────────────────────
+
+    def _entry_pipeline(self, name: str) -> NestedPipeline:
+        """The pipeline behind one entry point, built on first use.
+
+        Built lazily because an endpoint declaring only ``onRequest`` should not
+        carry an empty runtime for the side it never uses — and because an empty
+        pipeline and an absent one differ here: only the second leaves the board
+        answering.
+        """
+        existing = self._entries[name]
+        if existing is not None:
+            return existing
+        created = self._new_pipeline(name)
+        self._entries[name] = created
+        return created
+
+    def _legacy_pipeline(self) -> NestedPipeline:
+        if self._legacy is None:
+            self._legacy = self._new_pipeline("pipeline")
+        return self._legacy
+
+    def _new_pipeline(self, label: str) -> NestedPipeline:
+        pipeline = NestedPipeline(
+            f"{self.uuid}:{label}", self._create_service, "HttpServerSubservices"
+        )
+        # Both entries hold in the same cells: that they can is the whole reason
+        # for declaring them separately.
+        pipeline.share_slots(self._slot_store)
+        if self._host:
+            pipeline.attach(self._host)
+        return pipeline
+
+    def _edit_pipeline(self, pipeline: NestedPipeline, payload: JsonRecord) -> None:
+        """The four edit verbs, applied to whichever pipeline was named."""
+        if isinstance(payload.get("pipeline"), list):
+            pipeline.set_pipeline(payload["pipeline"])
+        elif _is_json_record(payload.get("appendService")):
+            pipeline.append(payload["appendService"])
+        elif isinstance(payload.get("removeService"), str):
+            pipeline.remove(payload["removeService"])
+        elif _is_json_record(payload.get("configureService")):
+            edit = payload["configureService"]
+            if isinstance(edit.get("instanceId"), str) and _is_json_record(edit.get("state")):
+                pipeline.configure_service(edit["instanceId"], edit["state"])
+
+    def _pipelines(self) -> list[NestedPipeline]:
+        """Every pipeline this endpoint owns, each one only once."""
+        seen: list[NestedPipeline] = []
+        for pipeline in (self._legacy, self._entries["onProcess"], self._entries["onRequest"]):
+            if pipeline is not None and not any(p is pipeline for p in seen):
+                seen.append(pipeline)
+        return seen
+
+    def _entry_for(self, name: str) -> NestedPipeline | None:
+        """The pipeline one side enters through, or None where it has none.
+
+        This is where a legacy ``mode`` is read, and the only place it is: a
+        board that names its entries never reaches the table below.
+
+        =====================  =========  =========
+        declared               onProcess  onRequest
+        =====================  =========  =========
+        ``process_on_session``  —          the one
+        ``process_on_both``     the one    the one
+        ``process_on_data``     —          —
+        =====================  =========  =========
+
+        ``process_on_both`` answers with *the same instance* on both sides,
+        never a second copy of the configuration: a pipeline holding a Hold, a
+        timer or a mount is one running thing, and duplicating it would give a
+        board two of each and a slot that never reaches itself.
+        """
+        if self._form == "entries":
+            return self._entries[name]
+        if self._mode == "process_on_data":
+            return None
+        if name == "onProcess" and self._mode != "process_on_both":
+            return None
+        return self._legacy
 
     def set_host(self, host: RuntimeHost) -> None:
         self._host = host
         # A pipeline built in the constructor was built before there was a host
-        # to ask, so what the board records reaches it here rather than never.
-        self._apply_log_settings()
-
-    def _apply_log_settings(self) -> None:
-        """Hands the board's log settings to the nested pipeline, if any."""
-        if not self._host or not self._pipeline:
-            return
-        settings = self._host.log_settings()
-        self._pipeline.set_logging(settings["logging"])
-        self._pipeline.set_log_data(settings["log_data"])
-        self._pipeline.set_log_level(settings["log_level"])
+        # to ask what board it belongs to, or to report through.
+        for pipeline in self._pipelines():
+            pipeline.attach(host)
         # State is applied in the constructor, before the host exists, so a
         # service configured as already-active has nothing to claim its mount
         # from until now. Claiming here is what makes a board load into a live
@@ -358,29 +493,34 @@ class HttpServerSubservicesService:
             self._claim_mount()
 
     def process(self, input: Any, _notify: NotifyCallback) -> Any:
-        if self._mode == "process_on_data":
+        # The legacy built-in slot: what the board hands this endpoint is what a
+        # caller gets back. Expressible now as an ``onProcess`` that writes a
+        # slot and an ``onRequest`` that reads it, and kept because boards carry
+        # the older spelling and a board is a document people keep.
+        if self._form == "legacy" and self._mode == "process_on_data":
             self._latest_data = input
             return input
 
-        # Routing only: the nested pipeline handles data arriving from the outer
-        # chain exactly as it handles a request, and what it returns carries on
-        # down the chain. Whatever has to survive between the two — a value one
-        # side produces and the other reads — is a service's job, not this one's.
-        if self._mode == "process_on_both" and not self._bypass:
-            return self._process_session_input(input)
+        entry = None if self._bypass else self._entry_for("onProcess")
+        if entry is None:
+            return input
 
-        return input
+        # Routing only: what the pass's own pipeline returns carries on down the
+        # chain. Whatever has to survive until a request arrives — a value this
+        # side produces and the other reads — belongs in a slot, which is a
+        # service's job and not this one's.
+        return self._run_entry(entry, input)
 
     def destroy(self) -> None:
         self._release_mount()
-        self._release_notifications()
         # Nested services hold the same things top-level ones do — timers,
         # sockets, mounts — and nothing else will ever reach them once this
         # service is gone.
-        if self._pipeline:
-            self._pipeline.destroy()
-        self._pipeline = None
-        self._pipeline_config = []
+        for pipeline in self._pipelines():
+            pipeline.destroy()
+        self._legacy = None
+        self._entries["onProcess"] = None
+        self._entries["onRequest"] = None
 
     # ── Mount ──────────────────────────────────────────────────────────────────
 
@@ -420,7 +560,7 @@ class HttpServerSubservicesService:
         # Whether the answer is already decided here, or is whatever the rest
         # of the outer chain makes of what this service emitted.
         answered_here = False
-        if self._mode == "process_on_data":
+        if self._form == "legacy" and self._mode == "process_on_data":
             process_input = self._latest_data
             output: Any = process_input
             # The mode's whole contract: what the board handed this endpoint is
@@ -433,8 +573,18 @@ class HttpServerSubservicesService:
             answered_here = True
         else:
             process_input = await self._read_request(request, context)
-            answered_here = self._has_subservices()
-            output = self._process_session_input(process_input, run_context)
+            # A declared handler is what takes the answer away from the chain —
+            # not the presence of a pipeline, which says only that this endpoint
+            # has something to run, possibly on the other side. Without one the
+            # board answers, which is the inversion of control this service is
+            # built around.
+            handler = self._entry_for("onRequest")
+            answered_here = handler is not None and not handler.is_empty()
+            output = (
+                self._run_entry(handler, process_input, run_context)
+                if handler is not None
+                else process_input
+            )
 
         # What the nested pipeline produced, before the outer runtime sees it.
         answer = output
@@ -550,111 +700,24 @@ class HttpServerSubservicesService:
 
     # ── Pipeline helpers ───────────────────────────────────────────────────────
 
-    def _has_subservices(self) -> bool:
-        """Whether a nested pipeline is configured to handle requests."""
-        return bool(self._pipeline and self._pipeline.list_services())
-
-    def _process_session_input(
-        self, input: Any, parent: ProcessContext | None = None
+    def _run_entry(
+        self,
+        pipeline: NestedPipeline,
+        input: Any,
+        parent: ProcessContext | None = None,
     ) -> Any:
-        """Runs the nested pipeline as a run descended from ``parent``.
+        """Runs one entry's pipeline as a run descended from ``parent``.
 
         Both entry points land here, and they differ only in what they descend
         from: a request brings the run its caller minted for the whole exchange,
         while data from the outer chain arrives mid-call and descends from
         whatever that call is running as.
         """
-        if not self._pipeline or not self._pipeline.list_services():
-            return input
-        # The callback is a no-op: the nested runtime fans these out to the
-        # target registered in _rebuild. Forwarding them here as well would
-        # deliver every one twice.
-        return self._pipeline.process(
-            input,
-            lambda _n: None,
-            child_run(parent or (self._host.current_context() if self._host else None)),
-        )
+        context = parent
+        if context is None and self._host:
+            context = self._host.current_context()
+        return pipeline.process(input, context)
 
     def _do_notify(self, payload: Any, instance_id: str | None = None) -> None:
         if self._host:
             self._host.notify(payload, instance_id or self.uuid)
-
-    def _rebuild(self) -> None:
-        from ..types import RuntimeConfiguration
-
-        self._release_notifications()
-        # The pipeline being replaced is about to become unreachable; its
-        # services keep running until told otherwise. State worth carrying over
-        # has already been read into _pipeline_config by _sync_states.
-        if self._pipeline:
-            self._pipeline.destroy()
-
-        self._pipeline = HostedRuntime(
-            RuntimeConfiguration(
-                id=f"{self.uuid}:http-sub-runtime",
-                name=f"{self.service_name}-{self.uuid}",
-                board_name="",
-                services=self._pipeline_config,
-            ),
-            self._create_service,
-        )
-
-        # A nested runtime has no notification targets of its own, so what its
-        # services report — a Timer's tick, a Hold's counts — reaches nobody
-        # unless the service hosting the pipeline carries it out to the board.
-        # Services report through their host precisely because it is not always
-        # a call they are answering: an autonomous emitter has no caller.
-        self._release_pipeline_notifications = self._pipeline.register_notification_target(
-            lambda n: self._do_notify(n.payload, n.instance_id)
-        )
-
-        # A nested pipeline's entries belong to the same board log as everything
-        # else; only the runtime hosting this service can carry them there, since
-        # a nested runtime has no route out of its own.
-        self._release_pipeline_logs = self._pipeline.register_log_target(
-            lambda entry: self._host.forward_log(entry) if self._host else None
-        )
-
-        self._apply_log_settings()
-
-    def _release_notifications(self) -> None:
-        if self._release_pipeline_notifications:
-            self._release_pipeline_notifications()
-            self._release_pipeline_notifications = None
-        if self._release_pipeline_logs:
-            self._release_pipeline_logs()
-            self._release_pipeline_logs = None
-
-    def _sync_states(self) -> None:
-        if not self._pipeline:
-            return
-        by_id = {svc.uuid: svc.state for svc in self._pipeline.list_services()}
-        self._pipeline_config = [
-            ServiceConfiguration(
-                service_id=entry.service_id,
-                uuid=entry.uuid,
-                name=entry.name,
-                service_name=entry.service_name,
-                state=by_id.get(entry.uuid, entry.state),
-            )
-            for entry in self._pipeline_config
-        ]
-
-    def _get_pipeline_state(self) -> list[dict[str, Any]]:
-        if not self._pipeline:
-            return [
-                {
-                    "serviceId": e.service_id,
-                    "instanceId": e.uuid,
-                    "state": e.state or {},
-                }
-                for e in self._pipeline_config
-            ]
-        return [
-            {
-                "serviceId": svc.service_id,
-                "instanceId": svc.uuid,
-                "state": svc.state,
-            }
-            for svc in self._pipeline.list_services()
-        ]
