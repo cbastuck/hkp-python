@@ -369,6 +369,28 @@ class HttpServerSubservicesService:
             headers[lowered] = value
         return headers
 
+    def find_nested(self, instance_id: str):
+        """The nested service a scoped address names, searching every pipeline
+        this endpoint owns. The two entries are separate pipelines rather than
+        branches of one, so an instanceId used in both resolves to whichever
+        ``_pipelines()`` lists first.
+        """
+        for pipeline in self._pipelines():
+            found = pipeline.find(instance_id)
+            if found is not None:
+                return found
+        return None
+
+    def remount(self) -> None:
+        """See HostedService.remount: the runtime can serve one now.
+
+        Bypassed is the same answer it gives at set_host: an endpoint switched
+        off holds no address, and gaining somewhere to claim one does not
+        switch it back on.
+        """
+        if not self._bypass:
+            self._claim_mount()
+
     def get_state(self) -> JsonRecord:
         common = {
             "bypass": self._bypass,
@@ -422,7 +444,10 @@ class HttpServerSubservicesService:
 
     def _new_pipeline(self, label: str) -> NestedPipeline:
         pipeline = NestedPipeline(
-            f"{self.uuid}:{label}", self._create_service, "HttpServerSubservices"
+            f"{self.uuid}:{label}",
+            self._create_service,
+            "HttpServerSubservices",
+            self.uuid,
         )
         # Both entries hold in the same cells: that they can is the whole reason
         # for declaring them separately.

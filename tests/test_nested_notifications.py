@@ -153,12 +153,14 @@ async def test_reports_a_nested_services_state_to_an_attached_board(servers):
     holds = [
         entry["payload"]
         for entry in seen
-        if entry["instanceId"] == "hold-1"
+        # Under its scoped address: an instanceId is unique only inside its
+        # own pipeline, so each boundary prefixes its owner on the way out.
+        if entry["instanceId"] == "sub-1.hold-1"
         and isinstance(entry["payload"], dict)
         and entry["payload"].get("writeCount") == 1
     ]
     # The tick reached the Hold behind it, and the Hold's own report got out.
-    assert holds, f"no hold-1 state reached the board; saw {seen}"
+    assert holds, f"no sub-1.hold-1 state reached the board; saw {seen}"
     assert holds[-1]["held"] == 1
 
 
@@ -182,8 +184,8 @@ async def test_reports_each_nested_notification_exactly_once(servers):
 
     seen = await collect_notifications(ws_url, drive)
 
-    assert flow_count(seen, "hold-1", "call-process") == 1
-    assert flow_count(seen, "hold-1", "call-process-finished") == 1
+    assert flow_count(seen, "sub-1.hold-1", "call-process") == 1
+    assert flow_count(seen, "sub-1.hold-1", "call-process-finished") == 1
 
 
 class _RecordingService:
