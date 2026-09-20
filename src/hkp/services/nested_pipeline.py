@@ -12,6 +12,7 @@ not one per host.
 
 from typing import Any, Callable
 
+from ..address import join_address
 from ..runtime import HostedRuntime, child_run
 from ..types import (
     JsonRecord,
@@ -37,10 +38,21 @@ class NestedPipeline:
     """
 
     def __init__(
-        self, label: str, create_service: ServiceCreator, owner: str = "SubService"
+        self,
+        label: str,
+        create_service: ServiceCreator,
+        owner: str = "SubService",
+        owner_uuid: str = "",
     ) -> None:
+        """
+        :param owner:      What the nested runtime is called in logs.
+        :param owner_uuid: The uuid a service inside this pipeline is addressed
+                           under. Separate from ``owner``, which is a name for
+                           a person reading a log rather than one for dialling.
+        """
         self._label = label
         self._owner = owner
+        self._owner_uuid = owner_uuid
         self._create_service = create_service
         #: See share_slots. None means the surrounding runtime's cells.
         self._shared: SlotStore | None = None
@@ -55,6 +67,7 @@ class NestedPipeline:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_slots()
+        self._apply_mounts()
 
     def share_slots(self, store: SlotStore) -> None:
         """Hold values here rather than in the surrounding runtime's cells.
@@ -64,6 +77,10 @@ class NestedPipeline:
         """
         self._shared = store
         self._apply_slots()
+
+    def find(self, instance_id: str) -> Any | None:
+        """One of the services here, by the name it carries — for an address."""
+        return self._runtime.get_service(instance_id) if self._runtime else None
 
     def is_empty(self) -> bool:
         return not self._runtime or not self._runtime.list_services()
@@ -152,8 +169,15 @@ class NestedPipeline:
             _make_runtime_config(self._label, self._owner, self._config),
             self._create_service,
         )
+        # Under a scoped address, not the bare instanceId: an instanceId is
+        # unique only inside its own pipeline, so each boundary prefixes its
+        # owner on the way out. See address.py.
         self._release_notifications = self._runtime.register_notification_target(
-            lambda n: self._host.notify(n.payload, n.instance_id) if self._host else None
+            lambda n: self._host.notify(
+                n.payload, join_address(self._owner_uuid, n.instance_id)
+            )
+            if self._host
+            else None
         )
         self._release_logs = self._runtime.register_log_target(
             lambda entry: self._host.forward_log(entry) if self._host else None
@@ -161,6 +185,7 @@ class NestedPipeline:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_slots()
+        self._apply_mounts()
 
     def _release(self) -> None:
         if self._release_notifications:
@@ -191,6 +216,28 @@ class NestedPipeline:
             lambda: self._shared
             if self._shared is not None
             else (self._host.slots() if self._host else None)
+        )
+
+    def _apply_mounts(self) -> None:
+        """Lets the services inside claim an endpoint on the runtime outside.
+
+        Same reason as slots and secrets: a nested runtime has no server of its
+        own. The name falls back to the scoped address, so two containers
+        holding a pipeline that names no mount do not derive one address
+        between them.
+        """
+        if not self._runtime:
+            return
+        self._runtime.delegate_mounts(
+            lambda service_uuid, handler, mount_name: (
+                self._host.mount(
+                    service_uuid,
+                    handler,
+                    mount_name or join_address(self._owner_uuid, service_uuid),
+                )
+                if self._host
+                else None
+            )
         )
 
     def _apply_log_settings(self) -> None:

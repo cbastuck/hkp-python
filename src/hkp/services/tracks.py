@@ -53,6 +53,7 @@ from ..types import (
     ServiceConfiguration,
     ServiceCreator,
     ServiceRegistryEntry,
+    SlotStore,
 )
 from .nested_pipeline import NestedPipeline
 from .sub_service import _is_json_record
@@ -90,7 +91,17 @@ class TracksService:
         self._bypass = False
         self._run = "serial"
         self._tracks: list[_Track] = []
-        self._reduce = NestedPipeline(f"{self.uuid}:{REDUCE}", create_service, "Tracks")
+        #: The cells this service's pipelines hold values in.
+        #:
+        #: Owned here, like an endpoint's: the branches are pipelines of one
+        #: arrangement, so a value one leaves for another belongs to this
+        #: service rather than to the runtime around it — and two of these on a
+        #: runtime may both use a name without meeting.
+        self._slot_store = SlotStore()
+        self._reduce = NestedPipeline(
+            f"{self.uuid}:{REDUCE}", create_service, "Tracks", self.uuid
+        )
+        self._reduce.share_slots(self._slot_store)
         self._last_error = ""
 
         if config.state:
@@ -101,6 +112,18 @@ class TracksService:
         self._reduce.attach(host)
         for track in self._tracks:
             track.pipeline.attach(host)
+
+    def find_nested(self, instance_id: str) -> Any | None:
+        """The nested service a scoped address names, tracks first and in
+        declaration order, then the reducer. A name used in two tracks resolves
+        to the earlier, which is the cost of addressing a branch by what is in
+        it rather than by the branch's own name.
+        """
+        for track in self._tracks:
+            found = track.pipeline.find(instance_id)
+            if found is not None:
+                return found
+        return self._reduce.find(instance_id)
 
     def get_state(self) -> JsonRecord:
         return {
@@ -188,7 +211,14 @@ class TracksService:
             # destroy what is running inside it because a track beside it was
             # edited.
             existing = previous.pop(name, None)
-            pipeline = existing.pipeline if existing else NestedPipeline(f"{self.uuid}:{name}", self._create_service, "Tracks")
+            pipeline = (
+                existing.pipeline
+                if existing
+                else NestedPipeline(
+                    f"{self.uuid}:{name}", self._create_service, "Tracks", self.uuid
+                )
+            )
+            pipeline.share_slots(self._slot_store)
             if isinstance(entry.get("pipeline"), list):
                 pipeline.set_pipeline(entry["pipeline"])
             if existing is None and self._host:

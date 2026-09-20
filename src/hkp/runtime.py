@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Coroutine, Callable, Iterator
 
+from .address import ADDRESS_SEPARATOR, descend, split_address
 from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
@@ -154,6 +155,11 @@ class HostedRuntime:
         #: Where this runtime's slots come from when they are not its own;
         #: see delegate_slots.
         self._slots_from: Callable[[], SlotStore | None] | None = None
+        #: Where this runtime's mounts are claimed, when it has no server of
+        #: its own; see delegate_mounts.
+        self._mounts_from: (
+            Callable[[str, MountHandler, str | None], MountHandle | None] | None
+        ) = None
 
         for svc_config in config.services:
             self.add_service(svc_config)
@@ -189,8 +195,22 @@ class HostedRuntime:
 
     # ── Service management ─────────────────────────────────────────────────────
 
-    def get_service(self, uuid: str) -> HostedService | None:
-        return self._services.get(uuid)
+    def get_service(self, address: str) -> HostedService | None:
+        """The service an address names, flat or scoped.
+
+        The flat list is asked first, so a uuid that happens to contain a dot
+        is still that service rather than a path into something else. Only when
+        no service carries the whole address is it read as one — see
+        ``address.py``.
+        """
+        direct = self._services.get(address)
+        if direct is not None:
+            return direct
+        segments = split_address(address)
+        if len(segments) < 2:
+            return None
+        head = self._services.get(segments[0])
+        return descend(head, segments[1:]) if head is not None else None
 
     def add_service(self, config: ServiceConfiguration) -> JsonRecord:
         if config.uuid in self._services:
@@ -202,8 +222,8 @@ class HostedRuntime:
         self._service_order.append(svc.uuid)
         return svc.get_state()
 
-    def configure_service(self, uuid: str, config: JsonRecord) -> JsonRecord | None:
-        svc = self._services.get(uuid)
+    def configure_service(self, address: str, config: JsonRecord) -> JsonRecord | None:
+        svc = self.get_service(address)
         if not svc:
             return None
         return svc.configure(config)
@@ -281,7 +301,15 @@ class HostedRuntime:
         try:
             start_index = self._service_order.index(start_at_uuid)
         except ValueError:
-            raise KeyError(start_at_uuid)
+            # Not one of this runtime's own: a scoped address enters the
+            # pipeline that holds it instead, and runs to the end of *that*
+            # list. What it produces is the nested pipeline's answer.
+            segments = split_address(start_at_uuid)
+            head = self._services.get(segments[0]) if len(segments) > 1 else None
+            enter = getattr(head, "process_nested", None) if head else None
+            if enter is None:
+                raise KeyError(start_at_uuid)
+            return enter(ADDRESS_SEPARATOR.join(segments[1:]), data, context)
 
         # Nothing to continue: whoever asked for this is outside the board, so
         # it begins a run rather than joining one.
@@ -360,6 +388,11 @@ class HostedRuntime:
         its endpoint is called, and the runtime knows which board it is in, and
         the address is derived from both.
         """
+        # A nested runtime has no server of its own, so it asks the one around
+        # it — the same arrangement as secrets and slots. Without this an
+        # endpoint inside a scope had no address at all.
+        if self._mounts_from is not None:
+            return self._mounts_from(service_uuid, handler, mount_name)
         if not self._mounts:
             return None
         return self._mounts.mount(
@@ -505,6 +538,23 @@ class HostedRuntime:
             if delegated is not None:
                 return delegated
         return self._own_slots
+
+    def delegate_mounts(
+        self,
+        source: Callable[[str, MountHandler, str | None], MountHandle | None],
+    ) -> None:
+        """Claim mounts somewhere else rather than on a server of this one's own.
+
+        The services here were built before this runtime could serve a mount,
+        so any that wanted one gave up on it; now that there is somewhere to
+        claim from, they are told to ask again. A service with nothing to claim
+        has nothing to do here and does not answer.
+        """
+        self._mounts_from = source
+        for svc in list(self._services.values()):
+            remount = getattr(svc, "remount", None)
+            if remount:
+                remount()
 
     def delegate_slots(self, source: Callable[[], SlotStore | None]) -> None:
         """Hold values somewhere other than this runtime's own cells.
