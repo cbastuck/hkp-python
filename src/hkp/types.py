@@ -260,6 +260,39 @@ class RuntimeHost(Protocol):
         """
         ...
 
+    def slots(self) -> "SlotStore | None":
+        """The cells this pipeline's values may be held in, or None.
+
+        A nested runtime answers with the store the service hosting it gave it,
+        and otherwise with its parent's — so a slot named inside a sub-pipeline
+        reaches the nearest owner that declared one, and a service that declared
+        none does not silently isolate what is nested in it.
+        """
+        ...
+
+
+class SlotStore:
+    """Named cells two pipelines can share a value through.
+
+    A pipeline pass carries one value and ends; anything that has to survive
+    until a *different* pipeline runs has nowhere to live. A store gives it a
+    name, and whoever owns the pipelines that must share decides which store
+    they see — which is what keeps the sharing scoped to the arrangement that
+    needs it rather than being ambient across a runtime.
+
+    Deliberately not a cache: nothing expires, nothing is computed on a miss.
+    It is a cell, and the services that read and write it say what it means.
+    """
+
+    def __init__(self) -> None:
+        self._cells: dict[str, Any] = {}
+
+    def get(self, name: str) -> Any:
+        return self._cells.get(name)
+
+    def set(self, name: str, value: Any) -> None:
+        self._cells[name] = value
+
 
 @runtime_checkable
 class HostedService(Protocol):

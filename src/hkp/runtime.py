@@ -25,6 +25,7 @@ from .types import (
     ServiceCreator,
     ServiceDescriptor,
     ServiceRegistryEntry,
+    SlotStore,
 )
 
 
@@ -145,6 +146,14 @@ class HostedRuntime:
         #: Where this runtime's secrets come from when they are not its own;
         #: see delegate_secrets.
         self._secrets_from: Callable[[], SecretVault | None] | None = None
+        #: The cells services in this runtime hold values in between passes.
+        #: Owned rather than delegated by default: a runtime is the outermost
+        #: thing a slot name can mean, so two services that name the same slot
+        #: and are given nothing more specific share this one.
+        self._own_slots = SlotStore()
+        #: Where this runtime's slots come from when they are not its own;
+        #: see delegate_slots.
+        self._slots_from: Callable[[], SlotStore | None] | None = None
 
         for svc_config in config.services:
             self.add_service(svc_config)
@@ -489,6 +498,25 @@ class HostedRuntime:
         reaches the runtime that was actually given something.
         """
         self._secrets_from = source
+
+    def slots(self) -> SlotStore:
+        if self._slots_from is not None:
+            delegated = self._slots_from()
+            if delegated is not None:
+                return delegated
+        return self._own_slots
+
+    def delegate_slots(self, source: Callable[[], SlotStore | None]) -> None:
+        """Hold values somewhere other than this runtime's own cells.
+
+        What a nested pipeline shares with is decided by the service hosting
+        it: an endpoint that wants its two entry points to hold between them
+        gives both of them one store, and a service with nothing to share
+        passes its parent's along — so a slot named deep inside reaches the
+        nearest owner that declared one, and nesting never isolates what is
+        inside it by accident.
+        """
+        self._slots_from = source
 
     def spawn(self, coro: Coroutine[Any, Any, Any]) -> bool:
         """Run a coroutine on the server's loop, from wherever this is called.

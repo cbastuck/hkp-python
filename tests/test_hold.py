@@ -15,7 +15,7 @@ from hkp.services.hold import HOLD_DESCRIPTOR, HoldService
 from hkp.services.http_server import HTTP_SERVER_SUBSERVICES_DESCRIPTOR
 from hkp.services.map_service import MAP_DESCRIPTOR
 from hkp.services.timer import TIMER_DESCRIPTOR
-from hkp.types import ServiceConfiguration
+from hkp.types import ServiceConfiguration, SlotStore
 
 
 @pytest_asyncio.fixture
@@ -292,3 +292,110 @@ async def test_serves_a_nested_timers_latest_tick_to_callers(servers):
 
         async with session.get(mount_url) as response:
             assert await response.json() == "tick 1"
+
+
+# ── A slot, where the role is declared ───────────────────────────────────────
+
+
+class _Host:
+    """A host that lends cells, as an endpoint lends them to its entry points."""
+
+    def __init__(self) -> None:
+        self.cells = SlotStore()
+
+    def slots(self) -> SlotStore:
+        return self.cells
+
+    def notify(self, _payload: Any, _instance_id: str) -> None:
+        return None
+
+
+def slot_pair(slot: str = "document"):
+    host = _Host()
+    write = make_hold({"slot": slot, "op": "write"})
+    read = make_hold({"slot": slot, "op": "read"})
+    write.set_host(host)
+    read.set_host(host)
+    return write, read
+
+
+def test_slot_reads_back_what_the_other_end_wrote():
+    write, read = slot_pair()
+    write.process({"meta": {"status": 200}, "body": "<rss/>"}, noop)
+    assert read.process(REQUEST, noop) == {"meta": {"status": 200}, "body": "<rss/>"}
+
+
+def test_slot_passes_a_writes_input_on_unchanged():
+    # The pass a write belongs to carries on as though the Hold were not there —
+    # nothing is wrapped, so the services after it see what they would have seen.
+    write, _read = slot_pair()
+    document = {"meta": {"status": 200}, "body": "<rss/>"}
+    assert write.process(document, noop) is document
+
+
+def test_slot_holds_two_shapes_that_look_alike():
+    # The reason the older arrangement cannot express an endpoint publishing a
+    # document — a response and a request are the same shape, so there is
+    # nothing in the value to discriminate on.
+    write, read = slot_pair()
+    write.process({"meta": {"status": 200}, "body": "ok"}, noop)
+    as_request = {"meta": {"method": "GET", "path": "/"}}
+    assert read.process(as_request, noop) == {"meta": {"status": 200}, "body": "ok"}
+    # The request did not overwrite what is held: a read is only ever a read.
+    assert read.process(as_request, noop) == {"meta": {"status": 200}, "body": "ok"}
+
+
+def test_slot_holds_bytes_and_reports_their_size():
+    write, read = slot_pair()
+    audio = bytes(4096)
+    write.process(audio, noop)
+    assert read.process(REQUEST, noop) is audio
+    assert write.get_state()["held"] == "[4096 bytes]"
+
+
+def test_slot_stops_a_read_that_arrives_before_a_write():
+    _write, read = slot_pair()
+    assert read.process(REQUEST, noop) is None
+
+
+def test_slots_are_kept_apart_by_name():
+    host = _Host()
+    feed = make_hold({"slot": "feed", "op": "write"})
+    playlist = make_hold({"slot": "playlist", "op": "read"})
+    feed.set_host(host)
+    playlist.set_host(host)
+
+    feed.process({"body": "<rss/>"}, noop)
+
+    assert playlist.process(REQUEST, noop) is None
+
+
+def test_destroying_one_end_leaves_the_cell_alone():
+    # A pipeline rebuilt while a board runs destroys the services in it. The
+    # other end of the slot outlives this one and must keep answering.
+    write, read = slot_pair()
+    write.process({"body": "<rss/>"}, noop)
+    write.destroy()
+    assert read.process(REQUEST, noop) == {"body": "<rss/>"}
+
+
+def test_reports_the_arrangement_it_is_using_and_not_the_other():
+    write, _read = slot_pair()
+    state = write.get_state()
+    assert state["slot"] == "document"
+    assert state["op"] == "write"
+    assert "property" not in state
+
+    by_property = make_hold({"property": "triggerCount"})
+    assert by_property.get_state()["property"] == "triggerCount"
+    assert "slot" not in by_property.get_state()
+
+
+def test_holds_for_itself_where_nothing_provides_a_store():
+    # A Hold is still a Hold outside any host that lends it cells; what it
+    # cannot do there is share.
+    alone = make_hold({"slot": "document", "op": "write"})
+    document = {"body": "<rss/>"}
+    alone.process(document, noop)
+    assert alone.get_state()["held"] == document
+    assert alone.get_state()["writeCount"] == 1
