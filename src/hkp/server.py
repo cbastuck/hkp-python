@@ -80,6 +80,10 @@ _AUTHENTICATED_USER_KEY: Any = (
 #: Largest accepted request body on a public service endpoint (25 MB).
 DEFAULT_MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
 
+#: Which runtime server this is, reported beside the runtimes so a client can
+#: tell remote runtimes apart without reading their address.
+RUNTIME_SERVER_KIND = "python"
+
 
 def _tenant_key(owner: str, runtime_id: str) -> str:
     """Runtime ids are unique per tenant, not globally, so anything keyed by
@@ -549,6 +553,7 @@ class RuntimeServer:
                 ],
                 # The service registry is a property of the build, not a tenant.
                 "registry": self.runtime_app.get_registry(),
+                "server": RUNTIME_SERVER_KIND,
             }
         )
 
@@ -599,7 +604,11 @@ class RuntimeServer:
             runtimes.append(self._serialize_runtime(runtime))
 
         return web.json_response(
-            {"runtimes": runtimes, "registry": self.runtime_app.get_registry()}
+            {
+                "runtimes": runtimes,
+                "registry": self.runtime_app.get_registry(),
+                "server": RUNTIME_SERVER_KIND,
+            }
         )
 
     async def _delete_runtimes(self, request: web.Request) -> web.Response:
