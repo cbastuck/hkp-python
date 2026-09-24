@@ -308,7 +308,7 @@ output. The `noMatch` config decides the other branch: `"stop"` (default) ends
 the pipeline, `"forward"` passes the original input to the remaining services —
 chain `skill-router (noMatch: forward) → text-generation → text-to-speech` for
 a voice assistant that acts on matching requests and answers everything else.
-See `hkp-frontend/boards/skill-router-demo-board.json`,
+See `boards/skill-router-demo-board.json`,
 `voice-assistant-skills-demo-board.json`, and the target board
 `send-ntfy-board.json`.
 
