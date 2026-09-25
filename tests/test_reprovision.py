@@ -5,7 +5,7 @@ coordinator-managed board does not kill services the coordinator started
 (hkp-node/tests/cloud-reprovision.test.ts).
 
 **hkp-python rebuilds it instead.** These tests pin that difference rather than
-endorse it: it is a known divergence, listed in TODO-CONSOLIDATION.md. Change
+endorse it: it is a known divergence, listed in plans/TODO-CONSOLIDATION.md. Change
 them when python adopts node's behaviour — the assertions below say plainly
 which way each one should flip.
 """

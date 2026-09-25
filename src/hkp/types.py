@@ -125,7 +125,7 @@ class ProcessContext:
     runtimes carry for a different purpose: that is a *reply address*, exists
     only while someone awaits a response, and is consumed on resolution. A run
     outlives any number of those, so the two are not interchangeable — see
-    TODO-CONSOLIDATION.md section 4.
+    plans/TODO-CONSOLIDATION.md section 4.
     """
 
     #: Identifies one invocation of a board — one webhook, one timer tick, one
