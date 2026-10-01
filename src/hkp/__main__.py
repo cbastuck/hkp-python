@@ -183,6 +183,14 @@ async def main() -> None:
             "external_host": external_host,
             "host": host,
             "mount_secret": _resolve_mount_secret(),
+            # The tickets this server reconnects to coordinators with, beside
+            # the mount secret. HKP_COORDINATOR_LINKS_FILE="" keeps them in
+            # memory, so a restart leaves every deployed board waiting to be
+            # deployed again.
+            "coordinator_links": os.environ.get(
+                "HKP_COORDINATOR_LINKS_FILE",
+                str(Path.home() / ".hkp" / "python" / "coordinator-links.json"),
+            ),
             "quotas": {
                 "max_runtimes_per_user": _read_integer(
                     os.environ.get("HKP_MAX_RUNTIMES_PER_USER"), 0
@@ -207,6 +215,9 @@ async def main() -> None:
     )
 
     address = await server.start(port, host)
+    # Once this server is listening: a coordinator it reconnects to may build a
+    # runtime at once, and that runtime's mounts need an address to publish.
+    server.coordinator_links.restore()
     print(f"hkp-python listening on {address['base_url']}")
 
     try:
