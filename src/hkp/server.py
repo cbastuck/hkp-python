@@ -22,6 +22,8 @@ from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
 from .runtime import set_server_loop
 from .secrets import read_secrets_payload
+from .assets import read_assets_payload
+from .services.asset import ASSET_DESCRIPTOR, AssetService
 from .runtime import (
     context_from_wire,
     HostedRuntime,
@@ -185,6 +187,10 @@ class RuntimeServer:
             HOLD_DESCRIPTOR.service_id: HostedServiceFactory(
                 HOLD_DESCRIPTOR,
                 lambda cfg, _cs: HoldService(cfg),
+            ),
+            ASSET_DESCRIPTOR.service_id: HostedServiceFactory(
+                ASSET_DESCRIPTOR,
+                lambda cfg, _cs: AssetService(cfg),
             ),
             TIMER_DESCRIPTOR.service_id: HostedServiceFactory(
                 TIMER_DESCRIPTOR,
@@ -376,6 +382,10 @@ class RuntimeServer:
             "/runtimes/{runtime_id}/session-token", self._mint_session_token
         )
         app.router.add_post("/runtimes/{runtime_id}/secrets", self._post_secrets)
+        app.router.add_post("/runtimes/{runtime_id}/assets", self._post_assets)
+        app.router.add_get(
+            "/runtimes/{runtime_id}/assets/{asset_id}", self._check_asset
+        )
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
         app.router.add_patch("/runtimes/{runtime_id}/state", self._patch_runtime_state)
         app.router.add_post("/runtimes/{runtime_id}", self._process_runtime)
@@ -704,6 +714,41 @@ class RuntimeServer:
             raise web.HTTPBadRequest()
         runtime.set_secrets(read_secrets_payload(body))
         return web.json_response({"aliases": runtime.secrets().aliases()})
+
+    async def _post_assets(self, request: web.Request) -> web.Response:
+        """Descriptors for the assets this runtime's services reference.
+
+        Provisioning carries them already; this is for a configuration naming
+        one the runtime was not given, for an asset edited while the board runs
+        — which is how an edit reaches a service without reconfiguring it — and
+        for a re-push after a restart. It merges, and ``null`` removes an asset.
+        Answers with the ids held, never content.
+        """
+        runtime = self._get_runtime_or_404(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        if not isinstance(body, (dict, list)):
+            raise web.HTTPBadRequest()
+        runtime.set_assets(read_assets_payload(body))
+        return web.json_response({"ids": runtime.assets().ids()})
+
+    async def _check_asset(self, request: web.Request) -> web.Response:
+        """Whether an asset resolves here, and to what — a check, not a download."""
+        runtime = self._get_runtime_or_404(request)
+        resolution = await asyncio.to_thread(
+            runtime.assets().resolve, f"hkp-asset://{request.match_info['asset_id']}"
+        )
+        if resolution.asset is None:
+            return web.json_response({"ok": False, "problem": resolution.problem})
+        return web.json_response(
+            {
+                "ok": True,
+                "mediaType": resolution.asset.media_type,
+                "size": len(resolution.asset.content),
+            }
+        )
 
     async def _rearrange_runtime(self, request: web.Request) -> web.Response:
         runtime = self._get_runtime_or_404(request)
@@ -1108,6 +1153,13 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         # here and handed to the runtime's vault; they are never put back into
         # any service's state, and never appear in a serialized runtime.
         secrets=read_secrets_payload(value.get("secrets")),
+        # Descriptors for the assets the services reference; a removal means
+        # nothing to a runtime being created, so only descriptors are kept.
+        assets={
+            asset_id: entry
+            for asset_id, entry in read_assets_payload(value.get("assets")).items()
+            if entry is not None
+        },
         services=services,
     )
 

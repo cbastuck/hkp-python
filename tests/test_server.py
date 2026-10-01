@@ -128,6 +128,7 @@ async def test_registry_shape(server_info, base_url, port):
             "version": "v1",
             "capabilities": [],
         },
+        {"serviceId": "asset", "serviceName": "Asset", "version": "v1", "capabilities": []},
         # Canonical id, matching hkp-node and hkp-rt. The legacy
         # "hookup.to/service/timer" still creates one but is not advertised.
         {"serviceId": "timer", "serviceName": "Timer"},

@@ -47,6 +47,11 @@ from __future__ import annotations
 # it is holding. Byte answers are seekable: `Range` is honoured against the
 # bytes the handler produced.
 #
+# A `body` that is an `hkp-asset://<id>` reference is answered with that asset's
+# content, resolved from the runtime's asset store as the answer is written, and
+# with the asset's media type unless `meta` names one — so editing the asset
+# changes the next response without reconfiguring the endpoint.
+#
 # Mirrors hkp-node's `http-server-subservices`, which reads the same shapes.
 
 import asyncio
@@ -61,6 +66,7 @@ from aiohttp import web
 from ..mounts import MountContext, MountHandle, decode_body
 from ..runtime import new_run
 from ..mount import MOUNT_FIELD
+from ..assets import parse_asset_ref
 from ..types import (
     ProcessContext,
     JsonRecord,
@@ -633,7 +639,43 @@ class HttpServerSubservicesService:
         # effects. Without one, the rest of the board is the handler — except in
         # `process_on_data`, where the stored document is the answer.
         response_value = answer if answered_here else output
-        return self._answer(request, response_value)
+        return self._answer(request, await self._resolve_asset_body(response_value))
+
+    async def _resolve_asset_body(self, value: Any) -> Any:
+        """An answer whose ``body`` is an ``hkp-asset://`` reference, with the
+        asset's content in its place.
+
+        Resolved as the answer is written, so what an endpoint serves is whatever
+        the asset holds now. A reference that does not resolve is answered as a
+        500 naming the asset and why, and reported — sending the reference itself
+        as the page would be a quieter failure, and a worse one.
+        """
+        envelope = _as_response_envelope(value)
+        if envelope is None or not parse_asset_ref(envelope.get("body")):
+            return value
+        store = (
+            self._host.assets()
+            if self._host is not None and hasattr(self._host, "assets")
+            else None
+        )
+        if store is None:
+            resolution_problem = "this runtime has no assets"
+            asset = None
+        else:
+            # A URL source is fetched blocking; keep it off the server's loop.
+            resolution = await asyncio.to_thread(store.resolve, envelope["body"])
+            asset, resolution_problem = resolution.asset, resolution.problem
+        if asset is None:
+            self._do_notify({"error": resolution_problem})
+            return {
+                "meta": {"status": 500, "contentType": "application/json"},
+                "body": {"error": resolution_problem},
+            }
+        meta = dict(envelope.get("meta") or {})
+        if not (isinstance(meta.get("contentType"), str) and meta["contentType"]):
+            meta["contentType"] = asset.media_type
+        answer = {key: item for key, item in envelope.items() if key != "body"}
+        return {**answer, "meta": meta, "binary": asset.content}
 
     def _answer(self, request: web.Request, value: Any) -> web.Response:
         """Writes what the handler produced, honouring a range request when the

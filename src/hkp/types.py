@@ -82,6 +82,11 @@ class RuntimeConfiguration:
     #: They are unpacked into the runtime's vault and go no further — never into
     #: a service's state, never into a serialized runtime, never back out.
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
+    #: Descriptors for the ``hkp-asset://<id>`` references this runtime's
+    #: services carry, by id — with the create payload for the reason secrets
+    #: are, and only what the services reference. They go into the runtime's
+    #: asset store and never into service state. See ``assets.py``.
+    assets: dict[str, dict[str, Any]] = field(default_factory=dict)
     services: list[ServiceConfiguration] = field(default_factory=list)
 
 

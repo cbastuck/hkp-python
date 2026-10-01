@@ -12,6 +12,7 @@ from .address import ADDRESS_SEPARATOR, descend, split_address
 from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
+from .assets import AssetStore
 from .types import (
     LogEntry,
     LogLevel,
@@ -147,6 +148,14 @@ class HostedRuntime:
         #: Where this runtime's secrets come from when they are not its own;
         #: see delegate_secrets.
         self._secrets_from: Callable[[], SecretVault | None] | None = None
+        #: The descriptors of the assets this runtime's services reference, and
+        #: the content they resolve to. Filled before any service is built, for
+        #: the same reason the vault is. Reachable through assets().
+        self._asset_store = AssetStore(lambda: self.secrets())
+        self._asset_store.replace(config.assets)
+        #: Where this runtime's assets come from when they are not its own; see
+        #: delegate_assets.
+        self._assets_from: Callable[[], AssetStore | None] | None = None
         #: The cells services in this runtime hold values in between passes.
         #: Owned rather than delegated by default: a runtime is the outermost
         #: thing a slot name can mean, so two services that name the same slot
@@ -531,6 +540,35 @@ class HostedRuntime:
         reaches the runtime that was actually given something.
         """
         self._secrets_from = source
+
+    def assets(self) -> AssetStore:
+        """The runtime's assets, for a service that consumes content by reference.
+
+        A service holds ``hkp-asset://<id>`` and resolves it here at the moment
+        it uses it, so an asset edited while the board runs is what the next use
+        gets. The content is used and dropped, never put into state.
+        """
+        if self._assets_from is not None:
+            delegated = self._assets_from()
+            if delegated is not None:
+                return delegated
+        return self._asset_store
+
+    def set_assets(self, entries: dict[str, Any]) -> None:
+        """Takes in descriptors, or ``None`` for an asset that was deleted.
+
+        Merges, like secrets, because a client edits one asset at a time.
+        """
+        self._asset_store.merge(entries)
+
+    def delegate_assets(self, source: Callable[[], AssetStore | None]) -> None:
+        """Take assets from somewhere else rather than from this runtime's own.
+
+        The same arrangement as secrets: a nested pipeline is provisioned by
+        nobody, so it asks the runtime around it — on each lookup, so an asset
+        edited while the board runs is what a nested service resolves next.
+        """
+        self._assets_from = source
 
     def slots(self) -> SlotStore:
         if self._slots_from is not None:
