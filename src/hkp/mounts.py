@@ -95,7 +95,14 @@ class MountRegistry:
         #: process, which is the old behaviour: addresses that work but do not
         #: survive a restart. ``__main__`` persists one so they do.
         self._secret = secret or secrets.token_hex(32)
-        self._mounts: dict[str, _MountRecord] = {}
+        #: Every claim to an address, oldest first. An address is derived
+        #: from what the mount is called, so more than one runtime may claim
+        #: the same one: a runtime rebuilt under its id claims it before the
+        #: one it replaces lets go, and a board open in a client and also
+        #: deployed holds two copies of each of its mounts. One claim answers
+        #: — see ``_answering`` — and the others are kept, so that releasing
+        #: one leaves the address with whoever still claims it.
+        self._mounts: dict[str, list[_MountRecord]] = {}
 
     def _derive_id(
         self,
@@ -146,16 +153,37 @@ class MountRegistry:
             service_uuid=service_uuid,
             handler=handler,
         )
-        self._mounts[mount_id] = record
+        self._mounts.setdefault(mount_id, []).append(record)
 
         def release() -> None:
-            # This claim and no other: the address is derived, so a later claim
-            # to it takes it over, and releasing the earlier one then removes
-            # nothing.
-            if self._mounts.get(mount_id) is record:
-                del self._mounts[mount_id]
+            # This claim and no other.
+            self._drop(mount_id, lambda claim: claim is record)
 
         return MountHandle(url=url, path=mount_path, release=release)
+
+    def _answering(self, mount_id: str) -> _MountRecord | None:
+        """The claim that answers at an address: a deployed board's before a
+        client's, and the newest of its kind.
+
+        A board somebody deployed is meant to be reachable whoever else has it
+        open, so opening it in a client neither takes its address nor, on
+        leaving, takes the address away.
+        """
+        claims = self._mounts.get(mount_id, [])
+        deployed = [claim for claim in claims if claim.space != claim.owner]
+        if deployed:
+            return deployed[-1]
+        return claims[-1] if claims else None
+
+    def _drop(self, mount_id: str, gone: Callable[[_MountRecord], bool]) -> None:
+        claims = self._mounts.get(mount_id)
+        if claims is None:
+            return
+        kept = [claim for claim in claims if not gone(claim)]
+        if kept:
+            self._mounts[mount_id] = kept
+        else:
+            del self._mounts[mount_id]
 
     def release_runtime(self, space: str, runtime_id: str) -> None:
         """Drop every mount belonging to a runtime.
@@ -163,24 +191,30 @@ class MountRegistry:
         Services release their own mounts on destroy; this is the backstop so a
         torn-down runtime can never leave a publicly reachable endpoint behind.
         """
-        for mount_id, record in list(self._mounts.items()):
-            if record.space == space and record.runtime_id == runtime_id:
-                del self._mounts[mount_id]
+        for mount_id in list(self._mounts):
+            self._drop(
+                mount_id,
+                lambda claim: claim.space == space and claim.runtime_id == runtime_id,
+            )
 
     def release_owner(self, owner: str) -> None:
         """Drops the mounts of what a tenant's clients created; a deployed
         board's go with its runtimes."""
-        for mount_id, record in list(self._mounts.items()):
-            if record.space == owner:
-                del self._mounts[mount_id]
+        for mount_id in list(self._mounts):
+            self._drop(mount_id, lambda claim: claim.space == owner)
 
     def count_for_owner(self, owner: str) -> int:
-        return sum(1 for r in self._mounts.values() if r.owner == owner)
+        return sum(
+            1
+            for claims in self._mounts.values()
+            for claim in claims
+            if claim.owner == owner
+        )
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         """Serve a request addressed to a mount, or 404 when the id is unknown."""
         mount_id = request.match_info.get("mount_id", "")
-        record = self._mounts.get(mount_id)
+        record = self._answering(mount_id)
         if not record:
             raise web.HTTPNotFound()
 

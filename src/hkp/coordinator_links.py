@@ -474,12 +474,28 @@ class CoordinatorLinks:
         keeps nothing — when it has not: an introduction is made by somebody
         waiting to hear whether it worked, so this is the one connection attempt
         that is not retried.
+
+        A runtime that is already connected to that coordinator stays as it is:
+        the link it has is kept, the ticket handed over goes unused, and only
+        the secrets are taken. Being introduced is the first step of a deploy
+        that may yet fail, and must not change what is running. One connected
+        to a *different* coordinator is refused — a board's runtime here
+        belongs to one coordinator at a time, and the other is named.
         """
         # Validated before anything is replaced: a malformed address must not
         # cost a runtime the link it already has.
-        join_url_for(record.coordinator_url)
+        join_url = join_url_for(record.coordinator_url)
 
         key = _link_key(record.owner, record.board_name, record.runtime_id)
+        existing = self._links.get(key)
+        if existing is not None and existing.connected:
+            if join_url_for(existing.record.coordinator_url) != join_url:
+                raise ConnectionError(
+                    f'"{record.board_name}" is already deployed here by '
+                    f"{existing.record.coordinator_url}"
+                )
+            existing.secrets = dict(secrets or {})
+            return
         previous = self._links.pop(key, None)
         if previous is not None:
             await previous.dispose()

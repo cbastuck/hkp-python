@@ -565,6 +565,48 @@ async def test_reconnects_after_a_restart_with_the_ticket_it_kept(servers, coord
     assert coordinator.hellos[1]["runtimeExists"] is False
 
 
+async def test_keeps_the_connection_it_has_when_introduced_again(servers, coordinator):
+    # Being introduced is the first step of a deploy that may yet fail.
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+
+    # Not even a ticket the coordinator would refuse costs it the link.
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_never-presented")
+    )
+
+    assert len(coordinator.hellos) == 1
+    links = server.coordinator_links.list(OWNER)
+    assert [link["connected"] for link in links] == [True]
+
+
+async def test_refuses_to_be_another_coordinators_naming_the_first(
+    servers, coordinator
+):
+    other = FakeCoordinator()
+    await other.start()
+    try:
+        server, _ = await servers()
+        await server.coordinator_links.introduce(
+            LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+        )
+
+        with pytest.raises(ConnectionError) as refused:
+            await server.coordinator_links.introduce(
+                LinkRecord(OWNER, "doorbell", "py", other.url, "hkpt_good")
+            )
+
+        assert "already deployed here by" in str(refused.value)
+        assert coordinator.url in str(refused.value)
+        assert other.hellos == []
+        links = server.coordinator_links.list(OWNER)
+        assert [link["coordinatorUrl"] for link in links] == [coordinator.url]
+    finally:
+        await other.stop()
+
+
 async def test_a_runtime_id_two_boards_share_is_a_link_of_each(servers, coordinator):
     # Boards ship the same handful of ids. Being introduced for a second board
     # must not cost the first one its link.
