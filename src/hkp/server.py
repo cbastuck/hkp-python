@@ -598,8 +598,7 @@ class RuntimeServer:
 
         def on_result(result: Any) -> None:
             self._send_result(socket_key, result)
-            # A coordinator link carries JSON; bytes travel as a placeholder,
-            # as they do in a notification.
+            # The link sends a value holding bytes as a binary frame.
             links.emit(
                 owner,
                 runtime_id,

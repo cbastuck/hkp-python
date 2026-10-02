@@ -21,6 +21,8 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
+from hkp.binary_frame import decode_frame, encode_frame, from_binary, to_binary
+from hkp.data import BinaryData, FloatRingBuffer
 from hkp.coordinator_links import (
     CLOSE_TICKET_REVOKED,
     FileLinkStore,
@@ -42,6 +44,8 @@ class FakeCoordinator:
         self.tickets: set[str] = {"hkpt_good"}
         self.hellos: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
+        # Binary frames, decoded: (header, shape, payload).
+        self.binary: list[Any] = []
         self.connection: web.WebSocketResponse | None = None
         self._waiting: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._counter = 0
@@ -74,6 +78,9 @@ class FakeCoordinator:
         await ws.prepare(request)
         self.connection = ws
         async for message in ws:
+            if message.type == aiohttp.WSMsgType.BINARY:
+                self.binary.append(decode_frame(message.data))
+                continue
             if message.type != aiohttp.WSMsgType.TEXT:
                 continue
             data = json.loads(message.data)
@@ -102,6 +109,12 @@ class FakeCoordinator:
     async def send(self, message: dict[str, Any]) -> None:
         assert self.connection is not None
         await self.connection.send_json(message)
+
+    async def send_binary(
+        self, header: dict[str, Any], shape: dict[str, Any], payload: bytes
+    ) -> None:
+        assert self.connection is not None
+        await self.connection.send_bytes(encode_frame(header, shape, payload))
 
 
 async def eventually(check, what: str = "condition", timeout: float = 3.0) -> None:
@@ -389,6 +402,101 @@ async def test_is_built_with_the_assets_the_coordinator_sends(servers, coordinat
     result = next(e for e in coordinator.events if e["type"] == "result")
     assert result["data"]["meta"]["status"] == 200
     assert result["data"]["body"] == "sun"
+
+
+async def test_bytes_arrive_as_bytes_and_leave_as_bytes(servers, coordinator):
+    # As text they could only be described — a size, a type — and the runtime
+    # after this one would be handed a description.
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+    sent = bytes(range(256)) * 16
+
+    await coordinator.send_binary({"type": "processRuntime"}, {"kind": "bytes"}, sent)
+
+    await eventually(lambda: coordinator.binary, "the result")
+    header, shape, payload = coordinator.binary[0]
+    assert header == {"type": "result"}
+    assert shape == {"kind": "bytes"}
+    assert payload == sent
+    # Nothing was also said as text.
+    assert not any(event["type"] == "result" for event in coordinator.events)
+
+
+async def test_a_ring_buffer_keeps_its_samples_and_what_identifies_it(
+    servers, coordinator
+):
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+    buffer = FloatRingBuffer.from_floats([0.5, -1.0, 0.25], id=7, ts=1234)
+
+    await coordinator.send_binary(
+        {"type": "processRuntime"},
+        {"kind": "floatRingBuffer", "id": 7, "ts": 1234},
+        buffer.samples,
+    )
+
+    await eventually(lambda: coordinator.binary, "the result")
+    _, shape, payload = coordinator.binary[0]
+    assert shape == {"kind": "floatRingBuffer", "id": 7, "ts": 1234}
+    assert payload == buffer.samples
+
+
+def test_reads_a_frame_as_the_coordinator_writes_it():
+    # The fixture hkp-node's encoder produces; hkp-frontend's tests read the
+    # same bytes.
+    fixture = bytes.fromhex(
+        "000000777b2274797065223a2270726f6365737352756e74696d65222c2272756e74696d654964223a227569222c22726571756573744964223a22722d31222c2262696e617279223a7b226b696e64223a226d69786564222c226a736f6e223a7b226d657461223a7b226e616d65223a22612e62696e227d7d7d7d0001feff"
+    )
+
+    header, shape, payload = decode_frame(fixture)
+
+    assert header == {"type": "processRuntime", "runtimeId": "ui", "requestId": "r-1"}
+    assert from_binary(shape, payload) == {
+        "meta": {"name": "a.bin"},
+        "binary": b"\x00\x01\xfe\xff",
+    }
+
+
+def test_what_travels_as_bytes_and_what_as_text():
+    assert to_binary(b"\x01\x02") == ({"kind": "bytes"}, b"\x01\x02")
+    assert to_binary(BinaryData(b"\x03")) == ({"kind": "bytes"}, b"\x03")
+    assert to_binary({"meta": {"status": 200}, "binary": b"\x04"}) == (
+        {"kind": "mixed", "json": {"meta": {"status": 200}}},
+        b"\x04",
+    )
+    assert to_binary({"a": 1}) is None
+    assert to_binary("text") is None
+    assert to_binary(None) is None
+
+
+def test_a_payload_becomes_the_value_a_service_expects():
+    assert from_binary({"kind": "bytes"}, b"\x01") == BinaryData(b"\x01")
+    assert from_binary({"kind": "mixed", "json": {"meta": {"n": 1}}}, b"\x02") == {
+        "meta": {"n": 1},
+        "binary": b"\x02",
+    }
+    buffer = from_binary({"kind": "floatRingBuffer", "id": 3, "ts": 9}, b"\x00" * 8)
+    assert isinstance(buffer, FloatRingBuffer)
+    assert (buffer.id, buffer.ts, buffer.num_samples) == (3, 9, 2)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"\x00\x00",
+        b"\x00\x00\x00\x32{",
+        b"\x00\x00\x00\x01x",
+        encode_frame({"type": "result"}, {"kind": "unknown"}, b""),
+    ],
+)
+def test_a_frame_that_is_not_one_is_not_read(raw: bytes):
+    assert decode_frame(raw) is None
 
 
 async def test_reconnects_on_its_own_and_says_its_runtime_is_still_there(

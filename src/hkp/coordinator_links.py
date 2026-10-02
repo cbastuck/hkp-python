@@ -29,6 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
+from .binary_frame import decode_frame, encode_frame, from_binary, to_binary
 from .secrets import SecretEntry
 
 #: Where a runtime server connects in; relative to the coordinator's base.
@@ -235,6 +236,10 @@ class _Link:
                 # A header rather than the URL, which is what ends up in logs.
                 headers={"Authorization": f"Bearer {self.record.ticket}"},
                 heartbeat=30,
+                # No ceiling of the library's own: exceeding one closes the
+                # link, and the board would lose its runtime over one large
+                # value.
+                max_msg_size=0,
             ) as ws:
                 self._ws = ws
                 await ws.send_str(
@@ -250,13 +255,22 @@ class _Link:
                     )
                 )
                 async for message in ws:
-                    if message.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    try:
-                        data = json.loads(message.data)
-                    except ValueError:
-                        continue
-                    if not isinstance(data, dict):
+                    if message.type == aiohttp.WSMsgType.BINARY:
+                        # Input for the pipeline that holds bytes; see
+                        # binary_frame.
+                        frame = decode_frame(message.data)
+                        if frame is None or frame[0].get("type") != "processRuntime":
+                            continue
+                        header, shape, payload = frame
+                        data = {**header, "params": from_binary(shape, payload)}
+                    elif message.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            data = json.loads(message.data)
+                        except ValueError:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                    else:
                         continue
                     # Each in its own task: a pipeline that runs for a while
                     # must not stop the connection from being read.
@@ -302,11 +316,22 @@ class _Link:
                 pass
 
     async def _send(self, ws: aiohttp.ClientWebSocketResponse, message: Any) -> None:
-        if not ws.closed:
-            try:
+        if ws.closed:
+            return
+        # A result holding bytes goes as a binary frame; as text it could only
+        # be described, not carried.
+        binary = (
+            to_binary(message.get("data"))
+            if isinstance(message, dict) and message.get("type") == "result"
+            else None
+        )
+        try:
+            if binary is not None:
+                await ws.send_bytes(encode_frame({"type": "result"}, *binary))
+            else:
                 await ws.send_str(self._dumps(message))
-            except (ConnectionError, aiohttp.ClientError):
-                pass
+        except (ConnectionError, aiohttp.ClientError):
+            pass
 
     async def emit(self, message: dict[str, Any]) -> None:
         """The runtime said something; only a welcomed link has anyone to tell."""
