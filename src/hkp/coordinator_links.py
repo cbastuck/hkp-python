@@ -112,36 +112,51 @@ class FileLinkStore:
 class LinkHost(Protocol):
     """What a link may do on this server — exactly the runtime it speaks for,
     as the tenant that introduced it. Supplied by the server, which owns
-    runtimes."""
+    runtimes.
+
+    The runtime is the board's: it shares its id with nothing a client created
+    here, nor with another board's runtime of the same id. Each operation names
+    it by tenant, board and id.
+    """
 
     kind: str
 
     def link_registry(self) -> list[Any]: ...
 
-    def link_runtime_exists(self, owner: str, runtime_id: str) -> bool: ...
+    def link_runtime_exists(
+        self, owner: str, board_name: str, runtime_id: str
+    ) -> bool: ...
 
     def link_provision(
         self,
         owner: str,
+        board_name: str,
         runtime_id: str,
         payload: dict[str, Any],
         secrets: dict[str, SecretEntry],
     ) -> dict[str, Any]: ...
 
-    def link_describe(self, owner: str, runtime_id: str) -> dict[str, Any] | None: ...
+    def link_describe(
+        self, owner: str, board_name: str, runtime_id: str
+    ) -> dict[str, Any] | None: ...
 
     async def link_configure_service(
-        self, owner: str, runtime_id: str, service_uuid: str, config: Any
+        self,
+        owner: str,
+        board_name: str,
+        runtime_id: str,
+        service_uuid: str,
+        config: Any,
     ) -> Any: ...
 
     def link_set_state(
-        self, owner: str, runtime_id: str, state: dict[str, Any]
+        self, owner: str, board_name: str, runtime_id: str, state: dict[str, Any]
     ) -> Any: ...
 
-    def link_remove(self, owner: str, runtime_id: str) -> None: ...
+    def link_remove(self, owner: str, board_name: str, runtime_id: str) -> None: ...
 
     async def link_process(
-        self, owner: str, runtime_id: str, params: Any, context: Any
+        self, owner: str, board_name: str, runtime_id: str, params: Any, context: Any
     ) -> Any: ...
 
 
@@ -156,10 +171,10 @@ def join_url_for(coordinator_url: str) -> str:
     )
 
 
-# Runtime ids are unique per tenant, and a runtime belongs to one board at a
-# time, so this is also what a link is keyed by. NUL occurs in neither part.
-def _link_key(owner: str, runtime_id: str) -> str:
-    return f"{owner}\x00{runtime_id}"
+# A runtime id is unique within a board, and a board's name within a tenant.
+# NUL occurs in none of the parts.
+def _link_key(owner: str, board_name: str, runtime_id: str) -> str:
+    return f"{owner}\x00{board_name}\x00{runtime_id}"
 
 
 class _Link:
@@ -187,6 +202,11 @@ class _Link:
         self._task: asyncio.Task[None] | None = None
         self._pending: set[asyncio.Task[Any]] = set()
         self._first: asyncio.Future[str | None] | None = None
+
+    @property
+    def _runtime(self) -> tuple[str, str, str]:
+        """The runtime this link speaks for, as a host's operations name it."""
+        return (self.record.owner, self.record.board_name, self.record.runtime_id)
 
     @property
     def connected(self) -> bool:
@@ -249,7 +269,7 @@ class _Link:
                             "server": self._host.kind,
                             "registry": self._host.link_registry(),
                             "runtimeExists": self._host.link_runtime_exists(
-                                self.record.owner, self.record.runtime_id
+                                *self._runtime
                             ),
                         }
                     )
@@ -342,7 +362,7 @@ class _Link:
     async def _on_message(
         self, ws: aiohttp.ClientWebSocketResponse, message: dict[str, Any]
     ) -> None:
-        owner, runtime_id = self.record.owner, self.record.runtime_id
+        runtime = self._runtime
         kind = message.get("type")
 
         if kind == "welcome":
@@ -356,7 +376,7 @@ class _Link:
                 return
             try:
                 result = await self._host.link_process(
-                    owner, runtime_id, message["params"], message.get("context")
+                    *runtime, message["params"], message.get("context")
                 )
             except Exception as err:  # noqa: BLE001 - reported, never raised
                 print(
@@ -391,33 +411,32 @@ class _Link:
                 )
 
     async def _serve(self, request: dict[str, Any]) -> Any:
-        owner, runtime_id = self.record.owner, self.record.runtime_id
+        runtime = self._runtime
         op = request.get("op")
         if op == "provision":
             return self._host.link_provision(
-                owner,
-                runtime_id,
+                *runtime,
                 # The board this link was introduced for, whatever the request
                 # says: a ticket speaks for one board.
                 {**request, "boardName": self.record.board_name},
                 self.secrets,
             )
         if op == "describe":
-            described = self._host.link_describe(owner, runtime_id)
+            described = self._host.link_describe(*runtime)
             if described is None:
                 raise RuntimeError("the runtime is not running")
             return described
         if op == "configureService":
             return await self._host.link_configure_service(
-                owner, runtime_id, str(request.get("serviceUuid")), request.get("config")
+                *runtime, str(request.get("serviceUuid")), request.get("config")
             )
         if op == "setState":
             state = request.get("state")
             return self._host.link_set_state(
-                owner, runtime_id, state if isinstance(state, dict) else {}
+                *runtime, state if isinstance(state, dict) else {}
             )
         if op == "remove":
-            self._host.link_remove(owner, runtime_id)
+            self._host.link_remove(*runtime)
             return {}
         raise RuntimeError(f'Unknown operation "{op}"')
 
@@ -460,7 +479,7 @@ class CoordinatorLinks:
         # cost a runtime the link it already has.
         join_url_for(record.coordinator_url)
 
-        key = _link_key(record.owner, record.runtime_id)
+        key = _link_key(record.owner, record.board_name, record.runtime_id)
         previous = self._links.pop(key, None)
         if previous is not None:
             await previous.dispose()
@@ -487,7 +506,7 @@ class CoordinatorLinks:
     def restore(self) -> None:
         """Reconnects with the tickets kept from before this process started."""
         for record in self._store.load():
-            key = _link_key(record.owner, record.runtime_id)
+            key = _link_key(record.owner, record.board_name, record.runtime_id)
             if key in self._links:
                 continue
             link = self._create_link(record)
@@ -495,35 +514,45 @@ class CoordinatorLinks:
             link.start()
 
     def list(self, owner: str) -> list[dict[str, Any]]:
-        """A tenant's links, without their tickets."""
+        """A tenant's links, without their tickets.
+
+        ``running`` is whether the runtime the link is for has been built: a
+        board's runtimes are not among those a client lists, so this is where
+        they are seen.
+        """
         return [
             {
                 "boardName": link.record.board_name,
                 "runtimeId": link.record.runtime_id,
                 "coordinatorUrl": link.record.coordinator_url,
                 "connected": link.connected,
+                "running": self._host.link_runtime_exists(
+                    link.record.owner, link.record.board_name, link.record.runtime_id
+                ),
             }
             for link in self._links.values()
             if link.record.owner == owner
         ]
 
-    async def remove(self, owner: str, runtime_id: str) -> bool:
+    async def remove(self, owner: str, board_name: str, runtime_id: str) -> bool:
         """Leaves a board: drops the link and the runtime it was for."""
-        link = self._links.pop(_link_key(owner, runtime_id), None)
+        link = self._links.pop(_link_key(owner, board_name, runtime_id), None)
         if link is None:
             return False
         await link.dispose()
-        self._host.link_remove(owner, runtime_id)
+        self._host.link_remove(owner, board_name, runtime_id)
         self._persist()
         return True
 
-    def emit(self, owner: str, runtime_id: str, message: dict[str, Any]) -> None:
+    def emit(
+        self, owner: str, board_name: str, runtime_id: str, message: dict[str, Any]
+    ) -> None:
         """Carries a runtime's output to its coordinator, when it has one.
 
         Safe from a worker thread: a pipeline runs off the event loop, and what
         it says is handed back to it.
         """
-        link = self._links.get(_link_key(owner, runtime_id))
+        link = self._links.get(_link_key(owner, board_name, runtime_id))
         if link is not None and link.connected:
             self._spawn(link.emit(message))
 
@@ -539,11 +568,11 @@ class CoordinatorLinks:
             # The coordinator no longer holds this ticket, so the runtime it was
             # for is nobody's: it was built to outlive its clients, and the only
             # party that would have released it has just said it is not theirs.
-            key = _link_key(record.owner, record.runtime_id)
+            key = _link_key(record.owner, record.board_name, record.runtime_id)
             if self._links.get(key) is not rejected:
                 return
             del self._links[key]
-            self._host.link_remove(record.owner, record.runtime_id)
+            self._host.link_remove(record.owner, record.board_name, record.runtime_id)
             self._persist()
 
         return _Link(record, self._host, self._options, on_rejected, self._dumps)

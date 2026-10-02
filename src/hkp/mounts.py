@@ -44,6 +44,7 @@ class MountHandle:
 @dataclass
 class _MountRecord:
     owner: str
+    space: str
     runtime_id: str
     service_uuid: str
     handler: MountHandler
@@ -127,6 +128,8 @@ class MountRegistry:
         # which is stable in a board file too.
         board_name: str = "",
         mount_name: str | None = None,
+        # The space the runtime lives in; see ``runtime.board_space``.
+        space: str | None = None,
     ) -> MountHandle | None:
         mount_id = self._derive_id(
             owner, board_name, runtime_id, mount_name or service_uuid
@@ -136,31 +139,39 @@ class MountRegistry:
         if not url:
             return None
 
-        self._mounts[mount_id] = _MountRecord(
+        record = _MountRecord(
             owner=owner,
+            space=owner if space is None else space,
             runtime_id=runtime_id,
             service_uuid=service_uuid,
             handler=handler,
         )
+        self._mounts[mount_id] = record
 
         def release() -> None:
-            self._mounts.pop(mount_id, None)
+            # This claim and no other: the address is derived, so a later claim
+            # to it takes it over, and releasing the earlier one then removes
+            # nothing.
+            if self._mounts.get(mount_id) is record:
+                del self._mounts[mount_id]
 
         return MountHandle(url=url, path=mount_path, release=release)
 
-    def release_runtime(self, owner: str, runtime_id: str) -> None:
+    def release_runtime(self, space: str, runtime_id: str) -> None:
         """Drop every mount belonging to a runtime.
 
         Services release their own mounts on destroy; this is the backstop so a
         torn-down runtime can never leave a publicly reachable endpoint behind.
         """
         for mount_id, record in list(self._mounts.items()):
-            if record.owner == owner and record.runtime_id == runtime_id:
+            if record.space == space and record.runtime_id == runtime_id:
                 del self._mounts[mount_id]
 
     def release_owner(self, owner: str) -> None:
+        """Drops the mounts of what a tenant's clients created; a deployed
+        board's go with its runtimes."""
         for mount_id, record in list(self._mounts.items()):
-            if record.owner == owner:
+            if record.space == owner:
                 del self._mounts[mount_id]
 
     def count_for_owner(self, owner: str) -> int:

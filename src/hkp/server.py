@@ -31,6 +31,7 @@ from .coordinator_links import (
     MemoryLinkStore,
 )
 from .runtime import (
+    board_space,
     context_from_wire,
     HostedRuntime,
     HostedServiceFactory,
@@ -248,7 +249,7 @@ class RuntimeServer:
         )
         self.runtime_app = RuntimeApp(
             factories,
-            mounts_for=lambda owner, runtime_id: RuntimeMounts(
+            mounts_for=lambda owner, runtime_id, space: RuntimeMounts(
                 mount=lambda service_uuid, handler, board_name="", mount_name=None: (
                     self._mounts.register(
                         owner,
@@ -257,6 +258,7 @@ class RuntimeServer:
                         handler,
                         board_name=board_name,
                         mount_name=mount_name,
+                        space=space,
                     )
                 )
             ),
@@ -310,7 +312,8 @@ class RuntimeServer:
 
     async def stop(self) -> None:
         await self.coordinator_links.stop()
-        for sockets in self._runtime_sockets.values():
+        # A copy: a socket's handler drops its entry while its close is awaited.
+        for sockets in list(self._runtime_sockets.values()):
             for ws in list(sockets):
                 await ws.close()
         self._runtime_sockets.clear()
@@ -404,7 +407,8 @@ class RuntimeServer:
         app.router.add_post("/coordinator-links", self._post_coordinator_link)
         app.router.add_get("/coordinator-links", self._get_coordinator_links)
         app.router.add_delete(
-            "/coordinator-links/{runtime_id}", self._delete_coordinator_link
+            "/coordinator-links/{board_name}/{runtime_id}",
+            self._delete_coordinator_link,
         )
 
         app.router.add_get("/runtimes", self._get_runtimes)
@@ -577,63 +581,84 @@ class RuntimeServer:
             if not ws.closed:
                 self._spawn(ws.send_str(message))
 
-    def _register_runtime_targets(self, owner: str, runtime: HostedRuntime) -> None:
+    def _register_runtime_targets(
+        self, owner: str, runtime: HostedRuntime, board_name: str | None
+    ) -> None:
         """Wires what a runtime says to whoever is listening: the sockets
-        watching it, and the coordinator it belongs to when it has one."""
-        socket_key = _tenant_key(owner, runtime.id)
+        watching it, or the coordinator it was built for."""
         runtime_id = runtime.id
-        links = self.coordinator_links
 
-        def on_notification(notification: RuntimeNotification) -> None:
-            self._send_notification(socket_key, notification)
-            links.emit(
-                owner,
-                runtime_id,
-                {
-                    "type": "notification",
-                    "serviceUuid": notification.instance_id,
-                    "payload": notification.payload,
-                },
-            )
+        if board_name is not None:
+            links = self.coordinator_links
+            linked = (owner, board_name, runtime_id)
 
-        def on_result(result: Any) -> None:
-            self._send_result(socket_key, result)
-            # The link sends a value holding bytes as a binary frame.
-            links.emit(
-                owner,
-                runtime_id,
-                {"type": "result", "data": _jsonable_result(result)},
-            )
+            def to_coordinator_notification(notification: RuntimeNotification) -> None:
+                links.emit(
+                    *linked,
+                    {
+                        "type": "notification",
+                        "serviceUuid": notification.instance_id,
+                        "payload": notification.payload,
+                    },
+                )
 
-        def on_log(entry: LogEntry) -> None:
-            self._send_log(socket_key, entry)
-            links.emit(owner, runtime_id, {"type": "log", "entry": entry.to_wire()})
+            def to_coordinator_result(result: Any) -> None:
+                # The link sends a value holding bytes as a binary frame.
+                links.emit(
+                    *linked, {"type": "result", "data": _jsonable_result(result)}
+                )
 
-        runtime.register_notification_target(on_notification)
-        runtime.register_result_target(on_result)
-        runtime.register_log_target(on_log)
+            def to_coordinator_log(entry: LogEntry) -> None:
+                links.emit(*linked, {"type": "log", "entry": entry.to_wire()})
+
+            runtime.register_notification_target(to_coordinator_notification)
+            runtime.register_result_target(to_coordinator_result)
+            runtime.register_log_target(to_coordinator_log)
+            return
+
+        socket_key = _tenant_key(owner, runtime_id)
+        runtime.register_notification_target(
+            lambda notification: self._send_notification(socket_key, notification)
+        )
+        runtime.register_result_target(
+            lambda result: self._send_result(socket_key, result)
+        )
+        runtime.register_log_target(lambda entry: self._send_log(socket_key, entry))
 
     def _provision_runtime(
-        self, owner: str, config: RuntimeConfiguration
+        self,
+        owner: str,
+        config: RuntimeConfiguration,
+        board_name: str | None = None,
     ) -> HostedRuntime:
         """Builds a runtime for a tenant, replacing anything under that id.
+
+        A runtime a client asked for lives in the tenant's own space and speaks
+        to the sockets watching it. One built for a coordinator (``board_name``
+        given) lives in its board's space and speaks to that coordinator; see
+        ``board_space``.
 
         Quotas apply only to genuinely new runtimes — re-creating one that
         already exists must not be refused for being over the limit.
         """
-        tenant = self.runtime_app.for_owner(owner)
-        is_new = tenant.get_runtime(config.id) is None
+        space = owner if board_name is None else board_space(owner, board_name)
+        is_new = self.runtime_app.get_runtime(space, config.id) is None
         if is_new and self._at_quota(
-            len(tenant.get_runtimes()), self._max_runtimes_per_user
+            self.runtime_app.count_runtimes(owner), self._max_runtimes_per_user
         ):
             raise _QuotaError(f"Runtime limit reached ({self._max_runtimes_per_user})")
         if self._exceeds_quota(len(config.services), self._max_services_per_runtime):
             raise _QuotaError(
                 f"Service limit reached ({self._max_services_per_runtime})"
             )
-        runtime = tenant.create_runtime(config)
-        self._register_runtime_targets(owner, runtime)
+        runtime = self.runtime_app.create_runtime(owner, config, space)
+        self._register_runtime_targets(owner, runtime, board_name)
         return runtime
+
+    def _linked_runtime(
+        self, owner: str, board_name: str, runtime_id: str
+    ) -> HostedRuntime | None:
+        return self.runtime_app.get_runtime(board_space(owner, board_name), runtime_id)
 
     def _remove_runtime(self, owner: str, runtime_id: str) -> None:
         self.runtime_app.remove_runtime(owner, runtime_id)
@@ -667,12 +692,13 @@ class RuntimeServer:
     def link_registry(self) -> list[Any]:
         return self.runtime_app.get_registry()
 
-    def link_runtime_exists(self, owner: str, runtime_id: str) -> bool:
-        return self.runtime_app.get_runtime(owner, runtime_id) is not None
+    def link_runtime_exists(self, owner: str, board_name: str, runtime_id: str) -> bool:
+        return self._linked_runtime(owner, board_name, runtime_id) is not None
 
     def link_provision(
         self,
         owner: str,
+        board_name: str,
         runtime_id: str,
         payload: dict[str, Any],
         secrets: dict[str, SecretEntry],
@@ -681,7 +707,7 @@ class RuntimeServer:
             {
                 "id": runtime_id,
                 "name": payload.get("name"),
-                "boardName": payload.get("boardName") or "",
+                "boardName": board_name,
                 # The coordinator's until it says otherwise: a deployed board
                 # keeps running with nobody watching.
                 "garbageCollected": False,
@@ -697,7 +723,7 @@ class RuntimeServer:
         # The values this server was handed for the runtime, by the person's own
         # client. They do not come from the coordinator and never go to it.
         config.secrets = dict(secrets)
-        runtime = self._provision_runtime(owner, config)
+        runtime = self._provision_runtime(owner, config, board_name)
         held = set(runtime.secrets().aliases())
         missing = [
             alias
@@ -714,8 +740,8 @@ class RuntimeServer:
             "missingSecrets": missing,
         }
 
-    def link_describe(self, owner: str, runtime_id: str) -> dict[str, Any] | None:
-        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+    def link_describe(self, owner: str, board_name: str, runtime_id: str) -> dict[str, Any] | None:
+        runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             return None
         return {
@@ -725,9 +751,9 @@ class RuntimeServer:
         }
 
     async def link_configure_service(
-        self, owner: str, runtime_id: str, service_uuid: str, config: Any
+        self, owner: str, board_name: str, runtime_id: str, service_uuid: str, config: Any
     ) -> Any:
-        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+        runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             raise RuntimeError("the runtime is not running")
         if not isinstance(config, dict):
@@ -737,20 +763,22 @@ class RuntimeServer:
         return await _wait_for_service_activation_state(runtime, service_uuid)
 
     def link_set_state(
-        self, owner: str, runtime_id: str, state: dict[str, Any]
+        self, owner: str, board_name: str, runtime_id: str, state: dict[str, Any]
     ) -> Any:
-        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+        runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             raise RuntimeError("the runtime is not running")
         return self._apply_runtime_state(runtime, state)
 
-    def link_remove(self, owner: str, runtime_id: str) -> None:
-        self._remove_runtime(owner, runtime_id)
+    def link_remove(self, owner: str, board_name: str, runtime_id: str) -> None:
+        space = board_space(owner, board_name)
+        self.runtime_app.remove_runtime(space, runtime_id)
+        self._mounts.release_runtime(space, runtime_id)
 
     async def link_process(
-        self, owner: str, runtime_id: str, params: Any, context: Any
+        self, owner: str, board_name: str, runtime_id: str, params: Any, context: Any
     ) -> Any:
-        runtime = self.runtime_app.get_runtime(owner, runtime_id)
+        runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             raise RuntimeError("the runtime is not running")
         # The coordinator names the run its call belongs to, so that a board
@@ -815,7 +843,9 @@ class RuntimeServer:
     async def _delete_coordinator_link(self, request: web.Request) -> web.Response:
         """Leaves a board: drops the link and the runtime it was for."""
         removed = await self.coordinator_links.remove(
-            self._owner_of(request), request.match_info["runtime_id"]
+            self._owner_of(request),
+            request.match_info["board_name"],
+            request.match_info["runtime_id"],
         )
         return web.Response(status=200 if removed else 404)
 

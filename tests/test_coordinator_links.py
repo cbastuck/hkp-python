@@ -30,6 +30,7 @@ from hkp.coordinator_links import (
     MemoryLinkStore,
     join_url_for,
 )
+from hkp.runtime import board_space
 from hkp.server import create_runtime_server
 from hkp.services.monitor import MONITOR_DESCRIPTOR
 
@@ -231,6 +232,8 @@ async def test_connects_with_the_ticket_and_reports_the_link_never_the_ticket(
             "runtimeId": "py",
             "coordinatorUrl": coordinator.url,
             "connected": True,
+            # Introduced, and not yet built by the coordinator.
+            "running": False,
         }
     ]
     assert "hkpt_good" not in text
@@ -290,7 +293,7 @@ async def test_the_coordinator_builds_configures_and_releases_the_runtime(
     assert built["ok"] is True
     assert [svc["uuid"] for svc in built["data"]["services"]] == ["mon-1"]
     assert built["data"]["missingSecrets"] == []
-    runtime = server.runtime_app.get_runtime(OWNER, "py")
+    runtime = server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py")
     # The coordinator's, until the coordinator says otherwise.
     assert runtime.garbage_collected is False
 
@@ -305,7 +308,7 @@ async def test_the_coordinator_builds_configures_and_releases_the_runtime(
 
     removed = await coordinator.request("remove")
     assert removed["ok"] is True
-    assert server.runtime_app.get_runtime(OWNER, "py") is None
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py") is None
 
 
 async def test_builds_for_the_board_it_was_introduced_for_whatever_it_is_told(
@@ -322,7 +325,9 @@ async def test_builds_for_the_board_it_was_introduced_for_whatever_it_is_told(
         "provision", **{**PROVISION, "boardName": "someone-elses-board"}
     )
 
-    assert server.runtime_app.get_runtime(OWNER, "py").board_name == "doorbell"
+    built = server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py")
+    assert built.board_name == "doorbell"
+    assert server.runtime_app.get_board_runtimes(OWNER) == [built]
 
 
 async def test_answers_what_it_cannot_do_with_an_error_rather_than_silence(
@@ -512,7 +517,7 @@ async def test_reconnects_on_its_own_and_says_its_runtime_is_still_there(
 
     await eventually(lambda: len(coordinator.hellos) == 2, "the reconnect")
     assert coordinator.hellos[1]["runtimeExists"] is True
-    assert server.runtime_app.get_runtime(OWNER, "py") is not None
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py") is not None
 
 
 async def test_drops_the_link_and_the_runtime_when_its_ticket_is_revoked(
@@ -530,7 +535,7 @@ async def test_drops_the_link_and_the_runtime_when_its_ticket_is_revoked(
 
     await eventually(lambda: store.load() == [], "the ticket to be forgotten")
     assert server.coordinator_links.list(OWNER) == []
-    assert server.runtime_app.get_runtime(OWNER, "py") is None
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py") is None
 
 
 async def test_forgets_a_ticket_the_coordinator_no_longer_holds(servers, coordinator):
@@ -560,6 +565,50 @@ async def test_reconnects_after_a_restart_with_the_ticket_it_kept(servers, coord
     assert coordinator.hellos[1]["runtimeExists"] is False
 
 
+async def test_a_runtime_id_two_boards_share_is_a_link_of_each(servers, coordinator):
+    # Boards ship the same handful of ids. Being introduced for a second board
+    # must not cost the first one its link.
+    server, _ = await servers()
+    for board in ("doorbell", "garden"):
+        await server.coordinator_links.introduce(
+            LinkRecord(OWNER, board, "py", coordinator.url, "hkpt_good")
+        )
+
+    links = server.coordinator_links.list(OWNER)
+    assert sorted(link["boardName"] for link in links) == ["doorbell", "garden"]
+    assert all(link["connected"] for link in links)
+
+
+async def test_a_boards_runtime_is_not_the_one_a_client_creates_under_its_id(
+    servers, coordinator
+):
+    # What opening the same board in the playground does: it posts a runtime
+    # under the id the deployed board uses, and deletes it when it leaves.
+    server, base_url = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+    deployed = server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py")
+
+    async with aiohttp.ClientSession() as session:
+        created = {"id": "py", "name": "Python", "boardName": "doorbell", "services": []}
+        async with session.post(f"{base_url}/runtimes", json=created) as res:
+            assert res.status == 200
+        async with session.get(f"{base_url}/runtimes") as res:
+            listed = (await res.json())["runtimes"]
+        async with session.delete(f"{base_url}/runtimes/py") as res:
+            assert res.status == 200
+        async with session.delete(f"{base_url}/runtimes") as res:
+            assert res.status == 200
+
+    # The client saw its own runtime and never the board's.
+    assert [runtime["services"] for runtime in listed] == [[]]
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py") is deployed
+    described = await coordinator.request("describe")
+    assert [svc["uuid"] for svc in described["data"]["services"]] == ["mon-1"]
+
+
 async def test_leaves_a_board_when_asked_dropping_the_runtime(servers, coordinator):
     server, base_url = await servers()
     await server.coordinator_links.introduce(
@@ -568,12 +617,12 @@ async def test_leaves_a_board_when_asked_dropping_the_runtime(servers, coordinat
     await coordinator.request("provision", **PROVISION)
 
     async with aiohttp.ClientSession() as session:
-        async with session.delete(f"{base_url}/coordinator-links/py") as res:
+        async with session.delete(f"{base_url}/coordinator-links/doorbell/py") as res:
             assert res.status == 200
-        async with session.delete(f"{base_url}/coordinator-links/py") as res:
+        async with session.delete(f"{base_url}/coordinator-links/doorbell/py") as res:
             assert res.status == 404
 
-    assert server.runtime_app.get_runtime(OWNER, "py") is None
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py") is None
     assert server.coordinator_links.list(OWNER) == []
 
 
@@ -606,7 +655,7 @@ async def test_credentials_come_from_the_client_and_missing_ones_are_named(
     built = await coordinator.request("provision", **with_secrets)
 
     assert built["data"]["missingSecrets"] == ["not.sent"]
-    assert server.runtime_app.get_runtime(OWNER, "py").secrets().aliases() == [
+    assert server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py").secrets().aliases() == [
         "api.key"
     ]
     # Never to the coordinator: not in what it was told, not in what it asks.
