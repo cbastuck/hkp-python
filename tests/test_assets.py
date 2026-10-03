@@ -18,9 +18,14 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
-from hkp.assets import AssetStore, parse_asset_ref, read_assets_payload, referenced_assets
+from hkp.assets import (
+    AssetStore,
+    decode_base64,
+    parse_asset_ref,
+    read_assets_payload,
+    referenced_assets,
+)
 from hkp.runtime import HostedRuntime
-from hkp.secrets import SecretVault, read_secrets_payload
 from hkp.server import create_runtime_server
 from hkp.services.asset import AssetService
 from hkp.services.http_server import HTTP_SERVER_SUBSERVICES_DESCRIPTOR
@@ -60,6 +65,24 @@ class TestReferences:
 
 
 class TestStore:
+    def test_the_payload_keeps_which_runtimes_an_asset_is_for_and_no_headers(self) -> None:
+        entries = read_assets_payload(
+            {
+                "model": {
+                    "mediaType": "application/octet-stream",
+                    "url": "https://example.com/m.bin",
+                    "runtimes": ["node", 7],
+                    "headers": {"Authorization": "Bearer {{secret.token}}"},
+                }
+            }
+        )
+        assert entries["model"] == {
+            "id": "model",
+            "mediaType": "application/octet-stream",
+            "url": "https://example.com/m.bin",
+            "runtimes": ["node"],
+        }
+
     def test_resolves_inline_text_and_base64(self) -> None:
         store = AssetStore()
         store.replace(
@@ -72,6 +95,21 @@ class TestStore:
         assert page.problem == ""
         assert page.asset.content == b"<p>hi</p>"
         assert store.resolve("hkp-asset://logo").asset.content == b"\x01\x02"
+
+    def test_refuses_base64_that_is_not_rather_than_decoding_what_it_recognises(self) -> None:
+        store = AssetStore()
+        store.replace({"logo": {"id": "logo", "mediaType": "image/png", "base64": "not base64!"}})
+        assert store.resolve("hkp-asset://logo").problem == 'asset "logo": its content is not base64'
+
+    def test_reads_base64_as_a_browser_does(self) -> None:
+        assert decode_base64("AQID") == b"\x01\x02\x03"
+        assert decode_base64("AQ ID\nBA==\n") == b"\x01\x02\x03\x04"
+        assert decode_base64("AQIDBA") == b"\x01\x02\x03\x04"
+        assert decode_base64("") == b""
+        # One character over a group of four stands for no byte at all.
+        assert decode_base64("AQIDB") is None
+        assert decode_base64("AQ=ID") is None
+        assert decode_base64("AQID-_") is None
 
     def test_says_why_an_asset_does_not_resolve(self) -> None:
         store = AssetStore()
@@ -148,18 +186,22 @@ class TestUrlSource:
         store.resolve("hkp-asset://r")
         assert len(remote["requests"]) == 1
 
-    def test_sends_a_header_secret_only_where_its_audience_allows(self, remote) -> None:
-        vault = SecretVault()
-        vault.replace(read_secrets_payload({"token": {"value": "s3cret", "audience": ["127.0.0.1"]}}))
-        store = AssetStore(lambda: vault)
+    def test_is_fetched_as_anyone_would_fetch_it(self, remote) -> None:
+        store = AssetStore()
         store.replace(
-            {"r": {"id": "r", "mediaType": "text/plain", "url": remote["url"], "headers": {"Authorization": "Bearer {{secret.token}}"}}}
+            read_assets_payload(
+                {
+                    "r": {
+                        "mediaType": "text/plain",
+                        "url": remote["url"],
+                        "headers": {"Authorization": "Bearer {{secret.token}}", "X-Api-Key": "literal"},
+                    }
+                }
+            )
         )
-        store.resolve("hkp-asset://r")
-        assert remote["requests"][0].get("Authorization") == "Bearer s3cret"
-
-        vault.replace(read_secrets_payload({"token": {"value": "s3cret", "audience": ["elsewhere.example"]}}))
-        assert "may not be sent" in store.resolve("hkp-asset://r").problem
+        assert store.resolve("hkp-asset://r").asset.content == b"remote v1"
+        sent = {name.lower() for name in remote["requests"][0]}
+        assert "authorization" not in sent and "x-api-key" not in sent
 
 
 class TestAssetService:

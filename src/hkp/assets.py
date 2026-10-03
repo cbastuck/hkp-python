@@ -6,20 +6,28 @@ names one by reference, ``hkp-asset://<id>``, as a whole field, and never holds
 the content itself. ``get_state`` therefore echoes the reference, and saving a
 board writes back what was configured: there is no round trip to undo.
 
-The descriptors arrive the way secrets do — with the runtime's create payload,
-or on ``POST /runtimes/<id>/assets`` — plus again whenever an asset is edited,
-which is the point: a service resolves its reference at the moment it uses it,
-so the next use gets the new content without anything being reconfigured.
+The descriptors arrive with the runtime's create payload, or on
+``POST /runtimes/<id>/assets`` — and again whenever an asset is edited, which is
+the point: a service resolves its reference at the moment it uses it, so the
+next use gets the new content without anything being reconfigured. A runtime is
+given every asset of its board that is not kept to other runtimes, named by its
+services or not: which one a service uses can be decided as it runs.
 
 Where the content comes from depends on the source:
 
 ``text``, ``base64``
     already in the descriptor
 ``http(s)://``
-    fetched by this runtime, cached by ``sha256`` or revalidated by ETag
+    fetched by this runtime as anyone would fetch it, cached by ``sha256`` or
+    revalidated by ETag
 
 Anything else — ``file://`` among them, since this runtime keeps no files a
 board may name — is refused by name rather than guessed at.
+
+An asset carries no request headers and names no secret. It is resolved without
+anyone looking, by every runtime holding it, which is no place for a
+credential; content that needs one is fetched by a service that says where it
+sends it.
 
 The format matches ``hkp-frontend/src/runtime/board/assets.ts`` and
 ``hkp-node/src/assets.ts``: a board written against one runtime has to open
@@ -41,7 +49,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from .secrets import SecretVault, resolve_credential
 
 ASSET_SCHEME = "hkp-asset://"
 
@@ -55,8 +62,8 @@ DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024
 DEFAULT_TIMEOUT_S = 30.0
 
 #: A descriptor as it travels: ``id``, ``mediaType``, exactly one of ``text``,
-#: ``base64`` or ``url`` (with optional ``headers``), and optional ``name``,
-#: ``sha256`` and ``size``.
+#: ``base64`` or ``url``, and optional ``name``, ``sha256``, ``size`` and
+#: ``runtimes`` — the runtimes it is for, which whoever provisions them reads.
 AssetDescriptor = dict[str, Any]
 
 
@@ -156,11 +163,11 @@ def read_asset_descriptor(value: Any, fallback_id: str | None = None) -> AssetDe
     size = value.get("size")
     if isinstance(size, (int, float)) and not isinstance(size, bool):
         descriptor["size"] = size
+    runtimes = value.get("runtimes")
+    if isinstance(runtimes, list):
+        descriptor["runtimes"] = [entry for entry in runtimes if isinstance(entry, str)]
     source = sources[0]
     descriptor[source] = value[source]
-    headers = value.get("headers")
-    if source == "url" and isinstance(headers, dict):
-        descriptor["headers"] = {k: v for k, v in headers.items() if isinstance(v, str)}
     return descriptor
 
 
@@ -204,12 +211,36 @@ class _CacheEntry:
     etag: str | None = None
 
 
+_BASE64_WHITESPACE = re.compile(r"[\t\n\f\r ]+")
+_BASE64_ALPHABET = re.compile(r"[A-Za-z0-9+/]*")
+
+
+def decode_base64(value: str) -> bytes | None:
+    """The bytes base64 text stands for, or ``None`` when it is not base64.
+
+    ``b64decode`` without ``validate`` skips what it does not recognise and
+    decodes the rest, so text that is not base64 would come out as some other
+    bytes. What is taken here is what a browser's ``atob`` takes — ASCII
+    whitespace ignored, the standard alphabet, padding optional — so that a
+    descriptor resolves to the same content, or the same refusal, on every
+    runtime.
+    """
+    text = _BASE64_WHITESPACE.sub("", value)
+    if len(text) % 4 == 0:
+        text = re.sub(r"={1,2}$", "", text)
+    if len(text) % 4 == 1 or not _BASE64_ALPHABET.fullmatch(text):
+        return None
+    try:
+        return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
 class AssetStore:
     """The descriptors one runtime was given, and the content they resolve to."""
 
     def __init__(
         self,
-        secrets: Callable[[], SecretVault | None] = lambda: None,
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
@@ -220,7 +251,6 @@ class AssetStore:
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._cached_bytes = 0
         self._listeners: dict[str, set[Callable[[str], None]]] = {}
-        self._secrets = secrets
         self._max_bytes = max_bytes
         self._max_cache_bytes = max_cache_bytes
         self._timeout_s = timeout_s
@@ -329,10 +359,10 @@ class AssetStore:
         if "text" in descriptor:
             return descriptor["text"].encode("utf-8"), None
         if "base64" in descriptor:
-            try:
-                return base64.b64decode(descriptor["base64"], validate=False), None
-            except (binascii.Error, ValueError) as error:
-                raise _Refused(f"base64 content does not decode: {error}") from error
+            content = decode_base64(descriptor["base64"])
+            if content is None:
+                raise _Refused("its content is not base64")
+            return content, None
 
         url = descriptor["url"]
         scheme = urlsplit(url).scheme.lower()
@@ -341,12 +371,7 @@ class AssetStore:
                 raise _Refused("file:// sources cannot be read by this runtime")
             raise _Refused(f"{scheme}:// sources are not supported by this runtime")
 
-        resolved = resolve_credential(self._secrets(), descriptor.get("headers") or {}, url)
-        if resolved.problem:
-            raise _Refused(resolved.problem)
-        headers = dict(resolved.value or {})
-        if cached and cached.etag:
-            headers["If-None-Match"] = cached.etag
+        headers = {"If-None-Match": cached.etag} if cached and cached.etag else {}
 
         request = urllib.request.Request(url, headers=headers)
         try:

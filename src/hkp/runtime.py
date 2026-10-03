@@ -151,7 +151,7 @@ class HostedRuntime:
         #: The descriptors of the assets this runtime's services reference, and
         #: the content they resolve to. Filled before any service is built, for
         #: the same reason the vault is. Reachable through assets().
-        self._asset_store = AssetStore(lambda: self.secrets())
+        self._asset_store = AssetStore()
         self._asset_store.replace(config.assets)
         #: Where this runtime's assets come from when they are not its own; see
         #: delegate_assets.
