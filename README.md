@@ -49,6 +49,7 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `HKP_MAX_RUNTIMES_PER_USER` | — | Maximum runtimes one tenant may hold. Unset or `0` means unlimited. Re-creating a runtime that already exists is never refused. |
 | `HKP_MAX_SERVICES_PER_RUNTIME` | — | Maximum services per runtime. Unset or `0` means unlimited. |
 | `HKP_MIN_TIMER_INTERVAL_MS` | — | Lower bound on the Timer service's periodic interval; shorter periods are clamped. Unset or `0` means no floor. |
+| `HKP_COORDINATOR_LINKS_FILE` | `~/.hkp/python/coordinator-links.json` | Where the tickets this server connects to coordinators with are kept, so a deployed board's runtimes are re-established after a restart. Empty keeps them in memory only. Written `0600`. |
 | `HKP_MOUNT_SECRET` | — | Keys the derivation of service endpoint addresses. Unset, a key is drawn once and kept at `~/.hkp/python/mount-secret`, so addresses survive a restart on this machine; set it to share one across instances. |
 | `HKP_MAX_REQUEST_BODY_BYTES` | `26214400` | Largest request body accepted on a service endpoint (25 MB). Oversized requests get `413`. Set `0` to disable — unwise, since these endpoints take no token. |
 
@@ -81,9 +82,18 @@ hkp-node coordinator) works against both runtimes:
   Authorization header or `?access_token=` (browsers can't set WS headers) and
   are Origin-checked against `ALLOWED_ORIGINS`.
 - `POST /runtimes/{id}/session-token` (JWT-gated) mints an opaque in-memory
-  token bound to the calling user and that runtime — used by the hkp-node
-  coordinator for long-lived machine calls past JWT expiry. Tokens are purged
-  when the runtime is removed.
+  token bound to the calling user and that runtime. Tokens are purged when the
+  runtime is removed. The coordinator no longer uses it — see below.
+- **A coordinator never dials this server.** When a board is deployed, the
+  person's client hands this server a *ticket* (`POST /coordinator-links`,
+  JWT-gated) and it connects to the coordinator itself, presenting the ticket
+  as a bearer token. The coordinator then builds, configures and drives that
+  one runtime over the connection that came in, acting as the user who
+  introduced it. The ticket is kept (`HKP_COORDINATOR_LINKS_FILE`) and
+  presented again after a restart or a dropped connection, with nobody present;
+  a ticket the coordinator no longer holds is dropped, together with the runtime
+  it was for. So this server joins a cloud board from behind NAT or from
+  loopback — only the coordinator has to be reachable.
 - Fail closed: without Auth0 config the server only starts on a loopback bind
   (`HOST=127.0.0.1`), or from a source checkout with `ALLOW_NO_AUTH=true` — and
   in both cases it runs **without authentication** (every request is anonymous).
@@ -175,7 +185,10 @@ The API mirrors hkp-node exactly.
 | `GET`    | `/runtimes/{id}`                                | Get a runtime                              |
 | `DELETE` | `/runtimes/{id}`                                | Remove a runtime                           |
 | `POST`   | `/runtimes/{id}`                                | Process input through the runtime pipeline |
-| `POST`   | `/runtimes/{id}/session-token`                  | Mint an opaque coordinator session token   |
+| `POST`   | `/runtimes/{id}/session-token`                  | Mint an opaque session token               |
+| `POST`   | `/coordinator-links`                            | Connect to a coordinator with a ticket, as one runtime of one board |
+| `GET`    | `/coordinator-links`                            | The caller's links (never a ticket)        |
+| `DELETE` | `/coordinator-links/{runtimeId}`                | Leave a board: drop the link and its runtime |
 | `POST`   | `/runtimes/{id}/rearrange`                      | Reorder services                           |
 | `GET`    | `/runtimes/{id}/services`                       | List services                              |
 | `POST`   | `/runtimes/{id}/services`                       | Add a service                              |

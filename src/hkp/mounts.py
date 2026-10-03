@@ -44,6 +44,7 @@ class MountHandle:
 @dataclass
 class _MountRecord:
     owner: str
+    space: str
     runtime_id: str
     service_uuid: str
     handler: MountHandler
@@ -94,7 +95,14 @@ class MountRegistry:
         #: process, which is the old behaviour: addresses that work but do not
         #: survive a restart. ``__main__`` persists one so they do.
         self._secret = secret or secrets.token_hex(32)
-        self._mounts: dict[str, _MountRecord] = {}
+        #: Every claim to an address, oldest first. An address is derived
+        #: from what the mount is called, so more than one runtime may claim
+        #: the same one: a runtime rebuilt under its id claims it before the
+        #: one it replaces lets go, and a board open in a client and also
+        #: deployed holds two copies of each of its mounts. One claim answers
+        #: — see ``_answering`` — and the others are kept, so that releasing
+        #: one leaves the address with whoever still claims it.
+        self._mounts: dict[str, list[_MountRecord]] = {}
 
     def _derive_id(
         self,
@@ -127,6 +135,8 @@ class MountRegistry:
         # which is stable in a board file too.
         board_name: str = "",
         mount_name: str | None = None,
+        # The space the runtime lives in; see ``runtime.board_space``.
+        space: str | None = None,
     ) -> MountHandle | None:
         mount_id = self._derive_id(
             owner, board_name, runtime_id, mount_name or service_uuid
@@ -136,40 +146,75 @@ class MountRegistry:
         if not url:
             return None
 
-        self._mounts[mount_id] = _MountRecord(
+        record = _MountRecord(
             owner=owner,
+            space=owner if space is None else space,
             runtime_id=runtime_id,
             service_uuid=service_uuid,
             handler=handler,
         )
+        self._mounts.setdefault(mount_id, []).append(record)
 
         def release() -> None:
-            self._mounts.pop(mount_id, None)
+            # This claim and no other.
+            self._drop(mount_id, lambda claim: claim is record)
 
         return MountHandle(url=url, path=mount_path, release=release)
 
-    def release_runtime(self, owner: str, runtime_id: str) -> None:
+    def _answering(self, mount_id: str) -> _MountRecord | None:
+        """The claim that answers at an address: a deployed board's before a
+        client's, and the newest of its kind.
+
+        A board somebody deployed is meant to be reachable whoever else has it
+        open, so opening it in a client neither takes its address nor, on
+        leaving, takes the address away.
+        """
+        claims = self._mounts.get(mount_id, [])
+        deployed = [claim for claim in claims if claim.space != claim.owner]
+        if deployed:
+            return deployed[-1]
+        return claims[-1] if claims else None
+
+    def _drop(self, mount_id: str, gone: Callable[[_MountRecord], bool]) -> None:
+        claims = self._mounts.get(mount_id)
+        if claims is None:
+            return
+        kept = [claim for claim in claims if not gone(claim)]
+        if kept:
+            self._mounts[mount_id] = kept
+        else:
+            del self._mounts[mount_id]
+
+    def release_runtime(self, space: str, runtime_id: str) -> None:
         """Drop every mount belonging to a runtime.
 
         Services release their own mounts on destroy; this is the backstop so a
         torn-down runtime can never leave a publicly reachable endpoint behind.
         """
-        for mount_id, record in list(self._mounts.items()):
-            if record.owner == owner and record.runtime_id == runtime_id:
-                del self._mounts[mount_id]
+        for mount_id in list(self._mounts):
+            self._drop(
+                mount_id,
+                lambda claim: claim.space == space and claim.runtime_id == runtime_id,
+            )
 
     def release_owner(self, owner: str) -> None:
-        for mount_id, record in list(self._mounts.items()):
-            if record.owner == owner:
-                del self._mounts[mount_id]
+        """Drops the mounts of what a tenant's clients created; a deployed
+        board's go with its runtimes."""
+        for mount_id in list(self._mounts):
+            self._drop(mount_id, lambda claim: claim.space == owner)
 
     def count_for_owner(self, owner: str) -> int:
-        return sum(1 for r in self._mounts.values() if r.owner == owner)
+        return sum(
+            1
+            for claims in self._mounts.values()
+            for claim in claims
+            if claim.owner == owner
+        )
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         """Serve a request addressed to a mount, or 404 when the id is unknown."""
         mount_id = request.match_info.get("mount_id", "")
-        record = self._mounts.get(mount_id)
+        record = self._answering(mount_id)
         if not record:
             raise web.HTTPNotFound()
 

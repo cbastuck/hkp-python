@@ -789,56 +789,92 @@ class TenantRuntimes:
         self._app.remove_all_runtimes(self.owner)
 
 
+def board_space(owner: str, board_name: str) -> str:
+    """The space the runtimes of one deployed board live in.
+
+    A runtime id is unique within a space, and there are two kinds. What a
+    tenant's clients create over the api shares one space, named by the tenant
+    alone. What a coordinator builds for a board gets a space per board, so two
+    boards that both call a runtime ``python`` each keep their own, and neither
+    is replaced by a client creating a runtime of that id.
+
+    NUL occurs in neither part, so a board's space is never a tenant's.
+    """
+    return f"{owner}\x00{board_name}"
+
+
 class RuntimeApp:
     def __init__(
         self,
         registry: dict[str, HostedServiceFactory],
         # Supplied by the server, which owns the listening socket. Absent in
         # tests and anywhere runtimes need no public endpoints.
-        mounts_for: Callable[[str, str], RuntimeMounts] | None = None,
+        mounts_for: Callable[[str, str, str], RuntimeMounts] | None = None,
     ) -> None:
         self._registry = registry
         self._mounts_for = mounts_for
-        # owner key -> runtime id -> runtime. The owner key is the authenticated
-        # ``sub`` (or "anonymous" when auth is off, collapsing to one bucket).
+        # space -> runtime id -> runtime. A tenant's own space is its owner
+        # key: the authenticated ``sub`` (or "anonymous" when auth is off,
+        # collapsing to one bucket). A deployed board's is ``board_space``.
         self._runtimes: dict[str, dict[str, HostedRuntime]] = {}
 
     def for_owner(self, owner: str) -> TenantRuntimes:
         """A tenant-scoped view; the only way route handlers reach runtimes."""
         return TenantRuntimes(owner, self)
 
-    def create_runtime(self, owner: str, config: RuntimeConfiguration) -> HostedRuntime:
-        owned = self._runtimes.setdefault(owner, {})
+    def create_runtime(
+        self, owner: str, config: RuntimeConfiguration, space: str | None = None
+    ) -> HostedRuntime:
+        """Builds a runtime for ``owner``, replacing anything under its id in
+        ``space``: the tenant's own unless a board's is named."""
+        space = owner if space is None else space
+        owned = self._runtimes.setdefault(space, {})
         existing = owned.get(config.id)
         if existing:
             existing.destroy()
         runtime = HostedRuntime(
             config,
             self.create_service,
-            self._mounts_for(owner, config.id) if self._mounts_for else None,
+            self._mounts_for(owner, config.id, space) if self._mounts_for else None,
         )
         owned[runtime.id] = runtime
         return runtime
 
-    def get_runtime(self, owner: str, runtime_id: str) -> HostedRuntime | None:
-        return self._runtimes.get(owner, {}).get(runtime_id)
+    def get_runtime(self, space: str, runtime_id: str) -> HostedRuntime | None:
+        return self._runtimes.get(space, {}).get(runtime_id)
 
-    def get_runtimes(self, owner: str) -> list[HostedRuntime]:
-        return list(self._runtimes.get(owner, {}).values())
+    def get_runtimes(self, space: str) -> list[HostedRuntime]:
+        return list(self._runtimes.get(space, {}).values())
 
-    def remove_runtime(self, owner: str, runtime_id: str) -> bool:
-        owned = self._runtimes.get(owner)
+    def get_board_runtimes(self, owner: str) -> list[HostedRuntime]:
+        """The runtimes a tenant's deployed boards have here, whichever board."""
+        boards = board_space(owner, "")
+        return [
+            runtime
+            for space, owned in self._runtimes.items()
+            if space.startswith(boards)
+            for runtime in owned.values()
+        ]
+
+    def count_runtimes(self, owner: str) -> int:
+        """How many runtimes a tenant has, in its own space and its boards'."""
+        return len(self.get_runtimes(owner)) + len(self.get_board_runtimes(owner))
+
+    def remove_runtime(self, space: str, runtime_id: str) -> bool:
+        owned = self._runtimes.get(space)
         if not owned:
             return False
         runtime = owned.pop(runtime_id, None)
         if not owned:
-            self._runtimes.pop(owner, None)
+            self._runtimes.pop(space, None)
         if runtime:
             runtime.destroy()
             return True
         return False
 
     def remove_all_runtimes(self, owner: str) -> None:
+        """Removes what is in a tenant's own space; a board's runtimes are its
+        coordinator's to remove."""
         owned = self._runtimes.pop(owner, None)
         if not owned:
             return
