@@ -153,6 +153,7 @@ class SubService:
         # to ask, so what the board records reaches it here rather than never.
         self._apply_log_settings()
         self._apply_secrets()
+        self._apply_assets()
         self._apply_slots()
         self._apply_mounts()
 
@@ -242,6 +243,15 @@ class SubService:
                 lambda: self._host.secrets() if self._host else None
             )
 
+    def _apply_assets(self) -> None:
+        """Points the nested runtime at the surrounding runtime's assets, for the
+        same reason as secrets: nothing provisions it, so it asks outward on each
+        lookup and sees an asset edited while the board runs."""
+        if self._pipeline is not None:
+            self._pipeline.delegate_assets(
+                lambda: self._host.assets() if self._host and hasattr(self._host, "assets") else None
+            )
+
     def _apply_log_settings(self) -> None:
         """Hands the board's log settings to the nested pipeline, if any."""
         if not self._host or not self._pipeline:
@@ -301,6 +311,7 @@ class SubService:
 
         self._apply_log_settings()
         self._apply_secrets()
+        self._apply_assets()
         self._apply_slots()
         self._apply_mounts()
 

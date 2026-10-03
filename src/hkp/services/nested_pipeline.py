@@ -66,6 +66,7 @@ class NestedPipeline:
         self._host = host
         self._apply_log_settings()
         self._apply_secrets()
+        self._apply_assets()
         self._apply_slots()
         self._apply_mounts()
 
@@ -184,6 +185,7 @@ class NestedPipeline:
         )
         self._apply_log_settings()
         self._apply_secrets()
+        self._apply_assets()
         self._apply_slots()
         self._apply_mounts()
 
@@ -199,6 +201,15 @@ class NestedPipeline:
         if self._runtime:
             self._runtime.delegate_secrets(
                 lambda: self._host.secrets() if self._host else None
+            )
+
+    def _apply_assets(self) -> None:
+        """Points the nested runtime at the surrounding runtime's assets, for the
+        same reason as secrets: nothing provisions it, so it asks outward on each
+        lookup and sees an asset edited while the board runs."""
+        if self._runtime is not None:
+            self._runtime.delegate_assets(
+                lambda: self._host.assets() if self._host and hasattr(self._host, "assets") else None
             )
 
     def _apply_slots(self) -> None:
