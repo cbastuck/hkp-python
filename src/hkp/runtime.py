@@ -13,7 +13,9 @@ from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
 from .assets import AssetStore
+from .auth import ANONYMOUS_SUB, AuthenticatedUser
 from .types import (
+    Caller,
     LogEntry,
     LogLevel,
     ProcessContext,
@@ -75,17 +77,99 @@ def context_from_wire(value: Any) -> ProcessContext | None:
     )
 
 
+def caller_of(user: AuthenticatedUser | None) -> Caller | None:
+    """Who a signed-in user is to a run they begin, or nothing where there is
+    no identity to state.
+
+    A server running without authentication resolves everybody to the one
+    anonymous tenant. That is *no caller*, not a caller called anonymous —
+    otherwise everybody on a development machine would be the same person.
+    """
+    if user is None or user.sub == ANONYMOUS_SUB:
+        return None
+    return Caller(sub=user.sub, email=user.email or None)
+
+
+def context_for_client(
+    wire: Any, user: AuthenticatedUser | None
+) -> ProcessContext:
+    """The context of a run a client holding a token begins: a REST process
+    call, or a ``processRuntime`` on a runtime's socket.
+
+    The run metadata the client sent is kept, as ``context_from_wire`` reads
+    it. Whatever it said about a caller is not read at all: who is calling is
+    what the server verified, so a client cannot act in another person's name
+    by saying so.
+    """
+    context = context_from_wire(wire) or new_run()
+    context.caller = caller_of(user)
+    return context
+
+
+def caller_from_wire(value: Any) -> Caller | None:
+    """A caller as a participant link states one, or nothing when the shape
+    is off."""
+    if not isinstance(value, dict):
+        return None
+    sub = value.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return None
+    email = value.get("email")
+    name = value.get("name")
+    return Caller(
+        sub=sub,
+        email=email if isinstance(email, str) and email else None,
+        name=name if isinstance(name, str) and name else None,
+    )
+
+
+def context_from_link(value: Any) -> ProcessContext | None:
+    """The context of a run as a coordinator says it over a participant link.
+
+    The one path on which a caller is taken as stated. The link is the board's
+    own — opened by this server with the board's ticket — and the coordinator
+    on it is what verified the person. Kept apart from ``context_from_wire`` so
+    that no other entry point can come to trust a caller by sharing a parser.
+    """
+    context = context_from_wire(value)
+    if context is None:
+        return None
+    # The reply address belongs to whoever was waiting at the other end.
+    context.request_id = None
+    context.caller = caller_from_wire(value.get("caller"))
+    return context
+
+
+def context_to_wire(context: ProcessContext | None) -> dict[str, Any] | None:
+    """A run as it is said to another runtime: which run, and who began it.
+    The reply address is left out — it means something only to whoever is
+    waiting."""
+    if context is None:
+        return None
+    wire: dict[str, Any] = {"runId": context.run_id}
+    if context.parent_run_id:
+        wire["parentRunId"] = context.parent_run_id
+    if context.caller is not None:
+        wire["caller"] = context.caller.to_wire()
+    return wire
+
+
 def child_run(parent: ProcessContext | None) -> ProcessContext:
     """A run invoked from inside another one, as a nested pipeline is.
 
     The child gets an identity of its own rather than borrowing its parent's, so
     that work done inside a sub-pipeline stays distinguishable from work done
     around it — which is the whole difference between a trace that shows nesting
-    and one that shows a flat list in timestamp order.
+    and one that shows a flat list in timestamp order. Who began the work is the
+    same person however deep it goes, so the caller is inherited.
     """
     if parent is None:
         return new_run()
-    return ProcessContext(run_id=str(_uuid.uuid4()), parent_run_id=parent.run_id)
+    return ProcessContext(
+        run_id=str(_uuid.uuid4()),
+        parent_run_id=parent.run_id,
+        caller=parent.caller,
+    )
 
 
 #: The loop the server runs on, for work a service starts from a worker thread.
@@ -120,7 +204,9 @@ class HostedRuntime:
         self._services: dict[str, HostedService] = {}
         self._service_order: list[str] = []
         self._notification_targets: set[NotificationCallback] = set()
-        self._result_targets: set[Callable[[Any], None]] = set()
+        self._result_targets: set[
+            Callable[[Any, ProcessContext | None], None]
+        ] = set()
         #: The call being processed right now; see _with_context.
         self._context: ProcessContext | None = None
         #: Which service the pass is inside, so a log entry can name it.
@@ -273,7 +359,12 @@ class HostedRuntime:
         self._notification_targets.add(target)
         return lambda: self._notification_targets.discard(target)
 
-    def register_result_target(self, target: Callable[[Any], None]) -> Callable[[], None]:
+    def register_result_target(
+        self, target: Callable[[Any, ProcessContext | None], None]
+    ) -> Callable[[], None]:
+        """Where what this runtime emits goes. A target is told the run the
+        value was emitted in, or None when it was emitted outside one, so that
+        whoever carries it on can say which run it continues."""
         self._result_targets.add(target)
         return lambda: self._result_targets.discard(target)
 
@@ -440,6 +531,7 @@ class HostedRuntime:
             level=level,
             event=event,
             data=data if (self._log_data and data is not None) else None,
+            caller=self._context.caller.sub if self._context.caller else None,
         )
         for target in list(self._log_targets):
             target(entry)
@@ -462,6 +554,7 @@ class HostedRuntime:
             level="debug",
             event="service.processed",
             duration_ms=duration_ms,
+            caller=self._context.caller.sub if self._context.caller else None,
         )
         for target in list(self._log_targets):
             target(entry)
@@ -631,8 +724,9 @@ class HostedRuntime:
         return False
 
     def emit_result(self, output: Any) -> None:
+        context = self._context
         for target in list(self._result_targets):
-            target(output)
+            target(output, context)
 
     # ── Internals ──────────────────────────────────────────────────────────────
 

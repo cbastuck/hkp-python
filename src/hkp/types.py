@@ -117,6 +117,35 @@ class RuntimeNotification:
 
 
 @dataclass
+class Caller:
+    """Who took the action a run began with.
+
+    Stated by the server that verified their token, never read from what they
+    sent: a payload saying who its sender is proves nothing about them. A run
+    nobody began — a timer tick, a request arriving at a mount — has none, and
+    neither does anything on a server running without authentication, where
+    there is nobody to tell apart.
+    """
+
+    #: The token's ``sub``.
+    sub: str
+    #: Present only when the token carried a verified one; normalised.
+    email: str | None = None
+    #: What the board's member list calls that email. Set by a coordinator
+    #: that keeps such a list, and absent everywhere else — a name from the
+    #: token would be the person's own choice.
+    name: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        wire: dict[str, Any] = {"sub": self.sub}
+        if self.email:
+            wire["email"] = self.email
+        if self.name:
+            wire["name"] = self.name
+        return wire
+
+
+@dataclass
 class ProcessContext:
     """What travels with a process call rather than with the data it carries.
 
@@ -144,6 +173,10 @@ class ProcessContext:
     #: forget calls that make up most traffic. Unused by this runtime today;
     #: named here so the shape matches the runtimes that do carry one.
     request_id: str | None = None
+    #: Who began this run, when somebody did. It travels with the run — into a
+    #: nested pipeline, and across the runtimes of a deployed board — so a
+    #: service asks here rather than trusting a field of its input.
+    caller: Caller | None = None
 
 
 LogLevel = Literal["debug", "info", "warn", "error"]
@@ -175,6 +208,9 @@ class LogEntry:
     parent_run_id: str | None = None
     data: Any = None
     duration_ms: float | None = None
+    #: The ``sub`` of whoever began the run, when somebody did. Enough to
+    #: answer "who did this" from a board's log without it collecting addresses.
+    caller: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         """The entry as the other runtimes spell it.
@@ -195,6 +231,8 @@ class LogEntry:
         }
         if self.parent_run_id:
             wire["parentRunId"] = self.parent_run_id
+        if self.caller:
+            wire["caller"] = self.caller
         if self.data is not None:
             wire["data"] = self.data
         if self.duration_ms is not None:

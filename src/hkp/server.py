@@ -5,7 +5,7 @@ import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Coroutine
+from typing import Any, Callable, Coroutine
 
 import aiohttp_cors
 from aiohttp import WSMsgType, web
@@ -32,7 +32,10 @@ from .coordinator_links import (
 )
 from .runtime import (
     board_space,
-    context_from_wire,
+    context_for_client,
+    context_from_link,
+    context_to_wire,
+    new_run,
     HostedRuntime,
     HostedServiceFactory,
     LOG_LEVELS,
@@ -387,7 +390,7 @@ class RuntimeServer:
             # Authorization header, keeping the token out of URLs/logs.
             token = token or request.query.get("access_token")
 
-        user = await self._authenticator.verify_token(token)
+        user = await self._authenticator.authorize_owner(token)
         if user is None:
             raise web.HTTPUnauthorized()
         request[_AUTHENTICATED_USER_KEY] = user
@@ -593,20 +596,26 @@ class RuntimeServer:
             linked = (owner, board_name, runtime_id)
 
             def to_coordinator_notification(notification: RuntimeNotification) -> None:
-                links.emit(
-                    *linked,
-                    {
-                        "type": "notification",
-                        "serviceUuid": notification.instance_id,
-                        "payload": notification.payload,
-                    },
-                )
+                message: dict[str, Any] = {
+                    "type": "notification",
+                    "serviceUuid": notification.instance_id,
+                    "payload": notification.payload,
+                }
+                # Named with whoever began the run it was raised in, which is
+                # how the coordinator knows whose it is to hear. Raised outside
+                # a run — a timer, a callback — it names nobody.
+                context = runtime.current_context()
+                if context is not None and context.caller is not None:
+                    message["caller"] = context.caller.to_wire()
+                links.emit(*linked, message)
 
-            def to_coordinator_result(result: Any) -> None:
-                # The link sends a value holding bytes as a binary frame.
-                links.emit(
-                    *linked, {"type": "result", "data": _jsonable_result(result)}
-                )
+            def to_coordinator_result(
+                result: Any, context: ProcessContext | None
+            ) -> None:
+                # The link sends a value holding bytes as a binary frame. With
+                # the run it was emitted in, so the coordinator can tell the
+                # next runtime which run this continues and who began it.
+                links.emit(*linked, _result_message(result, context))
 
             def to_coordinator_log(entry: LogEntry) -> None:
                 links.emit(*linked, {"type": "log", "entry": entry.to_wire()})
@@ -621,7 +630,7 @@ class RuntimeServer:
             lambda notification: self._send_notification(socket_key, notification)
         )
         runtime.register_result_target(
-            lambda result: self._send_result(socket_key, result)
+            lambda result, _context: self._send_result(socket_key, result)
         )
         runtime.register_log_target(lambda entry: self._send_log(socket_key, entry))
 
@@ -777,16 +786,55 @@ class RuntimeServer:
 
     async def link_process(
         self, owner: str, board_name: str, runtime_id: str, params: Any, context: Any
-    ) -> Any:
+    ) -> dict[str, Any]:
         runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             raise RuntimeError("the runtime is not running")
         # The coordinator names the run its call belongs to, so that a board
-        # spanning several runtimes reads as one trace.
-        result = await self._process_off_loop(
-            runtime, params, context_from_wire(context)
-        )
-        return _jsonable_result(result)
+        # spanning several runtimes reads as one trace — and who began it,
+        # which is taken as stated on this path and on no other.
+        run = context_from_link(context) or new_run()
+        result = await self._process_off_loop(runtime, params, run)
+        return _result_message(result, run)
+
+    def link_process_service(
+        self,
+        owner: str,
+        board_name: str,
+        runtime_id: str,
+        service_uuid: str,
+        params: Any,
+        context: Any,
+        done: Callable[[dict[str, Any]], None],
+    ) -> None:
+        runtime = self._linked_runtime(owner, board_name, runtime_id)
+        if runtime is None:
+            raise RuntimeError("the runtime is not running")
+        if not runtime.get_service(service_uuid):
+            raise RuntimeError(f'no service "{service_uuid}"')
+        # As on `link_process`: the run and its caller are the coordinator's
+        # to state, over this link and nowhere else.
+        run = context_from_link(context) or new_run()
+
+        async def work() -> None:
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    self._process_executor,
+                    runtime.process_at,
+                    service_uuid,
+                    params,
+                    lambda _n: None,
+                    run,
+                )
+            except Exception as err:  # noqa: BLE001 - reported, never raised
+                print(
+                    f'[coordinator-link] Runtime "{runtime_id}" failed to '
+                    f'process at "{service_uuid}": {err}'
+                )
+                return
+            done(_result_message(result, run))
+
+        self._spawn(work())
 
     # ── /coordinator-links handlers ────────────────────────────────────────────
 
@@ -1089,7 +1137,13 @@ class RuntimeServer:
             if body is not None and not isinstance(body, dict):
                 raise web.HTTPBadRequest()
 
-        result = await self._process_off_loop(runtime, body)
+        # An external HTTP caller is not continuing a run, it is starting one —
+        # as whoever its token says it is.
+        result = await self._process_off_loop(
+            runtime,
+            body,
+            context_for_client(None, request.get(_AUTHENTICATED_USER_KEY)),
+        )
         if _is_binary_result(result):
             return web.Response(
                 body=serialize_message(result, purpose=MessagePurpose.RESULT),
@@ -1127,7 +1181,12 @@ class RuntimeServer:
                 instance_id,
                 body,
                 lambda _n: None,
-                None,
+                # The caller is never the body's to name: it is whoever the
+                # token was verified as.
+                context_for_client(
+                    body.get("__context") if isinstance(body, dict) else None,
+                    request.get(_AUTHENTICATED_USER_KEY),
+                ),
             )
         except KeyError:
             raise web.HTTPNotFound()
@@ -1253,10 +1312,15 @@ class RuntimeServer:
                             # A peer driving this runtime names the run its
                             # call belongs to, so that a board spanning several
                             # runtimes reads as one trace rather than one each.
+                            # Who is calling is not the frame's to say: it is
+                            # whoever opened this socket.
                             result = await self._process_off_loop(
                                 runtime,
                                 data["params"],
-                                context_from_wire(data.get("context")),
+                                context_for_client(
+                                    data.get("context"),
+                                    request.get(_AUTHENTICATED_USER_KEY),
+                                ),
                             )
                             if not ws.closed:
                                 if _is_binary_result(result):
@@ -1343,6 +1407,16 @@ def _jsonable_result(result: Any) -> Any:
     if isinstance(result, (NullData, UndefinedData)):
         return None
     return result
+
+
+def _result_message(result: Any, context: ProcessContext | None) -> dict[str, Any]:
+    """What a runtime produced, as its coordinator is told: the value, and the
+    run it was produced in — which the coordinator hands to the next runtime."""
+    message: dict[str, Any] = {"type": "result", "data": _jsonable_result(result)}
+    wire = context_to_wire(context)
+    if wire is not None:
+        message["context"] = wire
+    return message
 
 
 def _json_placeholder(value: Any) -> Any:

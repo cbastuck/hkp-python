@@ -24,7 +24,7 @@ class TwoPrincipalAuthenticator:
         self._resolve_opaque_token = resolve_opaque_token
         self._known = {ALICE, BOB}
 
-    async def verify_token(self, token: str | None) -> AuthenticatedUser | None:
+    async def authorize_owner(self, token: str | None) -> AuthenticatedUser | None:
         if not token:
             return None
         opaque = self._resolve_opaque_token(token)
