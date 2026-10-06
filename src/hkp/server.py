@@ -1347,7 +1347,15 @@ class RuntimeServer:
                         continue
                     runtime = self.runtime_app.get_runtime(owner, runtime_id)
                     if runtime:
-                        result = await self._process_off_loop(runtime, message.data)
+                        # Bytes have nowhere to name a run, so this begins one;
+                        # it is still whoever opened this socket that began it.
+                        result = await self._process_off_loop(
+                            runtime,
+                            message.data,
+                            context_for_client(
+                                None, request.get(_AUTHENTICATED_USER_KEY)
+                            ),
+                        )
                         if not ws.closed:
                             if _is_binary_result(result):
                                 await ws.send_bytes(

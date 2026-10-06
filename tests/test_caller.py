@@ -19,6 +19,7 @@ from hkp.auth import (
     identity_from_claims,
     may_own,
 )
+from hkp.data import FloatRingBuffer
 from hkp.runtime import (
     caller_of,
     child_run,
@@ -29,6 +30,7 @@ from hkp.runtime import (
 )
 from hkp.server import create_runtime_server
 from hkp.types import Caller, ProcessContext
+from hkp.yas import serialize_message
 
 ALICE = AuthenticatedUser(sub="auth0|alice", email="alice@example.com")
 #: Signed in, and without an address anybody verified.
@@ -146,6 +148,26 @@ async def test_a_process_on_the_runtimes_socket_is_whoever_opened_it(servers):
                     break
 
     assert seen[0].run_id == "run-from-client"
+    assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
+
+
+async def test_bytes_on_the_runtimes_socket_are_whoever_opened_it_too(servers):
+    server, base_url = await servers(build_authenticator=KnownPeople)
+    frame = serialize_message(FloatRingBuffer.from_floats([1.0, -1.0]), sender="")
+    async with aiohttp.ClientSession() as session:
+        seen = await runtime_with_spy(server, session, base_url, ALICE)
+
+        async with session.ws_connect(
+            f"{base_url}/rt-1", headers=auth(ALICE)
+        ) as ws:
+            await ws.send_bytes(frame)
+            # Notifications come as text; the result of bytes comes as bytes.
+            while (await ws.receive(timeout=5)).type != aiohttp.WSMsgType.BINARY:
+                pass
+
+    # A frame of bytes names no run, so one begins here — as the person the
+    # socket was opened by, the same as a text frame's.
+    assert seen[0].run_id
     assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
 
 
