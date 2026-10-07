@@ -8,6 +8,7 @@ from hkp.runtime import HostedRuntime, child_run, new_run
 from hkp.types import (
     JsonRecord,
     ProcessContext,
+    SourceRunActor,
     RuntimeConfiguration,
     RuntimeHost,
     ServiceConfiguration,
@@ -29,12 +30,14 @@ class ContextSpy:
     def __init__(self, config: ServiceConfiguration) -> None:
         self.uuid = config.uuid
         self.seen: list[ProcessContext | None] = []
+        self.configured: list[ProcessContext | None] = []
         self._host: RuntimeHost | None = None
 
     def set_host(self, host: RuntimeHost) -> None:
         self._host = host
 
     def configure(self, _config: JsonRecord) -> JsonRecord:
+        self.configured.append(self._host.current_context() if self._host else None)
         return {}
 
     def get_state(self) -> JsonRecord:
@@ -134,7 +137,11 @@ def test_restores_the_outer_run_once_a_nested_call_returns() -> None:
     # still see the run the outer pass was running under, not a leftover.
     runtime, spies = build(("before", ContextSpy), ("puller", Puller), ("after", ContextSpy))
 
-    runtime.process({}, lambda _n: None, ProcessContext(run_id="outer"))
+    runtime.process(
+        {},
+        lambda _n: None,
+        ProcessContext(run_id="outer", actor=SourceRunActor(kind="board")),
+    )
 
     assert spies["before"].seen[0].run_id == "outer"  # type: ignore[union-attr]
     assert spies["after"].seen[0].run_id == "outer"  # type: ignore[union-attr]
@@ -159,7 +166,12 @@ def test_continues_the_named_run_when_process_from_is_given_one() -> None:
     # returning — an HTTP response, a delayed emit.
     runtime, spies = build(("a", ContextSpy), ("b", ContextSpy))
 
-    runtime.process_from("a", {}, lambda _n: None, ProcessContext(run_id="captured"))
+    runtime.process_from(
+        "a",
+        {},
+        lambda _n: None,
+        ProcessContext(run_id="captured", actor=SourceRunActor(kind="board")),
+    )
 
     assert spies["b"].seen[0].run_id == "captured"  # type: ignore[union-attr]
 
@@ -172,6 +184,20 @@ def test_reports_no_context_outside_a_call() -> None:
     runtime.process({}, lambda _n: None)
 
     # The pass has returned; nothing is running.
+    assert runtime.current_context() is None
+
+
+def test_gives_configure_the_context_supplied_by_the_framework() -> None:
+    runtime, spies = build(("a", ContextSpy))
+    run = ProcessContext(
+        run_id="configured-by-member",
+        actor=SourceRunActor(kind="board"),
+    )
+
+    runtime.configure_service("a", {}, run)
+    runtime.configure_service("a", {})
+
+    assert spies["a"].configured == [run, None]
     assert runtime.current_context() is None
 
 

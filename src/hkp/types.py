@@ -114,6 +114,7 @@ class RuntimeDescriptor:
 class RuntimeNotification:
     instance_id: str
     payload: Any
+    context: "ProcessContext | None" = None
 
 
 @dataclass
@@ -145,6 +146,42 @@ class Caller:
         return wire
 
 
+@dataclass(frozen=True)
+class PersonRunActor:
+    """The verified person acting in a run and their authority deadline."""
+
+    kind: Literal["person"]
+    sub: str
+    expires_at: int
+    email: str | None = None
+    name: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        wire: dict[str, Any] = {
+            "kind": self.kind,
+            "sub": self.sub,
+            "expiresAt": self.expires_at,
+        }
+        if self.email:
+            wire["email"] = self.email
+        if self.name:
+            wire["name"] = self.name
+        return wire
+
+
+@dataclass(frozen=True)
+class SourceRunActor:
+    """A run created without delegated person authority."""
+
+    kind: Literal["board", "mount", "local"]
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"kind": self.kind}
+
+
+RunActor = PersonRunActor | SourceRunActor
+
+
 @dataclass
 class ProcessContext:
     """What travels with a process call rather than with the data it carries.
@@ -165,6 +202,9 @@ class ProcessContext:
     #: Identifies one invocation of a board — one webhook, one timer tick, one
     #: user action — across every service and runtime it reaches.
     run_id: str
+    #: What is acting in this run. Only the person variant carries identity
+    #: and an authority deadline.
+    actor: RunActor
     #: The run this one was invoked from, for a nested pipeline. Absent on a run
     #: triggered from outside rather than from inside another run, which is what
     #: makes a trace reconstructable as a tree rather than a list.
@@ -173,10 +213,6 @@ class ProcessContext:
     #: forget calls that make up most traffic. Unused by this runtime today;
     #: named here so the shape matches the runtimes that do carry one.
     request_id: str | None = None
-    #: Who began this run, when somebody did. It travels with the run — into a
-    #: nested pipeline, and across the runtimes of a deployed board — so a
-    #: service asks here rather than trusting a field of its input.
-    caller: Caller | None = None
 
 
 LogLevel = Literal["debug", "info", "warn", "error"]

@@ -601,12 +601,12 @@ class RuntimeServer:
                     "serviceUuid": notification.instance_id,
                     "payload": notification.payload,
                 }
-                # Named with whoever began the run it was raised in, which is
-                # how the coordinator knows whose it is to hear. Raised outside
-                # a run — a timer, a callback — it names nobody.
-                context = runtime.current_context()
-                if context is not None and context.caller is not None:
-                    message["caller"] = context.caller.to_wire()
+                # Carries the run captured at the service boundary, so the
+                # coordinator can address and revalidate it. A standing timer
+                # or subscription instead has its own board-origin run.
+                wire = context_to_wire(notification.context)
+                if wire is not None:
+                    message["context"] = wire
                 links.emit(*linked, message)
 
             def to_coordinator_result(
@@ -760,14 +760,21 @@ class RuntimeServer:
         }
 
     async def link_configure_service(
-        self, owner: str, board_name: str, runtime_id: str, service_uuid: str, config: Any
+        self,
+        owner: str,
+        board_name: str,
+        runtime_id: str,
+        service_uuid: str,
+        config: Any,
+        context: Any,
     ) -> Any:
         runtime = self._linked_runtime(owner, board_name, runtime_id)
         if runtime is None:
             raise RuntimeError("the runtime is not running")
         if not isinstance(config, dict):
             raise ValueError("a service is configured with an object")
-        if runtime.configure_service(service_uuid, config) is None:
+        run = context_from_link(context) or new_run()
+        if runtime.configure_service(service_uuid, config, run) is None:
             raise LookupError(f'no service "{service_uuid}"')
         return await _wait_for_service_activation_state(runtime, service_uuid)
 
@@ -1248,7 +1255,11 @@ class RuntimeServer:
             raise web.HTTPBadRequest()
         if not isinstance(body, dict):
             raise web.HTTPBadRequest()
-        state = runtime.configure_service(instance_id, body)
+        state = runtime.configure_service(
+            instance_id,
+            body,
+            context_for_client(None, request.get(_AUTHENTICATED_USER_KEY)),
+        )
         if state is None:
             raise web.HTTPNotFound()
         # Poll until port is assigned for http-server-subservices with bypass=False, port=0

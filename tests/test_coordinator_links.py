@@ -409,7 +409,14 @@ async def test_takes_the_run_and_its_caller_from_the_coordinator_and_hands_them_
     )
     await coordinator.request("provision", **PROVISION)
     seen = _seen_by(server)
-    run = {"runId": "run-1", "caller": ALICE}
+    run = {
+        "runId": "run-1",
+        "actor": {
+            "kind": "person",
+            **ALICE,
+            "expiresAt": 9_999_999_999_999,
+        },
+    }
 
     await coordinator.send(
         {"type": "processRuntime", "params": {"n": 1}, "context": run}
@@ -420,12 +427,12 @@ async def test_takes_the_run_and_its_caller_from_the_coordinator_and_hands_them_
         "the result",
     )
     assert seen[0].run_id == "run-1"
-    assert seen[0].caller.to_wire() == ALICE
+    assert seen[0].actor.to_wire() == run["actor"]
     result = next(e for e in coordinator.events if e["type"] == "result")
     assert result["context"] == run
     # What the service said while it ran is the caller's to hear, and says so.
     said = next(e for e in coordinator.events if e["type"] == "notification")
-    assert said["caller"] == ALICE
+    assert said["context"] == run
 
 
 async def test_a_run_nobody_began_names_nobody(servers, coordinator):
@@ -442,10 +449,10 @@ async def test_a_run_nobody_began_names_nobody(servers, coordinator):
         "the result",
     )
     result = next(e for e in coordinator.events if e["type"] == "result")
-    assert "caller" not in result["context"]
+    assert result["context"]["actor"] == {"kind": "board"}
     assert result["context"]["runId"]
     said = next(e for e in coordinator.events if e["type"] == "notification")
-    assert "caller" not in said
+    assert said["context"]["actor"] == {"kind": "board"}
 
 
 async def test_begins_at_one_service_when_asked_and_says_what_came_of_it(
@@ -468,7 +475,14 @@ async def test_begins_at_one_service_when_asked_and_says_what_came_of_it(
     await coordinator.request("provision", **two)
     first = _seen_by(server, "first")
     second = _seen_by(server, "second")
-    run = {"runId": "run-2", "caller": ALICE}
+    run = {
+        "runId": "run-2",
+        "actor": {
+            "kind": "person",
+            **ALICE,
+            "expiresAt": 9_999_999_999_999,
+        },
+    }
 
     answer = await coordinator.request(
         "processService", serviceUuid="second", params={"n": 2}, context=run
@@ -481,7 +495,7 @@ async def test_begins_at_one_service_when_asked_and_says_what_came_of_it(
         "the result",
     )
     assert first == []
-    assert second[0].caller.to_wire() == ALICE
+    assert second[0].actor.to_wire() == run["actor"]
     result = next(e for e in coordinator.events if e["type"] == "result")
     assert result["data"] == {"n": 2}
     assert result["context"] == run

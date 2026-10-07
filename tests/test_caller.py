@@ -29,7 +29,7 @@ from hkp.runtime import (
     context_to_wire,
 )
 from hkp.server import create_runtime_server
-from hkp.types import Caller, ProcessContext
+from hkp.types import Caller, PersonRunActor, ProcessContext, SourceRunActor
 from hkp.yas import serialize_message
 
 ALICE = AuthenticatedUser(sub="auth0|alice", email="alice@example.com")
@@ -38,7 +38,13 @@ CAROL = AuthenticatedUser(sub="auth0|carol")
 
 FORGED = {
     "runId": "run-from-client",
-    "caller": {"sub": "auth0|bob", "email": "bob@example.com", "name": "Bob"},
+    "actor": {
+        "kind": "person",
+        "sub": "auth0|bob",
+        "email": "bob@example.com",
+        "name": "Bob",
+        "expiresAt": 9_999_999_999_999,
+    },
 }
 
 
@@ -72,9 +78,13 @@ def auth(user: AuthenticatedUser | None) -> dict[str, str]:
 
 
 async def runtime_with_spy(
-    server, session: aiohttp.ClientSession, base_url: str, user: AuthenticatedUser | None
+    server,
+    session: aiohttp.ClientSession,
+    base_url: str,
+    user: AuthenticatedUser | None,
+    method: str = "process",
 ) -> list[Any]:
-    """A runtime of one monitor, recording the context each call runs under."""
+    """A runtime of one monitor, recording the context each named call runs under."""
     async with session.post(
         f"{base_url}/runtimes",
         headers=auth(user),
@@ -88,14 +98,34 @@ async def runtime_with_spy(
     runtime = server.runtime_app.get_runtime(user.sub if user else "anonymous", "rt-1")
     service = runtime.get_service("mon-1")
     seen: list[Any] = []
-    process = service.process
+    called = getattr(service, method)
 
-    def recording(data: Any, notify: Any) -> Any:
+    def recording(*args: Any) -> Any:
         seen.append(runtime.current_context())
-        return process(data, notify)
+        return called(*args)
 
-    service.process = recording
+    setattr(service, method, recording)
     return seen
+
+
+async def test_a_service_configure_call_is_the_tokens(servers):
+    server, base_url = await servers(build_authenticator=KnownPeople)
+    async with aiohttp.ClientSession() as session:
+        seen = await runtime_with_spy(
+            server, session, base_url, ALICE, method="configure"
+        )
+
+        async with session.post(
+            f"{base_url}/runtimes/rt-1/services/mon-1",
+            headers=auth(ALICE),
+            json={"__context": FORGED, "logToConsole": True},
+        ) as res:
+            assert res.status == 200
+
+    assert len(seen) == 1
+    assert seen[0].run_id != FORGED["runId"]
+    assert seen[0].actor.sub == ALICE.sub
+    assert seen[0].actor.email == ALICE.email
 
 
 async def test_a_service_process_call_is_the_tokens_whatever_the_body_claims(servers):
@@ -106,12 +136,13 @@ async def test_a_service_process_call_is_the_tokens_whatever_the_body_claims(ser
         async with session.post(
             f"{base_url}/runtimes/rt-1/services/mon-1/process",
             headers=auth(ALICE),
-            json={"__context": FORGED, "caller": FORGED["caller"]},
+            json={"__context": FORGED, "actor": FORGED["actor"]},
         ) as res:
             assert res.status == 200
 
     assert seen[0].run_id == "run-from-client"
-    assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
+    assert seen[0].actor.sub == ALICE.sub
+    assert seen[0].actor.email == ALICE.email
 
 
 async def test_a_runtime_process_call_is_the_tokens(servers):
@@ -126,7 +157,8 @@ async def test_a_runtime_process_call_is_the_tokens(servers):
         ) as res:
             assert res.status == 200
 
-    assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
+    assert seen[0].actor.sub == ALICE.sub
+    assert seen[0].actor.email == ALICE.email
 
 
 async def test_a_process_on_the_runtimes_socket_is_whoever_opened_it(servers):
@@ -148,7 +180,8 @@ async def test_a_process_on_the_runtimes_socket_is_whoever_opened_it(servers):
                     break
 
     assert seen[0].run_id == "run-from-client"
-    assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
+    assert seen[0].actor.sub == ALICE.sub
+    assert seen[0].actor.email == ALICE.email
 
 
 async def test_bytes_on_the_runtimes_socket_are_whoever_opened_it_too(servers):
@@ -168,7 +201,8 @@ async def test_bytes_on_the_runtimes_socket_are_whoever_opened_it_too(servers):
     # A frame of bytes names no run, so one begins here — as the person the
     # socket was opened by, the same as a text frame's.
     assert seen[0].run_id
-    assert seen[0].caller == Caller(sub=ALICE.sub, email=ALICE.email)
+    assert seen[0].actor.sub == ALICE.sub
+    assert seen[0].actor.email == ALICE.email
 
 
 async def test_a_caller_has_no_email_when_none_was_verified(servers):
@@ -181,7 +215,8 @@ async def test_a_caller_has_no_email_when_none_was_verified(servers):
         ) as res:
             assert res.status == 200
 
-    assert seen[0].caller == Caller(sub=CAROL.sub)
+    assert seen[0].actor.sub == CAROL.sub
+    assert seen[0].actor.email is None
 
 
 async def test_a_server_without_authentication_names_no_caller(servers):
@@ -197,39 +232,57 @@ async def test_a_server_without_authentication_names_no_caller(servers):
         ) as res:
             assert res.status == 200
 
-    assert seen[0].caller is None
+    assert seen[0].actor == SourceRunActor(kind="local")
 
 
 def test_never_reads_a_caller_from_a_clients_context():
-    assert context_from_wire(FORGED).caller is None
-    assert context_for_client(FORGED, None).caller is None
-    assert context_for_client(FORGED, ALICE).caller == Caller(
-        sub=ALICE.sub, email=ALICE.email
+    assert context_from_wire(FORGED).actor == SourceRunActor(kind="local")
+    assert context_for_client(FORGED, None).actor == SourceRunActor(
+        kind="local"
     )
+    actor = context_for_client(FORGED, ALICE).actor
+    assert actor.kind == "person"
+    assert actor.sub == ALICE.sub
+    assert actor.email == ALICE.email
     assert context_for_client(None, ALICE).run_id
 
 
 def test_takes_a_caller_as_stated_over_a_participant_link():
     context = context_from_link({**FORGED, "requestId": "reply-here"})
     assert context.run_id == "run-from-client"
-    assert context.caller.to_wire() == FORGED["caller"]
+    assert context.actor.to_wire() == FORGED["actor"]
     # The reply address belongs to whoever was waiting at the other end.
     assert context.request_id is None
-    # A caller without a `sub` is nobody, not somebody with half an identity.
-    assert context_from_link({"runId": "r", "caller": {"email": "x@y.z"}}).caller is None
+    # A malformed person is expired, rather than gaining another actor kind.
+    malformed = context_from_link(
+        {"runId": "r", "actor": {"kind": "person", "email": "x@y.z"}}
+    )
+    assert malformed.actor == PersonRunActor(kind="person", sub="", expires_at=0)
     assert context_from_link(None) is None
 
 
 def test_says_a_run_as_another_runtime_is_told_it():
     context = ProcessContext(
-        run_id="r", parent_run_id="p", request_id="q", caller=Caller(sub="s", name="N")
+        run_id="r",
+        parent_run_id="p",
+        request_id="q",
+        actor=PersonRunActor(
+            kind="person", sub="s", name="N", expires_at=9_999_999_999_999
+        ),
     )
     assert context_to_wire(context) == {
         "runId": "r",
         "parentRunId": "p",
-        "caller": {"sub": "s", "name": "N"},
+        "actor": {
+            "kind": "person",
+            "sub": "s",
+            "name": "N",
+            "expiresAt": 9_999_999_999_999,
+        },
     }
-    assert context_to_wire(ProcessContext(run_id="r")) == {"runId": "r"}
+    assert context_to_wire(
+        ProcessContext(run_id="r", actor=SourceRunActor(kind="board"))
+    ) == {"runId": "r", "actor": {"kind": "board"}}
     assert context_to_wire(None) is None
 
 
@@ -240,11 +293,18 @@ def test_states_no_caller_for_the_anonymous_tenant():
 
 
 def test_hands_the_caller_down_to_a_child_run():
-    parent = ProcessContext(run_id="outer", caller=Caller(sub="s", email="e@x.y"))
+    parent = ProcessContext(
+        run_id="outer",
+        actor=PersonRunActor(
+            kind="person", sub="s", email="e@x.y", expires_at=9_999_999_999_999
+        ),
+    )
     child = child_run(parent)
     assert child.parent_run_id == "outer"
-    assert child.caller == parent.caller
-    assert child_run(ProcessContext(run_id="outer")).caller is None
+    assert child.actor == parent.actor
+    assert child_run(
+        ProcessContext(run_id="outer", actor=SourceRunActor(kind="board"))
+    ).actor == SourceRunActor(kind="board")
 
 
 def test_an_identity_carries_an_email_only_when_it_is_verified():

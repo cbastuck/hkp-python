@@ -147,6 +147,7 @@ class LinkHost(Protocol):
         runtime_id: str,
         service_uuid: str,
         config: Any,
+        context: Any,
     ) -> Any: ...
 
     def link_set_state(
@@ -458,7 +459,10 @@ class _Link:
             return described
         if op == "configureService":
             return await self._host.link_configure_service(
-                *runtime, str(request.get("serviceUuid")), request.get("config")
+                *runtime,
+                str(request.get("serviceUuid")),
+                request.get("config"),
+                request.get("context"),
             )
         if op == "processService":
             self._host.link_process_service(

@@ -6,7 +6,7 @@ import time
 import uuid as _uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Coroutine, Callable, Iterator
+from typing import Any, Coroutine, Callable, Iterator, Literal
 
 from .address import ADDRESS_SEPARATOR, descend, split_address
 from .data import ControlFlowData
@@ -16,6 +16,9 @@ from .assets import AssetStore
 from .auth import ANONYMOUS_SUB, AuthenticatedUser
 from .types import (
     Caller,
+    PersonRunActor,
+    RunActor,
+    SourceRunActor,
     LogEntry,
     LogLevel,
     ProcessContext,
@@ -35,6 +38,7 @@ from .types import (
 
 #: Severity order, so a runtime can drop anything below what it records.
 LOG_LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+DEFAULT_PERSON_RUN_TTL_MS = 15 * 60 * 1000
 
 
 def iso_timestamp() -> str:
@@ -50,9 +54,11 @@ def iso_timestamp() -> str:
     return f"{now.strftime('%Y-%m-%dT%H:%M:%S')}.{now.microsecond // 1000:03d}Z"
 
 
-def new_run() -> ProcessContext:
+def new_run(
+    kind: Literal["board", "mount", "local"] = "board",
+) -> ProcessContext:
     """A run with no parent: something outside the board asked for this."""
-    return ProcessContext(run_id=str(_uuid.uuid4()))
+    return ProcessContext(run_id=str(_uuid.uuid4()), actor=SourceRunActor(kind=kind))
 
 
 def context_from_wire(value: Any) -> ProcessContext | None:
@@ -72,6 +78,7 @@ def context_from_wire(value: Any) -> ProcessContext | None:
 
     return ProcessContext(
         run_id=text("runId") or str(_uuid.uuid4()),
+        actor=SourceRunActor(kind="local"),
         parent_run_id=text("parentRunId"),
         request_id=text("requestId"),
     )
@@ -101,8 +108,19 @@ def context_for_client(
     what the server verified, so a client cannot act in another person's name
     by saying so.
     """
-    context = context_from_wire(wire) or new_run()
-    context.caller = caller_of(user)
+    context = context_from_wire(wire) or new_run("local")
+    caller = caller_of(user)
+    context.actor = (
+        PersonRunActor(
+            kind="person",
+            sub=caller.sub,
+            email=caller.email,
+            name=caller.name,
+            expires_at=int(time.time() * 1000) + DEFAULT_PERSON_RUN_TTL_MS,
+        )
+        if caller is not None
+        else SourceRunActor(kind="local")
+    )
     return context
 
 
@@ -123,6 +141,31 @@ def caller_from_wire(value: Any) -> Caller | None:
     )
 
 
+def actor_from_wire(value: Any) -> RunActor | None:
+    """An actor as a trusted participant link states it."""
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("kind")
+    if kind == "person":
+        caller = caller_from_wire(value)
+        expires_at = value.get("expiresAt")
+        return PersonRunActor(
+            kind="person",
+            sub=caller.sub if caller is not None else "",
+            email=caller.email if caller is not None else None,
+            name=caller.name if caller is not None else None,
+            expires_at=(
+                int(expires_at)
+                if isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                else 0
+            ),
+        )
+    if kind in ("board", "mount", "local"):
+        return SourceRunActor(kind=kind)
+    return None
+
+
 def context_from_link(value: Any) -> ProcessContext | None:
     """The context of a run as a coordinator says it over a participant link.
 
@@ -136,7 +179,9 @@ def context_from_link(value: Any) -> ProcessContext | None:
         return None
     # The reply address belongs to whoever was waiting at the other end.
     context.request_id = None
-    context.caller = caller_from_wire(value.get("caller"))
+    context.actor = actor_from_wire(value.get("actor")) or SourceRunActor(
+        kind="board"
+    )
     return context
 
 
@@ -149,8 +194,7 @@ def context_to_wire(context: ProcessContext | None) -> dict[str, Any] | None:
     wire: dict[str, Any] = {"runId": context.run_id}
     if context.parent_run_id:
         wire["parentRunId"] = context.parent_run_id
-    if context.caller is not None:
-        wire["caller"] = context.caller.to_wire()
+    wire["actor"] = context.actor.to_wire()
     return wire
 
 
@@ -160,16 +204,24 @@ def child_run(parent: ProcessContext | None) -> ProcessContext:
     The child gets an identity of its own rather than borrowing its parent's, so
     that work done inside a sub-pipeline stays distinguishable from work done
     around it — which is the whole difference between a trace that shows nesting
-    and one that shows a flat list in timestamp order. Who began the work is the
-    same person however deep it goes, so the caller is inherited.
+    and one that shows a flat list in timestamp order. The actor is inherited
+    exactly, whether it is a person, the board, a mount, or local work.
     """
     if parent is None:
         return new_run()
     return ProcessContext(
         run_id=str(_uuid.uuid4()),
+        actor=parent.actor,
         parent_run_id=parent.run_id,
-        caller=parent.caller,
     )
+
+
+def run_expired(context: ProcessContext | None, now_ms: int | None = None) -> bool:
+    """Person authority is invalid unless it carries a live finite deadline."""
+    if context is None or context.actor.kind != "person":
+        return False
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    return context.actor.expires_at <= now
 
 
 #: The loop the server runs on, for work a service starts from a worker thread.
@@ -317,11 +369,19 @@ class HostedRuntime:
         self._service_order.append(svc.uuid)
         return svc.get_state()
 
-    def configure_service(self, address: str, config: JsonRecord) -> JsonRecord | None:
+    def configure_service(
+        self,
+        address: str,
+        config: JsonRecord,
+        context: ProcessContext | None = None,
+    ) -> JsonRecord | None:
         svc = self.get_service(address)
         if not svc:
             return None
-        return svc.configure(config)
+        if context is None:
+            return svc.configure(config)
+        with self._with_context(context):
+            return svc.configure(config)
 
     def remove_service(self, uuid: str) -> bool:
         svc = self._services.get(uuid)
@@ -531,7 +591,11 @@ class HostedRuntime:
             level=level,
             event=event,
             data=data if (self._log_data and data is not None) else None,
-            caller=self._context.caller.sub if self._context.caller else None,
+            caller=(
+                self._context.actor.sub
+                if self._context.actor.kind == "person"
+                else None
+            ),
         )
         for target in list(self._log_targets):
             target(entry)
@@ -554,7 +618,11 @@ class HostedRuntime:
             level="debug",
             event="service.processed",
             duration_ms=duration_ms,
-            caller=self._context.caller.sub if self._context.caller else None,
+            caller=(
+                self._context.actor.sub
+                if self._context.actor.kind == "person"
+                else None
+            ),
         )
         for target in list(self._log_targets):
             target(entry)
@@ -761,6 +829,8 @@ class HostedRuntime:
         result = input
 
         for uuid in self._service_order[start_index:]:
+            if run_expired(self._context):
+                return None
             svc = self._services.get(uuid)
             if not svc:
                 continue
@@ -773,10 +843,16 @@ class HostedRuntime:
                 on_notification,
             )
 
+            notification_context = self._context
+
             def _make_notify(u: str) -> NotificationCallback:
                 def _notify_cb(payload: Any, inst_id: str | None = None) -> None:
                     self._emit_notification(
-                        RuntimeNotification(instance_id=inst_id or u, payload=payload),
+                        RuntimeNotification(
+                            instance_id=inst_id or u,
+                            payload=payload,
+                            context=notification_context,
+                        ),
                         on_notification,
                     )
                 return _notify_cb  # type: ignore[return-value]
@@ -832,6 +908,8 @@ class HostedRuntime:
         notification: RuntimeNotification,
         on_notification: NotificationCallback,
     ) -> None:
+        if notification.context is None:
+            notification.context = self._context or new_run("board")
         on_notification(notification)
         for target in list(self._notification_targets):
             target(notification)
