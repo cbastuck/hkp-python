@@ -147,6 +147,7 @@ class LinkHost(Protocol):
         runtime_id: str,
         service_uuid: str,
         config: Any,
+        context: Any,
     ) -> Any: ...
 
     def link_set_state(
@@ -157,7 +158,26 @@ class LinkHost(Protocol):
 
     async def link_process(
         self, owner: str, board_name: str, runtime_id: str, params: Any, context: Any
-    ) -> Any: ...
+    ) -> dict[str, Any]:
+        """Runs the runtime's pipeline as the run ``context`` names. Answers
+        with the ``result`` message to send: what it produced, and the run it
+        produced it in."""
+        ...
+
+    def link_process_service(
+        self,
+        owner: str,
+        board_name: str,
+        runtime_id: str,
+        service_uuid: str,
+        params: Any,
+        context: Any,
+        done: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Begins the runtime's pipeline at one service, as the run ``context``
+        names. Returns once the work is taken — raising when it cannot be —
+        and hands ``done`` the ``result`` message when the pipeline finishes."""
+        ...
 
 
 def join_url_for(coordinator_url: str) -> str:
@@ -347,11 +367,22 @@ class _Link:
         )
         try:
             if binary is not None:
-                await ws.send_bytes(encode_frame({"type": "result"}, *binary))
+                # The header is the message without its value, so the run it
+                # belongs to travels in it either way.
+                header: dict[str, Any] = {"type": "result"}
+                if message.get("context") is not None:
+                    header["context"] = message["context"]
+                await ws.send_bytes(encode_frame(header, *binary))
             else:
                 await ws.send_str(self._dumps(message))
         except (ConnectionError, aiohttp.ClientError):
             pass
+
+    def _emit_later(self, message: dict[str, Any]) -> None:
+        """Sends what a pipeline finished with, from the loop it finished on."""
+        task = asyncio.get_running_loop().create_task(self.emit(message))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     async def emit(self, message: dict[str, Any]) -> None:
         """The runtime said something; only a welcomed link has anyone to tell."""
@@ -380,10 +411,10 @@ class _Link:
                 )
             except Exception as err:  # noqa: BLE001 - reported, never raised
                 print(
-                    f'[coordinator-link] Runtime "{runtime_id}" failed to process: {err}'
+                    f'[coordinator-link] Runtime "{runtime[2]}" failed to process: {err}'
                 )
                 return
-            await self._send(ws, {"type": "result", "data": result})
+            await self._send(ws, result)
             return
 
         if kind == "request":
@@ -428,8 +459,22 @@ class _Link:
             return described
         if op == "configureService":
             return await self._host.link_configure_service(
-                *runtime, str(request.get("serviceUuid")), request.get("config")
+                *runtime,
+                str(request.get("serviceUuid")),
+                request.get("config"),
+                request.get("context"),
             )
+        if op == "processService":
+            self._host.link_process_service(
+                *runtime,
+                str(request.get("serviceUuid")),
+                request.get("params"),
+                request.get("context"),
+                # What the pipeline made of it goes to the coordinator the way
+                # any of this runtime's output does.
+                self._emit_later,
+            )
+            return {"accepted": True}
         if op == "setState":
             state = request.get("state")
             return self._host.link_set_state(

@@ -295,8 +295,11 @@ class SubService:
         # at each boundary is what makes the path a listener hears the path it
         # can dial.
         self._release_pipeline_notifications = self._pipeline.register_notification_target(
+            # With the run it was reported in, which only the nested runtime
+            # knows when its pipeline was entered directly rather than through
+            # this service's own call.
             lambda n: self._host.notify(
-                n.payload, join_address(self.uuid, n.instance_id)
+                n.payload, join_address(self.uuid, n.instance_id), n.context
             )
             if self._host
             else None

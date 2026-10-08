@@ -25,8 +25,22 @@ AllowedOrigins = Union[str, list[str]]
 
 @dataclass
 class AuthenticatedUser:
+    """Who a verified token speaks for.
+
+    ``email`` is present only when the token carries one **and** says it is
+    verified, and is normalised the way the lists it is compared with are. An
+    address somebody merely typed while signing up is dropped rather than
+    carried: everything that reads it — the server's allowlist, a run's caller
+    — treats it as proof of who is asking.
+    """
+
     sub: str
     email: str | None = None
+
+
+def normalize_email(email: str) -> str:
+    """An email as the lists it is compared with keep it."""
+    return email.strip().lower()
 
 
 #: Owner key used when authentication is disabled. Every request collapses into
@@ -49,9 +63,9 @@ class AuthConfig:
     """How requests are authenticated.
 
     - ``jwt``  — verify an Auth0 bearer token against the JWKS for
-      ``domain``/``audience``. When ``allowed_emails`` is set, the token must
-      additionally carry a **verified** ``email`` claim that is on the list;
-      any other authenticated user of the tenant is rejected.
+      ``domain``/``audience``. When ``allowed_emails`` is set, owning anything
+      here additionally takes a **verified** ``email`` claim that is on the
+      list. It gates who may own, not who may be identified.
 
       ``audience`` may list several accepted values. The frontend sends its
       id_token, whose ``aud`` is the Auth0 *client id* of whichever application
@@ -94,7 +108,33 @@ def is_email_allowed(
     email = claims.get("email")
     if not isinstance(email, str) or claims.get("email_verified") is not True:
         return False
-    return email.strip().lower() in allowed_emails
+    return normalize_email(email) in allowed_emails
+
+
+def may_own(user: AuthenticatedUser, allowed_emails: list[str] | None) -> bool:
+    """The allowlist asked of somebody already identified. An identity carries
+    an email only when it was verified, so this is ``is_email_allowed`` without
+    the claims."""
+    if allowed_emails is None:
+        return True
+    return bool(user.email) and user.email in allowed_emails
+
+
+def identity_from_claims(claims: dict[str, Any]) -> AuthenticatedUser | None:
+    """What a token's claims say about who it speaks for, or None without a
+    ``sub``."""
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return None
+    email = claims.get("email")
+    # Dropped, not refused: a person whose address is unverified can still sign
+    # in wherever no list is asked.
+    verified = (
+        normalize_email(email)
+        if isinstance(email, str) and claims.get("email_verified") is True
+        else ""
+    )
+    return AuthenticatedUser(sub=sub, email=verified or None)
 
 
 def is_loopback_host(host: str) -> bool:
@@ -142,9 +182,28 @@ class Authenticator:
                 cache_keys=True,
             )
 
-    async def verify_token(self, token: str | None) -> AuthenticatedUser | None:
-        """Verify a raw token string (from a WebSocket ``?access_token=`` query
-        param or an Authorization bearer value). Returns the principal or None.
+    async def authorize_owner(self, token: str | None) -> AuthenticatedUser | None:
+        """``identify_token``, then the server's allowlist: whether this person
+        may own things here. What every route uses. The token is a raw string,
+        from a WebSocket ``?access_token=`` query param or an Authorization
+        bearer value."""
+        if self._config.mode == "none":
+            return AuthenticatedUser(sub=ANONYMOUS_SUB)
+        if token and self._resolve_opaque_token is not None:
+            # A session token was minted for somebody who had passed the
+            # allowlist, and carries no email to ask it of again.
+            opaque = self._resolve_opaque_token(token)
+            if opaque is not None:
+                return opaque
+        user = await self.identify_token(token)
+        if user is None or not may_own(user, self._config.allowed_emails):
+            return None
+        return user
+
+    async def identify_token(self, token: str | None) -> AuthenticatedUser | None:
+        """Who a raw token speaks for, and nothing about what they may do:
+        signature, audience and ``sub``, with the email only when it is
+        verified. Returns the principal or None.
         """
         if self._config.mode == "none":
             # Identity is irrelevant in no-auth mode; hand back a stable
@@ -181,12 +240,4 @@ class Authenticator:
         except Exception:
             return None
 
-        sub = decoded.get("sub")
-        if not isinstance(sub, str) or not sub:
-            return None
-        if not is_email_allowed(decoded, self._config.allowed_emails):
-            return None
-        email = decoded.get("email")
-        return AuthenticatedUser(
-            sub=sub, email=email if isinstance(email, str) else None
-        )
+        return identity_from_claims(decoded)

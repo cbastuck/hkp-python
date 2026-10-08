@@ -91,10 +91,10 @@ async def test_resolves_opaque_session_tokens_before_jwt_verification():
             AuthenticatedUser(sub="auth0|user-1") if token == "sess-1" else None
         ),
     )
-    assert await authenticator.verify_token("sess-1") == AuthenticatedUser(
+    assert await authenticator.authorize_owner("sess-1") == AuthenticatedUser(
         sub="auth0|user-1"
     )
-    assert await authenticator.verify_token(None) is None
+    assert await authenticator.authorize_owner(None) is None
 
 
 async def test_rejects_websocket_upgrades_without_valid_token_under_jwt_auth(servers):
@@ -199,16 +199,52 @@ def _jwt_authenticator(allowed_emails: list[str] | None = None):
 
 async def test_verifies_a_signed_jwt_and_extracts_the_principal():
     authenticator, sign = _jwt_authenticator()
-    token = sign({"sub": "auth0|u1", "aud": "test-audience", "email": "a@x.com"})
-    assert await authenticator.verify_token(token) == AuthenticatedUser(
+    token = sign(
+        {
+            "sub": "auth0|u1",
+            "aud": "test-audience",
+            "email": " A@X.com ",
+            "email_verified": True,
+        }
+    )
+    assert await authenticator.authorize_owner(token) == AuthenticatedUser(
         sub="auth0|u1", email="a@x.com"
     )
+
+
+async def test_carries_an_email_only_when_it_is_verified():
+    # Dropped, not refused: the person is still who their `sub` says, and an
+    # address nobody verified is not proof of anything.
+    authenticator, sign = _jwt_authenticator()
+    token = sign({"sub": "auth0|u1", "aud": "test-audience", "email": "a@x.com"})
+    assert await authenticator.identify_token(token) == AuthenticatedUser(
+        sub="auth0|u1"
+    )
+    assert await authenticator.authorize_owner(token) == AuthenticatedUser(
+        sub="auth0|u1"
+    )
+
+
+async def test_identifies_somebody_the_allowlist_would_not_let_own():
+    authenticator, sign = _jwt_authenticator(allowed_emails=["alice@example.com"])
+    token = sign(
+        {
+            "sub": "auth0|bob",
+            "aud": "test-audience",
+            "email": "bob@example.com",
+            "email_verified": True,
+        }
+    )
+    assert await authenticator.identify_token(token) == AuthenticatedUser(
+        sub="auth0|bob", email="bob@example.com"
+    )
+    assert await authenticator.authorize_owner(token) is None
 
 
 async def test_rejects_a_jwt_with_the_wrong_audience():
     authenticator, sign = _jwt_authenticator()
     token = sign({"sub": "auth0|u1", "aud": "other-audience"})
-    assert await authenticator.verify_token(token) is None
+    assert await authenticator.authorize_owner(token) is None
 
 
 async def test_enforces_the_email_allowlist_on_verified_jwts():
@@ -221,7 +257,7 @@ async def test_enforces_the_email_allowlist_on_verified_jwts():
             "email_verified": True,
         }
     )
-    assert await authenticator.verify_token(allowed) is not None
+    assert await authenticator.authorize_owner(allowed) is not None
 
     unverified = sign(
         {
@@ -231,7 +267,7 @@ async def test_enforces_the_email_allowlist_on_verified_jwts():
             "email_verified": False,
         }
     )
-    assert await authenticator.verify_token(unverified) is None
+    assert await authenticator.authorize_owner(unverified) is None
 
     unlisted = sign(
         {
@@ -241,7 +277,7 @@ async def test_enforces_the_email_allowlist_on_verified_jwts():
             "email_verified": True,
         }
     )
-    assert await authenticator.verify_token(unlisted) is None
+    assert await authenticator.authorize_owner(unlisted) is None
 
 
 # ── Email allowlist ────────────────────────────────────────────────────────────

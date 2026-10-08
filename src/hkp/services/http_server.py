@@ -586,7 +586,7 @@ class HttpServerSubservicesService:
         # chain afterwards continues it. Minting one here rather than letting
         # each leg mint its own is what keeps a request's trace joined up
         # instead of arriving as two unrelated runs sharing a timestamp.
-        run_context = new_run()
+        run_context = new_run("mount")
 
         # Whether the answer is already decided here, or is whatever the rest
         # of the outer chain makes of what this service emitted.

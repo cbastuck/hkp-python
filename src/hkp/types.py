@@ -114,6 +114,72 @@ class RuntimeDescriptor:
 class RuntimeNotification:
     instance_id: str
     payload: Any
+    context: "ProcessContext | None" = None
+
+
+@dataclass
+class Caller:
+    """Who took the action a run began with.
+
+    Stated by the server that verified their token, never read from what they
+    sent: a payload saying who its sender is proves nothing about them. A run
+    nobody began — a timer tick, a request arriving at a mount — has none, and
+    neither does anything on a server running without authentication, where
+    there is nobody to tell apart.
+    """
+
+    #: The token's ``sub``.
+    sub: str
+    #: Present only when the token carried a verified one; normalised.
+    email: str | None = None
+    #: What the board's member list calls that email. Set by a coordinator
+    #: that keeps such a list, and absent everywhere else — a name from the
+    #: token would be the person's own choice.
+    name: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        wire: dict[str, Any] = {"sub": self.sub}
+        if self.email:
+            wire["email"] = self.email
+        if self.name:
+            wire["name"] = self.name
+        return wire
+
+
+@dataclass(frozen=True)
+class PersonRunActor:
+    """The verified person acting in a run and their authority deadline."""
+
+    kind: Literal["person"]
+    sub: str
+    expires_at: int
+    email: str | None = None
+    name: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        wire: dict[str, Any] = {
+            "kind": self.kind,
+            "sub": self.sub,
+            "expiresAt": self.expires_at,
+        }
+        if self.email:
+            wire["email"] = self.email
+        if self.name:
+            wire["name"] = self.name
+        return wire
+
+
+@dataclass(frozen=True)
+class SourceRunActor:
+    """A run created without delegated person authority."""
+
+    kind: Literal["board", "mount", "local"]
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"kind": self.kind}
+
+
+RunActor = PersonRunActor | SourceRunActor
 
 
 @dataclass
@@ -136,6 +202,9 @@ class ProcessContext:
     #: Identifies one invocation of a board — one webhook, one timer tick, one
     #: user action — across every service and runtime it reaches.
     run_id: str
+    #: What is acting in this run. Only the person variant carries identity
+    #: and an authority deadline.
+    actor: RunActor
     #: The run this one was invoked from, for a nested pipeline. Absent on a run
     #: triggered from outside rather than from inside another run, which is what
     #: makes a trace reconstructable as a tree rather than a list.
@@ -175,6 +244,9 @@ class LogEntry:
     parent_run_id: str | None = None
     data: Any = None
     duration_ms: float | None = None
+    #: The ``sub`` of whoever began the run, when somebody did. Enough to
+    #: answer "who did this" from a board's log without it collecting addresses.
+    caller: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         """The entry as the other runtimes spell it.
@@ -195,6 +267,8 @@ class LogEntry:
         }
         if self.parent_run_id:
             wire["parentRunId"] = self.parent_run_id
+        if self.caller:
+            wire["caller"] = self.caller
         if self.data is not None:
             wire["data"] = self.data
         if self.duration_ms is not None:
@@ -211,7 +285,20 @@ class RuntimeHost(Protocol):
         context: "ProcessContext | None" = None,
     ) -> Any: ...
 
-    def notify(self, payload: Any, instance_id: str) -> None: ...
+    def notify(
+        self,
+        payload: Any,
+        instance_id: str,
+        context: "ProcessContext | None" = None,
+    ) -> None:
+        """Report something to whoever is watching.
+
+        Said from inside a run, it is reported as part of it. ``context`` names
+        the run instead where the report is being carried out of a nested
+        pipeline, which knows the run it was made in when the runtime around it
+        does not.
+        """
+        ...
 
     def emit_result(self, output: Any) -> None: ...
 

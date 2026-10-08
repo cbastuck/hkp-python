@@ -15,7 +15,6 @@ import asyncio
 from typing import Any
 
 from ..types import (
-    ProcessContext,
     JsonRecord,
     NotifyCallback,
     RuntimeHost,
@@ -166,11 +165,9 @@ class TimerService:
         # One-shot: schedule a delayed fire and return input immediately.
         if not self._periodic:
             delay_s = _duration_ms(self._one_shot_delay, self._one_shot_delay_unit) / 1000
-            # Delaying data does not make it a different arrival: what fires
-            # later is the run that handed this input over, resumed. Captured
-            # now because by then the call it belongs to is long gone.
-            context = self._host.current_context() if self._host else None
-            self._run_soon(self._tick_with_input(input, delay_s, context))
+            # The call passes through now; the later tick is a timer emission,
+            # not a delayed answer carrying the person who started it.
+            self._run_soon(self._tick_with_input(input, delay_s))
         return input
 
     def destroy(self) -> None:
@@ -218,9 +215,7 @@ class TimerService:
         self._running = False
         self._notify({"running": False})
 
-    async def _tick_with_input(
-        self, input: Any, delay_s: float, context: ProcessContext | None = None
-    ) -> None:
+    async def _tick_with_input(self, input: Any, delay_s: float) -> None:
         await asyncio.sleep(delay_s)
         trigger_count = self._counter + 1
         self._counter = trigger_count
@@ -233,7 +228,6 @@ class TimerService:
                 # No-op: the runtime already fans these out to its notification
                 # targets. Re-notifying through the host would deliver each twice.
                 lambda _n: None,
-                context,
             )
             self._host.emit_result(result)
 

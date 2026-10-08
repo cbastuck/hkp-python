@@ -376,6 +376,148 @@ async def test_is_driven_over_the_link_and_says_what_its_runtime_says(
     )
 
 
+ALICE = {"sub": "auth0|alice", "email": "alice@example.com", "name": "Alice"}
+
+
+def _seen_by(server, service_uuid: str = "mon-1") -> list[Any]:
+    """Records the context each call of a service runs under. The context
+    travels with the call rather than with the data, so this is the only way
+    to observe it from outside."""
+    runtime = server.runtime_app.get_runtime(board_space(OWNER, "doorbell"), "py")
+    service = runtime.get_service(service_uuid)
+    seen: list[Any] = []
+    process = service.process
+
+    def recording(data: Any, notify: Any) -> Any:
+        seen.append(runtime.current_context())
+        return process(data, notify)
+
+    service.process = recording
+    return seen
+
+
+async def test_takes_the_run_and_its_caller_from_the_coordinator_and_hands_them_back(
+    servers, coordinator
+):
+    # The link is the board's own, and the coordinator on it is what verified
+    # the person — so here, and nowhere else, a caller is taken as stated. It
+    # comes back with the result, which is how the board's next runtime learns
+    # who began the run.
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+    seen = _seen_by(server)
+    run = {
+        "runId": "run-1",
+        "actor": {
+            "kind": "person",
+            **ALICE,
+            "expiresAt": 9_999_999_999_999,
+        },
+    }
+
+    await coordinator.send(
+        {"type": "processRuntime", "params": {"n": 1}, "context": run}
+    )
+
+    await eventually(
+        lambda: any(event["type"] == "result" for event in coordinator.events),
+        "the result",
+    )
+    assert seen[0].run_id == "run-1"
+    assert seen[0].actor.to_wire() == run["actor"]
+    result = next(e for e in coordinator.events if e["type"] == "result")
+    assert result["context"] == run
+    # What the service said while it ran is the caller's to hear, and says so.
+    said = next(e for e in coordinator.events if e["type"] == "notification")
+    assert said["context"] == run
+
+
+async def test_a_run_nobody_began_names_nobody(servers, coordinator):
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+
+    await coordinator.send({"type": "processRuntime", "params": {"n": 1}})
+
+    await eventually(
+        lambda: any(event["type"] == "result" for event in coordinator.events),
+        "the result",
+    )
+    result = next(e for e in coordinator.events if e["type"] == "result")
+    assert result["context"]["actor"] == {"kind": "board"}
+    assert result["context"]["runId"]
+    said = next(e for e in coordinator.events if e["type"] == "notification")
+    assert said["context"]["actor"] == {"kind": "board"}
+
+
+async def test_begins_at_one_service_when_asked_and_says_what_came_of_it(
+    servers, coordinator
+):
+    # What a facade's process action means on a deployed board: the answer
+    # says the work was taken, and what the pipeline produced follows as the
+    # runtime's output, in the same run.
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    two = {
+        **PROVISION,
+        "services": [
+            {**PROVISION["services"][0], "uuid": "first"},
+            {**PROVISION["services"][0], "uuid": "second"},
+        ],
+    }
+    await coordinator.request("provision", **two)
+    first = _seen_by(server, "first")
+    second = _seen_by(server, "second")
+    run = {
+        "runId": "run-2",
+        "actor": {
+            "kind": "person",
+            **ALICE,
+            "expiresAt": 9_999_999_999_999,
+        },
+    }
+
+    answer = await coordinator.request(
+        "processService", serviceUuid="second", params={"n": 2}, context=run
+    )
+
+    assert answer["ok"] is True
+    assert answer["data"] == {"accepted": True}
+    await eventually(
+        lambda: any(event["type"] == "result" for event in coordinator.events),
+        "the result",
+    )
+    assert first == []
+    assert second[0].actor.to_wire() == run["actor"]
+    result = next(e for e in coordinator.events if e["type"] == "result")
+    assert result["data"] == {"n": 2}
+    assert result["context"] == run
+
+
+async def test_says_why_it_cannot_begin_at_a_service_that_is_not_there(
+    servers, coordinator
+):
+    server, _ = await servers()
+    await server.coordinator_links.introduce(
+        LinkRecord(OWNER, "doorbell", "py", coordinator.url, "hkpt_good")
+    )
+    await coordinator.request("provision", **PROVISION)
+
+    answer = await coordinator.request(
+        "processService", serviceUuid="nobody", params={}
+    )
+
+    assert answer["ok"] is False
+    assert 'no service "nobody"' in answer["error"]
+
+
 async def test_is_built_with_the_assets_the_coordinator_sends(servers, coordinator):
     server, _ = await servers()
     await server.coordinator_links.introduce(
@@ -423,7 +565,10 @@ async def test_bytes_arrive_as_bytes_and_leave_as_bytes(servers, coordinator):
 
     await eventually(lambda: coordinator.binary, "the result")
     header, shape, payload = coordinator.binary[0]
-    assert header == {"type": "result"}
+    # The header is the message without its value: what it is, and the run it
+    # was produced in — which a coordinator hands to the next runtime.
+    assert header["type"] == "result"
+    assert header["context"]["runId"]
     assert shape == {"kind": "bytes"}
     assert payload == sent
     # Nothing was also said as text.
