@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import time
 import uuid as _uuid
@@ -259,10 +260,14 @@ class HostedRuntime:
         self._result_targets: set[
             Callable[[Any, ProcessContext | None], None]
         ] = set()
-        #: The call being processed right now; see _with_context.
-        self._context: ProcessContext | None = None
-        #: Which service the pass is inside, so a log entry can name it.
-        self._current_service: str | None = None
+        #: The call being processed right now, and which service it is inside;
+        #: see _context and _with_context. Kept per thread: passes run on a
+        #: worker thread while services are configured on the server's loop,
+        #: and a service may report from a thread of its own. One field shared
+        #: between them would let a call that began on one thread restore a
+        #: context saved from another, and leave a finished run in place for
+        #: everything that followed.
+        self._call = threading.local()
         self._log_targets: set[Callable[[LogEntry], None]] = set()
         #: Whether log entries may carry their ``data`` payload.
         #:
@@ -481,6 +486,24 @@ class HostedRuntime:
     def current_context(self) -> ProcessContext | None:
         return self._context
 
+    @property
+    def _context(self) -> ProcessContext | None:
+        """The call this thread is processing, or None when it is in none."""
+        return getattr(self._call, "context", None)
+
+    @_context.setter
+    def _context(self, context: ProcessContext | None) -> None:
+        self._call.context = context
+
+    @property
+    def _current_service(self) -> str | None:
+        """Which service this thread's pass is inside, for a log entry to name."""
+        return getattr(self._call, "service", None)
+
+    @_current_service.setter
+    def _current_service(self, uuid: str | None) -> None:
+        self._call.service = uuid
+
     def process_from(
         self,
         start_after_uuid: str,
@@ -562,9 +585,16 @@ class HostedRuntime:
             mount_name=mount_name,
         )
 
-    def notify(self, payload: Any, instance_id: str) -> None:
+    def notify(
+        self,
+        payload: Any,
+        instance_id: str,
+        context: ProcessContext | None = None,
+    ) -> None:
         self._emit_notification(
-            RuntimeNotification(instance_id=instance_id, payload=payload),
+            RuntimeNotification(
+                instance_id=instance_id, payload=payload, context=context
+            ),
             lambda _: None,
         )
 
@@ -808,10 +838,11 @@ class HostedRuntime:
         the outer run, and when it returns the outer loop has more services to
         visit, so the context it was running under has to come back.
 
-        Safe as ambient state only because a pass is synchronous: it never
-        awaits, so no second call can interleave with this one and observe a
-        context that is not its own. A pass that awaited would need the context
-        threaded through the call instead.
+        Safe as ambient state only because a pass is synchronous and the state
+        is its thread's own: it never awaits, so no second call on the thread
+        can interleave with this one, and a call on another thread has a
+        context of its own to save and restore. A pass that awaited would need
+        the context threaded through the call instead.
         """
         previous = self._context
         self._context = context

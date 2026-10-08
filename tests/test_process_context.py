@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from hkp.runtime import HostedRuntime, child_run, new_run
+from hkp.services.sub_service import SubService
 from hkp.types import (
     JsonRecord,
+    PersonRunActor,
     ProcessContext,
     SourceRunActor,
     RuntimeConfiguration,
@@ -199,6 +203,129 @@ def test_gives_configure_the_context_supplied_by_the_framework() -> None:
 
     assert spies["a"].configured == [run, None]
     assert runtime.current_context() is None
+
+
+def person(sub: str = "auth0|member") -> ProcessContext:
+    return ProcessContext(
+        run_id=f"run-of-{sub}",
+        actor=PersonRunActor(
+            kind="person", sub=sub, expires_at=int(time.time() * 1000) + 60_000
+        ),
+    )
+
+
+class Waiter(ContextSpy):
+    """Holds its call open until told to go on, so another can overlap it."""
+
+    def __init__(self, config: ServiceConfiguration) -> None:
+        super().__init__(config)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def process(self, input: Any, _notify: Any = None) -> Any:
+        self.entered.set()
+        assert self.release.wait(5)
+        return super().process(input, _notify)
+
+    def configure(self, config: JsonRecord) -> JsonRecord:
+        if config.get("wait"):
+            self.entered.set()
+            assert self.release.wait(5)
+        return super().configure(config)
+
+
+def test_keeps_a_call_on_one_thread_out_of_a_call_on_another() -> None:
+    # A pass runs on a worker thread while a service is configured on the
+    # server's loop. Shared, the context each saved on the way in would be the
+    # other's, and whichever returned last would leave a finished run in place
+    # for every tick that followed.
+    runtime, spies = build(("slow", Waiter), ("after", ContextSpy))
+    slow = spies["slow"]
+    assert isinstance(slow, Waiter)
+
+    passing = threading.Thread(
+        target=lambda: runtime.process({}, lambda _n: None, person("auth0|anna"))
+    )
+    passing.start()
+    assert slow.entered.wait(5)
+
+    # Overlapping it from here: begun while the pass is inside its service,
+    # and seeing none of it.
+    assert runtime.current_context() is None
+    runtime.configure_service("after", {}, person("auth0|owner"))
+    assert runtime.current_context() is None
+
+    slow.release.set()
+    passing.join(5)
+
+    assert spies["after"].configured[-1].actor.sub == "auth0|owner"
+    assert spies["after"].seen[-1].actor.sub == "auth0|anna"
+    assert runtime.current_context() is None
+
+
+def test_leaves_no_run_behind_when_a_configure_outlasts_a_pass() -> None:
+    runtime, spies = build(("slow", Waiter), ("after", ContextSpy))
+    slow = spies["slow"]
+    assert isinstance(slow, Waiter)
+
+    configuring = threading.Thread(
+        target=lambda: runtime.configure_service(
+            "slow", {"wait": True}, person("auth0|owner")
+        )
+    )
+    configuring.start()
+    assert slow.entered.wait(5)
+
+    # A whole pass, begun and finished while the configure is still inside.
+    slow.process = lambda input, _notify=None: input  # type: ignore[method-assign]
+    runtime.process({}, lambda _n: None, person("auth0|anna"))
+
+    slow.release.set()
+    configuring.join(5)
+
+    # Neither is left for what runs next: a tick begins a run of its own.
+    assert runtime.current_context() is None
+    runtime.process_from("slow", {}, lambda _n: None)
+    assert spies["after"].seen[-1].actor.kind == "board"
+
+
+def test_reports_a_scoped_entry_as_the_run_that_entered_it() -> None:
+    # The runtime around the scope is never in a call here, so only the nested
+    # runtime knows whose run a report belongs to. Reported without it, a
+    # member's answer reads as the board's and is sent to everybody.
+    def create(config: ServiceConfiguration) -> Any:
+        if config.service_id == "sub-service":
+            return SubService(config, create)
+        return ContextSpy(config)
+
+    runtime = HostedRuntime(
+        RuntimeConfiguration(
+            id="test",
+            name="test",
+            services=[
+                ServiceConfiguration(
+                    service_id="sub-service",
+                    uuid="scope",
+                    state={"pipeline": [{"serviceId": "spy", "uuid": "inner"}]},
+                )
+            ],
+        ),
+        create,
+    )
+    actors: list[Any] = []
+    runtime.register_notification_target(
+        lambda n: actors.append(n.context.actor if n.context else None)
+        if n.instance_id == "scope.inner"
+        else None
+    )
+
+    runtime.process_at("scope.inner", {"n": 1}, lambda _n: None, person())
+
+    assert actors
+    assert all(
+        actor is not None and actor.kind == "person" and actor.sub == "auth0|member"
+        for actor in actors
+    )
 
 
 def test_child_run_descends_from_its_parent() -> None:

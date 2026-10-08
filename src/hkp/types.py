@@ -285,7 +285,20 @@ class RuntimeHost(Protocol):
         context: "ProcessContext | None" = None,
     ) -> Any: ...
 
-    def notify(self, payload: Any, instance_id: str) -> None: ...
+    def notify(
+        self,
+        payload: Any,
+        instance_id: str,
+        context: "ProcessContext | None" = None,
+    ) -> None:
+        """Report something to whoever is watching.
+
+        Said from inside a run, it is reported as part of it. ``context`` names
+        the run instead where the report is being carried out of a nested
+        pipeline, which knows the run it was made in when the runtime around it
+        does not.
+        """
+        ...
 
     def emit_result(self, output: Any) -> None: ...
 

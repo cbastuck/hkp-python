@@ -174,8 +174,11 @@ class NestedPipeline:
         # unique only inside its own pipeline, so each boundary prefixes its
         # owner on the way out. See address.py.
         self._release_notifications = self._runtime.register_notification_target(
+            # With the run it was reported in, which only the nested runtime
+            # knows when its pipeline was entered directly rather than through
+            # this service's own call.
             lambda n: self._host.notify(
-                n.payload, join_address(self._owner_uuid, n.instance_id)
+                n.payload, join_address(self._owner_uuid, n.instance_id), n.context
             )
             if self._host
             else None
