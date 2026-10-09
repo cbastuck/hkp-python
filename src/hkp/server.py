@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine
 
-import aiohttp_cors
 from aiohttp import WSMsgType, web
 
 from .auth import (
@@ -17,6 +16,12 @@ from .auth import (
     Authenticator,
     is_origin_allowed,
     owner_key_of,
+)
+from .origins import (
+    DEFAULT_ORIGINS,
+    admits_without_credential,
+    allows_origin,
+    allows_origin_without_credential,
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
@@ -123,7 +128,9 @@ class RuntimeServer:
 
     def __init__(self, options: dict[str, Any]) -> None:
         self._external_host: str = options.get("external_host", "127.0.0.1")
-        self._allowed_origins: AllowedOrigins = options.get("allowed_origins", "*")
+        self._allowed_origins: AllowedOrigins = options.get(
+            "allowed_origins", DEFAULT_ORIGINS
+        )
         # Tests and local dev default to no auth; __main__.py always resolves an
         # explicit config and fails closed for non-loopback binds (see
         # resolve_server_auth_config).
@@ -379,6 +386,20 @@ class RuntimeServer:
 
         is_upgrade = request.headers.get("Upgrade", "").strip().lower() == "websocket"
 
+        # A server without auth lets a request in for where it comes from, so
+        # it asks that this is not a foreign page; see origins.py. Answered
+        # with nothing a page could read — no CORS headers are set for it — so
+        # to the page that sent it this is what a server that is not there
+        # looks like.
+        if self._no_auth and not admits_without_credential(
+            request.headers.get("Origin"),
+            request.headers.get("Sec-Fetch-Site"),
+            request.headers.get("Host"),
+            self._allowed_origins,
+            [self._external_host],
+        ):
+            return web.Response(status=403)
+
         header = request.headers.get("Authorization")
         token = header[7:] if header and header.startswith("Bearer ") else None
         if is_upgrade:
@@ -396,11 +417,63 @@ class RuntimeServer:
         request[_AUTHENTICATED_USER_KEY] = user
         return await handler(request)
 
+    @property
+    def _no_auth(self) -> bool:
+        return self._auth_config.mode == "none"
+
+    def _page_may_read(self, origin: str | None) -> bool:
+        """Which page may read an answer: the one asking, when it is one this
+        server allows. Without auth there are no credentials, so ``*`` — any
+        page, with one — allows nobody."""
+        if self._no_auth:
+            return allows_origin_without_credential(origin, self._allowed_origins)
+        return allows_origin(origin, self._allowed_origins)
+
+    @web.middleware
+    async def _cors_middleware(self, request: web.Request, handler: Any) -> web.Response:
+        """States who may read an answer, in one place for every response — a
+        handler's, an error's, a preflight's — so that none can answer a page
+        the server does not allow. Mounts are left alone: what they send is
+        their pipeline's to decide."""
+        if request.path.startswith(f"{MOUNT_PREFIX}/"):
+            return await handler(request)
+
+        origin = request.headers.get("Origin")
+        allowed = bool(origin) and self._page_may_read(origin)
+
+        if request.method == "OPTIONS" and "Access-Control-Request-Method" in request.headers:
+            if not allowed:
+                return web.Response(status=403)
+            response = web.Response(status=200)
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            _allow_origin(response, origin)
+            return response
+
+        try:
+            response = await handler(request)
+        except web.HTTPException as error:
+            if allowed:
+                _allow_origin(error, origin)
+            raise
+        if allowed and not response.prepared:
+            _allow_origin(response, origin)
+            exposed = [name for name in response.headers if name.lower() != "vary"]
+            if exposed:
+                response.headers["Access-Control-Expose-Headers"] = ", ".join(exposed)
+        return response
+
     # ── App construction ───────────────────────────────────────────────────────
 
     def _build_app(self) -> web.Application:
         # Error middleware is outermost so it also renders auth failures.
-        app = web.Application(middlewares=[_error_middleware, self._auth_middleware])
+        app = web.Application(
+            middlewares=[
+                _error_middleware,
+                self._cors_middleware,
+                self._auth_middleware,
+            ]
+        )
 
         app.router.add_route("*", f"{MOUNT_PREFIX}/{{mount_id}}", self._mounts.handle)
         app.router.add_route(
@@ -454,29 +527,6 @@ class RuntimeServer:
 
         # WebSocket endpoint — matches /{runtimeId}
         app.router.add_get("/{runtime_id}", self._websocket_handler)
-
-        # CORS — honour the allowed-origins list and let the browser send the
-        # Authorization header on authenticated requests.
-        cors_origins = (
-            ["*"] if self._allowed_origins == "*" else list(self._allowed_origins)
-        )
-        cors = aiohttp_cors.setup(
-            app,
-            defaults={
-                origin: aiohttp_cors.ResourceOptions(
-                    allow_credentials=True,
-                    expose_headers="*",
-                    allow_headers=["Content-Type", "Authorization"],
-                    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-                )
-                for origin in cors_origins
-            },
-        )
-        for route in list(app.router.routes()):
-            try:
-                cors.add(route)
-            except ValueError:
-                pass  # some routes (e.g. OPTIONS added by cors itself) may already be registered
 
         return app
 
@@ -1457,6 +1507,13 @@ def _json_placeholder(value: Any) -> Any:
 
 
 # ── Middleware ─────────────────────────────────────────────────────────────────
+
+
+def _allow_origin(response: web.StreamResponse, origin: str | None) -> None:
+    """Lets the page at ``origin`` read ``response``."""
+    response.headers["Access-Control-Allow-Origin"] = origin or ""
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
 
 
 @web.middleware
