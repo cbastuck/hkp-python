@@ -41,7 +41,7 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `PORT`            | `8080`      | TCP port to listen on                                         |
 | `HOST`            | `0.0.0.0`   | Bind address                                                  |
 | `EXTERNAL_HOST`   | `127.0.0.1` | Host used in `outputUrl` / WebSocket URLs returned to clients |
-| `ALLOWED_ORIGINS` | `*`         | CORS + WebSocket Origin allowlist (comma-separated)           |
+| `ALLOWED_ORIGINS` | the Readymade apps and pages served from this machine | Browser origins that may call this server, comma-separated; replaces the default. `*` allows any page that carries a token, never one that carries none. See *Who may call from a browser* |
 | `AUTH0_DOMAIN`    | —           | Auth0 tenant domain; enables JWT auth together with `AUTH0_AUDIENCE` |
 | `AUTH0_AUDIENCE`  | —           | Accepted `aud` claims, comma-separated — the client id of each Auth0 application whose users this runtime serves (the frontend sends the ID token) |
 | `ALLOWED_EMAILS`  | —           | Comma-separated email allowlist; requires Auth0 config, matched against the **verified** `email` claim |
@@ -61,6 +61,19 @@ Example:
 ```bash
 PORT=9000 EXTERNAL_HOST=myhost.local python3 -m hkp
 ```
+
+### Who may call from a browser
+
+The same rule as hkp-node, row for row (`src/hkp/origins.py`). A server
+reachable only from its own machine is still reachable by every page open in a
+browser on that machine, so a server running **without authentication** lets a
+request in only when it does not come from a foreign page: its `Origin` is
+absent (a caller that is not a browser) or one the server allows — by default
+the Readymade apps and any page served from this machine, otherwise exactly
+what `ALLOWED_ORIGINS` names — and its `Host` is an address, `localhost` or
+`EXTERNAL_HOST`. Anything else is answered `403` with nothing a page can read.
+To use a local server from the playground on the public website, start it with
+`ALLOWED_ORIGINS=https://readymadeit.com`. Mounts are not subject to this.
 
 ### Authentication
 

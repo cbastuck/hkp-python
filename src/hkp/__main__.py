@@ -6,7 +6,8 @@ import secrets
 import sys
 from pathlib import Path
 
-from .auth import AllowedOrigins, AuthConfig, is_loopback_host
+from .auth import AuthConfig, is_loopback_host
+from .origins import parse_allowed_origins
 from .server import create_runtime_server
 
 
@@ -96,13 +97,6 @@ def _parse_audiences(value: str | None) -> list[str]:
     return [audience for audience in audiences if audience]
 
 
-def _parse_allowed_origins(value: str | None) -> AllowedOrigins:
-    if not value or value.strip() == "*":
-        return "*"
-    origins = [origin.strip() for origin in value.split(",")]
-    return [origin for origin in origins if origin]
-
-
 def _is_dev_checkout() -> bool:
     """A development checkout runs from the source tree; an installed package
     runs from site-packages/dist-packages. Only the former may opt out of
@@ -173,7 +167,7 @@ async def main() -> None:
     port = _read_integer(os.environ.get("PORT"), 8080)
     host = os.environ.get("HOST", "0.0.0.0")
     external_host = os.environ.get("EXTERNAL_HOST", "127.0.0.1")
-    allowed_origins = _parse_allowed_origins(os.environ.get("ALLOWED_ORIGINS"))
+    allowed_origins = parse_allowed_origins(os.environ.get("ALLOWED_ORIGINS"))
     auth_config = resolve_server_auth_config(host)
 
     server = create_runtime_server(

@@ -19,8 +19,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
-# "*" reflects any origin (only sensible for local/no-auth development).
-AllowedOrigins = Union[str, list[str]]
+from .origins import AllowedOrigins, allows_origin
 
 
 @dataclass
@@ -140,26 +139,29 @@ def identity_from_claims(claims: dict[str, Any]) -> AuthenticatedUser | None:
 def is_loopback_host(host: str) -> bool:
     """True when the bind address is reachable only from the local machine.
 
-    A loopback bind is itself an access-control boundary — nothing off-machine
-    can connect — so running without authentication there is safe.
+    A loopback bind keeps other machines out — nothing off-machine can
+    connect — which is why running without authentication is permitted there.
+    It does not keep out a page in a browser on this machine; origins.py does.
     """
     h = host.strip().lower()
     return h in ("localhost", "::1", "[::1]") or h.startswith("127.")
 
 
 def is_origin_allowed(origin: str | None, allowed: AllowedOrigins) -> bool:
-    """Cross-Site WebSocket Hijacking protection.
+    """Cross-Site WebSocket Hijacking protection, for an upgrade that carries
+    a credential.
 
     Browsers always send an Origin header on the WS handshake, so a mismatched
     one is a cross-site attempt and is rejected. Non-browser clients (e.g. the
     coordinator) send no Origin; they are allowed through here and gated by
     the token check instead.
+
+    An upgrade that carries no credential is asked more of; see
+    ``admits_without_credential`` in origins.py.
     """
-    if allowed == "*":
-        return True
     if origin is None:
         return True
-    return origin in allowed
+    return allows_origin(origin, allowed)
 
 
 class Authenticator:
