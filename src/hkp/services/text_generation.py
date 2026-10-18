@@ -47,6 +47,7 @@ import urllib.request
 from typing import Any
 
 from ..data import TextData
+from ..egress import refusal_in, urlopen
 from ..types import JsonRecord, NotifyCallback, ServiceConfiguration, ServiceRegistryEntry
 
 TEXT_GENERATION_DESCRIPTOR = ServiceRegistryEntry(
@@ -89,7 +90,7 @@ def _post_json(url: str, payload: JsonRecord, timeout: float) -> JsonRecord:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -106,7 +107,7 @@ def _post_json_stream(url: str, payload: JsonRecord, timeout: float) -> Any:
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urlopen(request, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line.startswith("data:"):
@@ -357,7 +358,12 @@ class TextGenerationService:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:200]
             return self._error(notify, f"server returned HTTP {exc.code}: {detail}")
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError) as exc:
+            # Refused here, not unreachable: telling the person to start a
+            # server would be advice about the wrong problem.
+            refused = refusal_in(exc)
+            if refused:
+                return self._error(notify, str(refused))
             return self._error(notify, server_hint(self._server_url))
 
         return self._emit_result(response, started, notify)

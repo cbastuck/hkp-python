@@ -49,6 +49,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from .egress import refusal_in
+from .egress import urlopen as egress_urlopen
+
 
 ASSET_SCHEME = "hkp-asset://"
 
@@ -254,7 +257,7 @@ class AssetStore:
         self._max_bytes = max_bytes
         self._max_cache_bytes = max_cache_bytes
         self._timeout_s = timeout_s
-        self._open = opener or urllib.request.urlopen
+        self._open = opener or egress_urlopen
         # Services resolve on worker threads and the server pushes on its loop.
         self._lock = threading.RLock()
 
@@ -388,6 +391,9 @@ class AssetStore:
                 return cached.asset.content, cached.etag
             raise _Refused(f"{url} answered {error.code}") from error
         except urllib.error.URLError as error:
+            refused = refusal_in(error)
+            if refused:
+                raise _Refused(f"{url}: {refused}") from error
             raise _Refused(f"{url} is unreachable: {error.reason}") from error
         except TimeoutError as error:
             raise _Refused(f"{url} did not answer in time") from error

@@ -44,6 +44,8 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `PORT`            | `8080`      | TCP port to listen on                                         |
 | `HOST`            | `0.0.0.0`   | Bind address                                                  |
 | `EXTERNAL_HOST`   | `127.0.0.1` | Host used in `outputUrl` / WebSocket URLs returned to clients |
+| `HKP_EGRESS`      | unset — boards reach any address | `public` makes this a hosted server: a destination a board names (an HTTP Client's URL, an asset, a model's base URL) is reached only when every address its name resolves to is a public internet address — never this host, a private network or a cloud metadata endpoint. Checked on the address each connection opens to, redirects included. Set it on any server other people's boards run on |
+| `HKP_EGRESS_ALLOW` | — | Comma-separated addresses or ranges (`10.0.0.5`, `10.1.0.0/16`, `fd00::/8`) a hosted server reaches anyway. Addresses, not names: an allowed name could be repointed |
 | `ALLOWED_ORIGINS` | the Readymade apps and pages served from this machine | Browser origins that may call this server, comma-separated; replaces the default. `*` allows any page that carries a token, never one that carries none. See *Who may call from a browser* |
 | `AUTH0_DOMAIN`    | —           | Auth0 tenant domain; enables JWT auth together with `AUTH0_AUDIENCE` |
 | `AUTH0_AUDIENCE`  | —           | Accepted `aud` claims, comma-separated — the client id of each Auth0 application whose users this runtime serves (the frontend sends the ID token) |
