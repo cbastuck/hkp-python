@@ -2,7 +2,12 @@
 # The dependency list itself lives in pyproject.toml (single source of truth):
 #   [project.dependencies]              — runtime deps (aiohttp, ...)
 #   [project.optional-dependencies].asr — speech-to-text (faster-whisper, numpy)
+#   [project.optional-dependencies].tts — text-to-speech (kokoro-onnx, numpy)
+#   [project.optional-dependencies].mp3 — mp3 encoding for audio-encode (lameenc)
 #   [project.optional-dependencies].dev — test tooling (pytest, ...)
 #
+# Not included: llm (llama-cpp-python), which compiles a native library on
+# install; add it with pip install -e ".[llm]" when a board needs it.
+#
 # Usage:  pip install -r requirements.txt
--e .[asr,dev]
+-e .[asr,tts,mp3,dev]

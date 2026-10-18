@@ -117,6 +117,9 @@ class RuntimeNotification:
     context: "ProcessContext | None" = None
 
 
+CallerRole = Literal["owner", "member"]
+
+
 @dataclass
 class Caller:
     """Who took the action a run began with.
@@ -136,6 +139,9 @@ class Caller:
     #: that keeps such a list, and absent everywhere else — a name from the
     #: token would be the person's own choice.
     name: str | None = None
+    #: What they are to the board: its ``owner``, in whose tenant it runs, or a
+    #: ``member`` its list admitted. Stated by whoever admitted them.
+    role: CallerRole | None = None
 
     def to_wire(self) -> dict[str, Any]:
         wire: dict[str, Any] = {"sub": self.sub}
@@ -143,6 +149,8 @@ class Caller:
             wire["email"] = self.email
         if self.name:
             wire["name"] = self.name
+        if self.role:
+            wire["role"] = self.role
         return wire
 
 
@@ -155,6 +163,7 @@ class PersonRunActor:
     expires_at: int
     email: str | None = None
     name: str | None = None
+    role: CallerRole | None = None
 
     def to_wire(self) -> dict[str, Any]:
         wire: dict[str, Any] = {
@@ -166,6 +175,8 @@ class PersonRunActor:
             wire["email"] = self.email
         if self.name:
             wire["name"] = self.name
+        if self.role:
+            wire["role"] = self.role
         return wire
 
 

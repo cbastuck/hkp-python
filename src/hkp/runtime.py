@@ -95,7 +95,9 @@ def caller_of(user: AuthenticatedUser | None) -> Caller | None:
     """
     if user is None or user.sub == ANONYMOUS_SUB:
         return None
-    return Caller(sub=user.sub, email=user.email or None)
+    # A client holding a token reaches only its own tenant's runtimes, so it
+    # is their owner; a member arrives through a coordinator, which says so.
+    return Caller(sub=user.sub, email=user.email or None, role="owner")
 
 
 def context_for_client(
@@ -117,6 +119,7 @@ def context_for_client(
             sub=caller.sub,
             email=caller.email,
             name=caller.name,
+            role=caller.role,
             expires_at=int(time.time() * 1000) + DEFAULT_PERSON_RUN_TTL_MS,
         )
         if caller is not None
@@ -135,10 +138,12 @@ def caller_from_wire(value: Any) -> Caller | None:
         return None
     email = value.get("email")
     name = value.get("name")
+    role = value.get("role")
     return Caller(
         sub=sub,
         email=email if isinstance(email, str) and email else None,
         name=name if isinstance(name, str) and name else None,
+        role=role if role in ("owner", "member") else None,
     )
 
 
@@ -155,6 +160,7 @@ def actor_from_wire(value: Any) -> RunActor | None:
             sub=caller.sub if caller is not None else "",
             email=caller.email if caller is not None else None,
             name=caller.name if caller is not None else None,
+            role=caller.role if caller is not None else None,
             expires_at=(
                 int(expires_at)
                 if isinstance(expires_at, (int, float))

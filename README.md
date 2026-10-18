@@ -10,7 +10,7 @@ From the hkp-python directory:
 # 1. Create the venv (or reuse the existing .venv from run_tests.sh)
 python3 -m venv .venv
 
-# 2. Install the package with all extras (ASR + dev tooling)
+# 2. Install the package with its extras (speech-to-text, text-to-speech, mp3, dev tooling)
 .venv/bin/pip install -r requirements.txt
 
 # 3. Start the runtime (no need to activate the venv)
@@ -25,6 +25,9 @@ You should see `hkp-python listening on http://127.0.0.1:8080`.
 ```bash
 pip install -e .          # base runtime only
 pip install -e ".[asr]"   # + speech-to-text (faster-whisper, numpy)
+pip install -e ".[tts]"   # + text-to-speech (kokoro-onnx, numpy)
+pip install -e ".[mp3]"   # + mp3 encoding for audio-encode (lameenc)
+pip install -e ".[llm]"   # + local LLM inference (llama-cpp-python); not in requirements.txt
 pip install -e ".[dev]"   # + test tooling
 ```
 

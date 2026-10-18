@@ -43,6 +43,7 @@ FORGED = {
         "sub": "auth0|bob",
         "email": "bob@example.com",
         "name": "Bob",
+        "role": "member",
         "expiresAt": 9_999_999_999_999,
     },
 }
@@ -244,6 +245,8 @@ def test_never_reads_a_caller_from_a_clients_context():
     assert actor.kind == "person"
     assert actor.sub == ALICE.sub
     assert actor.email == ALICE.email
+    # Acting in their own tenant, whatever the context claimed.
+    assert actor.role == "owner"
     assert context_for_client(None, ALICE).run_id
 
 
@@ -289,7 +292,7 @@ def test_says_a_run_as_another_runtime_is_told_it():
 def test_states_no_caller_for_the_anonymous_tenant():
     assert caller_of(AuthenticatedUser(sub="anonymous")) is None
     assert caller_of(None) is None
-    assert caller_of(CAROL) == Caller(sub=CAROL.sub)
+    assert caller_of(CAROL) == Caller(sub=CAROL.sub, role="owner")
 
 
 def test_hands_the_caller_down_to_a_child_run():
