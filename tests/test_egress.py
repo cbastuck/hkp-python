@@ -114,6 +114,8 @@ def test_public_addresses(address: str) -> None:
         "fc00::1",
         "fd00:ec2::254",
         "ff02::1",
+        "::127.0.0.1",
+        "64:ff9b:1::a9fe:a9fe",
         # IPv6 forms carrying an IPv4 address are judged by the IPv4 inside.
         "::ffff:127.0.0.1",
         "::ffff:7f00:1",

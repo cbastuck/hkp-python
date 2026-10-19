@@ -39,7 +39,11 @@ import aiohttp
 
 # What is not the public internet: this host, private networks, link-local
 # (where the metadata endpoints are), shared address space, and what is not an
-# address one connects to at all.
+# address one connects to at all. ``::/96`` is the deprecated IPv4-compatible
+# form (``::127.0.0.1``); ``64:ff9b:1::/48`` is a network's own NAT64 prefix,
+# which may translate to private IPv4 and puts the IPv4 address where that
+# network chose, so the whole range is refused rather than judged by what it
+# carries.
 _NOT_PUBLIC = [
     ipaddress.ip_network(text)
     for text in (
@@ -54,11 +58,12 @@ _NOT_PUBLIC = [
         "198.18.0.0/15",
         "224.0.0.0/4",
         "240.0.0.0/4",
-        "::/128",
+        "::/96",
         "::1/128",
         "fe80::/10",
         "fc00::/7",
         "ff00::/8",
+        "64:ff9b:1::/48",
     )
 ]
 
