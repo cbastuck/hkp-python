@@ -233,11 +233,18 @@ class Authenticator:
 
         try:
             signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+            # The same checks in every runtime (hkp-node's auth.ts, hkp-rt's
+            # http/auth.cpp, the website's auth.php): RS256 only, the issuer
+            # the keys came from, one of the accepted audiences, and an expiry
+            # and a subject that must be there, not merely valid when present.
             decoded = jwt.decode(
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
                 audience=self._config.audience,
+                issuer=f"https://{self._config.domain}/",
+                leeway=60,
+                options={"require": ["exp", "iss", "sub"]},
             )
         except Exception:
             return None

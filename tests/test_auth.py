@@ -6,6 +6,7 @@ opaque session token locally, so the JWKS endpoint is never contacted.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import aiohttp
@@ -120,6 +121,45 @@ async def test_mints_session_token_and_accepts_it_on_ws_authorization_header(ser
     assert outcome == "open"
 
 
+async def test_a_ticket_opens_a_runtimes_socket_once_without_the_token_in_the_address(
+    servers,
+):
+    server, base_url = await servers({"auth": JWT_AUTH})
+    server._session_tokens["sess-1"] = SessionToken(sub="auth0|user-1", runtime_id="rt-1")
+    bearer = {"Authorization": "Bearer sess-1"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{base_url}/runtimes",
+            json={"id": "rt-1", "name": "Python", "services": []},
+            headers=bearer,
+        ) as resp:
+            assert resp.status == 200
+        async with session.post(f"{base_url}/ws-tickets") as resp:
+            assert resp.status == 401
+        async with session.post(f"{base_url}/ws-tickets", headers=bearer) as resp:
+            assert resp.status == 200
+            minted = await resp.json()
+    assert minted["expiresInMs"] == 30_000
+
+    assert await _ws_outcome(base_url, f"/rt-1?ticket={minted['ticket']}") == "open"
+    # Used: it opens nothing again.
+    assert await _ws_outcome(base_url, f"/rt-1?ticket={minted['ticket']}") == "rejected"
+    assert await _ws_outcome(base_url, "/rt-1?ticket=made-up") == "rejected"
+
+
+def test_a_ticket_is_worth_nothing_once_its_time_is_up():
+    from hkp.ws_tickets import TICKET_TTL_SECONDS, WsTickets
+
+    clock = [100.0]
+    tickets: WsTickets[str] = WsTickets(now=lambda: clock[0])
+    fresh = tickets.mint("alice")
+    stale = tickets.mint("alice")
+    assert tickets.redeem(fresh) == "alice"
+    assert tickets.redeem(fresh) is None
+    clock[0] += TICKET_TTL_SECONDS + 1
+    assert tickets.redeem(stale) is None
+
+
 async def test_minted_session_token_authenticates_http_under_jwt_auth(servers):
     """Under JWT auth a minted opaque token must be accepted without ever
     contacting the JWKS endpoint (it resolves locally, before JWT verify)."""
@@ -191,8 +231,11 @@ def _jwt_authenticator(allowed_emails: list[str] | None = None):
     authenticator = Authenticator(config)
     authenticator._jwks_client = _StubJwksClient(private_key.public_key())
 
-    def sign(claims: dict[str, Any]) -> str:
-        return pyjwt.encode(claims, private_key, algorithm="RS256")
+    def sign(claims: dict[str, Any], **header: Any) -> str:
+        # What Auth0 always sets, unless a test says otherwise; None leaves it out.
+        full = {"iss": "https://auth.invalid/", "exp": int(time.time()) + 3600, **claims}
+        full = {name: value for name, value in full.items() if value is not None}
+        return pyjwt.encode(full, private_key, algorithm="RS256", headers=header or None)
 
     return authenticator, sign
 
@@ -239,6 +282,50 @@ async def test_identifies_somebody_the_allowlist_would_not_let_own():
         sub="auth0|bob", email="bob@example.com"
     )
     assert await authenticator.authorize_owner(token) is None
+
+
+async def test_rejects_a_jwt_without_an_expiry_or_past_it():
+    authenticator, sign = _jwt_authenticator()
+    claims = {"sub": "auth0|u1", "aud": "test-audience"}
+    assert await authenticator.identify_token(sign({**claims, "exp": None})) is None
+    assert await authenticator.identify_token(
+        sign({**claims, "exp": int(time.time()) - 3600})
+    ) is None
+    # Within the minute of clock skew every runtime allows.
+    assert await authenticator.identify_token(
+        sign({**claims, "exp": int(time.time()) - 30})
+    ) is not None
+
+
+async def test_rejects_a_jwt_from_another_issuer_or_none():
+    authenticator, sign = _jwt_authenticator()
+    claims = {"sub": "auth0|u1", "aud": "test-audience"}
+    assert await authenticator.identify_token(
+        sign({**claims, "iss": "https://elsewhere.invalid/"})
+    ) is None
+    assert await authenticator.identify_token(sign({**claims, "iss": None})) is None
+
+
+async def test_rejects_a_jwt_without_a_subject_or_not_yet_valid():
+    authenticator, sign = _jwt_authenticator()
+    assert await authenticator.identify_token(sign({"aud": "test-audience"})) is None
+    assert await authenticator.identify_token(
+        sign({"sub": "auth0|u1", "aud": "test-audience", "nbf": int(time.time()) + 3600})
+    ) is None
+
+
+async def test_rejects_a_jwt_signed_another_way():
+    import jwt as pyjwt
+
+    authenticator, _ = _jwt_authenticator()
+    claims = {
+        "sub": "auth0|u1",
+        "aud": "test-audience",
+        "iss": "https://auth.invalid/",
+        "exp": int(time.time()) + 3600,
+    }
+    hmac = pyjwt.encode(claims, "a shared secret long enough for HS256 32b", algorithm="HS256")
+    assert await authenticator.identify_token(hmac) is None
 
 
 async def test_rejects_a_jwt_with_the_wrong_audience():

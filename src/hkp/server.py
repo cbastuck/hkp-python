@@ -20,11 +20,13 @@ from .auth import (
 from .origins import (
     DEFAULT_ORIGINS,
     admits_without_credential,
+    is_forwarded,
     allows_origin,
     allows_origin_without_credential,
 )
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
+from .ws_tickets import TICKET_TTL_SECONDS, WsTickets
 from .runtime import set_server_loop
 from .secrets import SecretEntry, read_secrets_payload, referenced_secrets
 from .assets import read_assets_payload
@@ -164,6 +166,9 @@ class RuntimeServer:
         # still resolves its own session tokens first, by passing the resolver it
         # owns into whatever this returns.
         build_authenticator = options.get("build_authenticator")
+        # What a browser opens a WebSocket with instead of its token; see
+        # ws_tickets.py.
+        self._ws_tickets: WsTickets[AuthenticatedUser] = WsTickets()
         self._authenticator = (
             build_authenticator(self._resolve_session_token)
             if build_authenticator
@@ -397,6 +402,7 @@ class RuntimeServer:
             request.headers.get("Host"),
             self._allowed_origins,
             [self._external_host],
+            forwarded=is_forwarded(request.headers),
         ):
             return web.Response(status=403)
 
@@ -407,8 +413,18 @@ class RuntimeServer:
                 request.headers.get("Origin"), self._allowed_origins
             ):
                 raise web.HTTPForbidden()
-            # Non-browser clients (the coordinator) use the standard
-            # Authorization header, keeping the token out of URLs/logs.
+            # A browser cannot set a header on a handshake, so it presents a
+            # ticket it was given for its token (ws_tickets.py). A client that
+            # can sends the token itself; ``?access_token=`` is what browsers
+            # sent before tickets, and is still taken, though it puts the token
+            # where logs keep it.
+            ticket = request.query.get("ticket")
+            if ticket is not None:
+                holder = self._ws_tickets.redeem(ticket)
+                if holder is None:
+                    raise web.HTTPUnauthorized()
+                request[_AUTHENTICATED_USER_KEY] = holder
+                return await handler(request)
             token = token or request.query.get("access_token")
 
         user = await self._authenticator.authorize_owner(token)
@@ -488,6 +504,7 @@ class RuntimeServer:
         )
 
         app.router.add_get("/runtimes", self._get_runtimes)
+        app.router.add_post("/ws-tickets", self._post_ws_ticket)
         app.router.add_post("/runtimes", self._post_runtimes)
         app.router.add_delete("/runtimes", self._delete_runtimes)
 
@@ -976,6 +993,16 @@ class RuntimeServer:
                 # deploys: against a server that keeps them together, leaving
                 # the board it deployed would stop it.
                 "boardRuntimes": True,
+            }
+        )
+
+    async def _post_ws_ticket(self, request: web.Request) -> web.Response:
+        """A ticket for a WebSocket, minted for whoever this request's token
+        let in, so the socket is opened without the token in its address."""
+        return web.json_response(
+            {
+                "ticket": self._ws_tickets.mint(request[_AUTHENTICATED_USER_KEY]),
+                "expiresInMs": int(TICKET_TTL_SECONDS * 1000),
             }
         )
 

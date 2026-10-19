@@ -97,8 +97,12 @@ hkp-node coordinator) works against both runtimes:
   `anonymous` tenant — identical to the pre-tenancy behaviour.
 - With `AUTH0_DOMAIN` + `AUTH0_AUDIENCE` set, every HTTP request needs
   `Authorization: Bearer <token>`; WebSocket upgrades take the token from the
-  Authorization header or `?access_token=` (browsers can't set WS headers) and
-  are Origin-checked against `ALLOWED_ORIGINS`.
+  Authorization header or, from a browser, `?ticket=` — a single-use ticket it
+  traded its token for at `POST /ws-tickets`, so the token is never in an
+  address (`?access_token=` is still taken from older clients) — and are
+  Origin-checked against `ALLOWED_ORIGINS`. A token must be RS256, issued by
+  `https://<AUTH0_DOMAIN>/`, for one of the audiences, with an expiry and a
+  subject.
 - `POST /runtimes/{id}/session-token` (JWT-gated) mints an opaque in-memory
   token bound to the calling user and that runtime. Tokens are purged when the
   runtime is removed. The coordinator no longer uses it — see below.

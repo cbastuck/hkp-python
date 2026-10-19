@@ -185,6 +185,16 @@ PROVISION = {
 }
 
 
+def test_a_link_has_a_ceiling_above_the_coordinators_frame_limit():
+    from hkp.coordinator_links import DEFAULT_MAX_FRAME_BYTES, socket_ceiling
+
+    assert socket_ceiling({}) > DEFAULT_MAX_FRAME_BYTES
+    assert socket_ceiling({"HKP_COORDINATOR_MAX_FRAME_BYTES": "0"}) == socket_ceiling({})
+    assert socket_ceiling({"HKP_COORDINATOR_MAX_FRAME_BYTES": "nonsense"}) == socket_ceiling({})
+    raised = 256 * 1024 * 1024
+    assert socket_ceiling({"HKP_COORDINATOR_MAX_FRAME_BYTES": str(raised)}) > raised
+
+
 def test_join_url_is_the_coordinators_join_endpoint():
     assert (
         join_url_for("http://127.0.0.1:8080/coordinator")

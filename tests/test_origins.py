@@ -22,6 +22,7 @@ from hkp.origins import (
     admits_without_credential,
     allows_origin,
     allows_origin_without_credential,
+    is_forwarded,
     is_known_host,
     is_loopback_origin,
     parse_allowed_origins,
@@ -138,6 +139,20 @@ def test_a_request_without_an_origin_is_refused_when_the_browser_says_cross_site
     assert admits(allowed, None, "same-origin")
     # An allowed page is allowed however the browser classifies the request.
     assert admits(allowed, "http://localhost:5173", "cross-site")
+
+
+def test_a_request_a_proxy_passed_on_is_not_let_in_for_where_it_comes_from():
+    allowed = parse_allowed_origins("")
+    assert not admits_without_credential(None, None, "127.0.0.1:8080", allowed, [], forwarded=True)
+    assert not admits_without_credential(
+        "saucer://embedded", None, "127.0.0.1:8080", allowed, [], forwarded=True
+    )
+
+    assert is_forwarded({"X-Forwarded-For": "203.0.113.9"})
+    assert is_forwarded({"Forwarded": "for=203.0.113.9"})
+    assert is_forwarded({"X-Real-IP": "203.0.113.9"})
+    assert not is_forwarded({"X-Forwarded-For": "  "})
+    assert not is_forwarded({})
 
 
 def test_a_server_is_addressed_by_an_address_localhost_or_a_name_it_was_given():
@@ -433,6 +448,18 @@ async def test_a_foreign_page_cannot_open_a_runtimes_socket(listening):
     )
     assert await rt.upgrade({"Origin": "http://localhost:5173"}) == "open"
     assert await rt.upgrade() == "open"
+
+
+async def test_a_request_a_proxy_on_this_machine_passed_on_is_refused(listening):
+    # nginx or Caddy in front of the server: every caller arrives from
+    # loopback, and says where it really came from in a header.
+    rt = await listening({"auth": NO_AUTH})
+    forwarded = {"X-Forwarded-For": "203.0.113.9"}
+
+    assert (await rt.send("POST", "/runtimes", headers=forwarded, json=RUNTIME)).status == 403
+    assert (await rt.send("GET", "/runtimes", headers={"Forwarded": "for=203.0.113.9"})).status == 403
+    assert await rt.upgrade({"X-Real-IP": "203.0.113.9"}) == "rejected"
+    assert await rt.runtime_count() == 0
 
 
 async def test_a_mount_is_reached_by_anyone_as_it_is_meant_to_be(listening):
