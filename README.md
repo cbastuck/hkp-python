@@ -4,32 +4,36 @@ asyncio port of the hkp-node runtime engine, built with [aiohttp](https://docs.a
 
 ## Setup
 
-From the hkp-python directory:
+hkp-python is managed with [uv](https://docs.astral.sh/uv/getting-started/installation/).
+The dependencies are listed in `pyproject.toml` and pinned in `uv.lock`, so every
+machine gets the same environment. From the hkp-python directory:
 
 ```bash
-# 1. Create the venv (or reuse the existing .venv from run_tests.sh)
-python3 -m venv .venv
+# 1. Install into .venv exactly what uv.lock pins: the runtime, its extras for
+#    speech-to-text, text-to-speech and mp3, and the test tooling
+uv sync
 
-# 2. Install the package with its extras (speech-to-text, text-to-speech, mp3, dev tooling)
-.venv/bin/pip install -r requirements.txt
-
-# 3. Start the runtime (no need to activate the venv)
-.venv/bin/hkp-python
+# 2. Start the runtime (no need to activate the venv)
+./run_server.sh           # or: uv run hkp-python
 ```
 
 You should see `hkp-python listening on http://127.0.0.1:8080`.
 
-`requirements.txt` is a thin pointer — the actual dependency list lives in
-`pyproject.toml`. To install selectively:
+`run_server.sh` and `run_tests.sh` sync `.venv` themselves before they start, so
+step 1 is only needed to install without running anything.
+
+A plain `uv sync` includes the `dev` group in `pyproject.toml`, which pulls in
+the `asr`, `tts` and `mp3` extras and the test tooling. Other combinations:
 
 ```bash
-pip install -e .          # base runtime only
-pip install -e ".[asr]"   # + speech-to-text (faster-whisper, numpy)
-pip install -e ".[tts]"   # + text-to-speech (kokoro-onnx, numpy)
-pip install -e ".[mp3]"   # + mp3 encoding for audio-encode (lameenc)
-pip install -e ".[llm]"   # + local LLM inference (llama-cpp-python); not in requirements.txt
-pip install -e ".[dev]"   # + test tooling
+uv sync --extra llm       # + local LLM inference (llama-cpp-python, compiles llama.cpp)
+uv sync --no-dev          # base runtime only, e.g. for a server
+uv sync --no-dev --extra tts --extra mp3   # base runtime with chosen extras
 ```
+
+`uv sync` makes `.venv` match exactly what it was asked for and removes anything
+else, so repeat `--extra llm` on every `uv sync` once you use it. `uv run` and the
+two scripts only add, never remove.
 
 ## Running the server
 
@@ -265,7 +269,7 @@ loads the model in-process via `llama-cpp-python`, so no external server is
 needed:
 
 ```bash
-pip install -e ".[llm]"
+uv sync --extra llm
 ```
 
 Configure `backend: "local"` plus `modelPath` (path to the `.gguf` file;
@@ -293,7 +297,7 @@ in-process via [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx)
 (onnxruntime — no PyTorch, faster than real time on CPU):
 
 ```bash
-pip install -e ".[tts]"
+uv sync    # the tts extra is part of the default install
 ```
 
 Model files (~310 MB onnx + ~27 MB voices, or ~88 MB with the
@@ -355,4 +359,6 @@ See `boards/skill-router-demo-board.json`,
 ./run_tests.sh -k map # filter by name
 ```
 
-The script creates `.venv` automatically if it does not exist.
+The script syncs `.venv` with `uv.lock` before it runs, and refuses a lockfile
+that no longer matches `pyproject.toml` — run `uv lock` after changing the
+dependencies.

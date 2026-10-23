@@ -14,7 +14,7 @@ from __future__ import annotations
 # Binary: consumes FloatRingBuffer; other inputs yield an error JSON
 # MixedData: not supported
 #
-# The ML dependencies are an optional extra:  pip install "hkp-python[asr]"
+# The ML dependencies are an optional extra:  uv sync --extra asr
 # The model is loaded lazily on first use (first call downloads it from
 # Hugging Face); progress is reported through notify() so the UI can show
 # loading/transcribing states.
@@ -37,7 +37,7 @@ _MODELS = ["tiny", "base", "small", "medium", "large-v3", "distil-large-v3"]
 _COMPUTE_TYPES = ["int8", "int8_float16", "float16", "float32"]
 _DEVICES = ["auto", "cpu", "cuda"]
 
-INSTALL_HINT = 'faster-whisper is not installed — run: pip install "hkp-python[asr]"'
+INSTALL_HINT = "faster-whisper is not installed — run in hkp-python: uv sync --extra asr"
 
 
 def _resample_linear(audio: Any, from_rate: int, to_rate: int) -> Any:

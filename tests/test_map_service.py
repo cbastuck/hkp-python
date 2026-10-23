@@ -89,10 +89,79 @@ def test_empty_template():
     assert create_map({"mode": "overwrite"}).process({"value": 1}) == {"value": 1}
 
 
-def test_returns_the_input_unchanged_when_an_expression_fails():
-    svc = create_map({"template": {"x=": "nope("}})
+# ── Missing reads, warnings and errors ────────────────────────────────────────
+# What a pass says about itself — the same in every runtime (browser Map.ts,
+# hkp-node map.ts, hkp-rt map.h).
 
-    assert svc.process({"value": 1}) == {"value": 1}
+
+def _reported(host: RecordingHost) -> list[Any]:
+    return [payload for _, payload in host.notifications]
+
+
+def test_a_read_that_found_nothing_maps_to_null_and_warns():
+    svc = create_map({"template": {"title=": "params.titel", "x=": "params.missing.deep"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"title": "Hello"}) == {"title": None, "x": None}
+    assert _reported(host) == [
+        {"warnings": ["title: params.titel not found", "x: params.missing not found"]}
+    ]
+
+
+def test_no_warning_for_a_read_a_fallback_covered_or_a_value_that_is_null():
+    svc = create_map({"template": {"slug=": "params.id || params.link", "none=": "params.none"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"link": "l", "none": None}) == {"slug": "l", "none": None}
+    assert _reported(host) == []
+
+
+def test_builds_the_template_without_input():
+    svc = create_map({"template": {"text=": "'Today is ' + string(1 + 1)"}})
+
+    assert svc.process(None) == {"text": "Today is 2"}
+
+
+def test_a_failing_term_stops_the_flow_says_why_and_clears_once_it_works():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({}) is None
+    svc.configure({"template": {"x=": "params.n"}})
+    assert svc.process({"n": 2}) == {"x": 2}
+    assert [p for p in _reported(host) if "error" in p] == [
+        {"error": "x: unknown function 'nope'"},
+        {"error": ""},
+    ]
+
+
+def test_an_array_input_fails_when_one_element_fails():
+    svc = create_map({"template": {"x=": "round(params.n) + nope()"}})
+
+    assert svc.process([{"n": 1}, {}]) is None
+
+
+def test_a_term_that_does_not_parse_is_said_when_configured():
+    svc = create_map()
+    host = RecordingHost()
+    svc.set_host(host)
+
+    svc.configure({"template": {"x=": "nope("}})
+
+    assert _reported(host)[1]["error"].startswith("x: invalid expression 'nope('")
+    assert svc.process({}) is None
+
+
+def test_a_term_in_a_structured_template_is_named_by_where_it_sits():
+    svc = create_map({"template": {"items": [{"title=": "params.titel"}]}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({}) == {"items": [{"title": None}]}
+    assert _reported(host) == [{"warnings": ["items.0.title: params.titel not found"]}]
 
 
 def test_a_missing_path_yields_null_rather_than_failing_the_mapping():

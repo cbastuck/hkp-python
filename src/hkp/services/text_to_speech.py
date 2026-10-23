@@ -13,7 +13,7 @@ from __future__ import annotations
 # Binary: emits FloatRingBuffer; non-text inputs yield an error JSON
 # MixedData: not supported
 #
-# The ML dependencies are an optional extra:  pip install "hkp-python[tts]"
+# The ML dependencies are an optional extra:  uv sync --extra tts
 # Model files (~310 MB onnx + ~27 MB voices) are downloaded lazily on first
 # use from the kokoro-onnx GitHub release; progress is reported through
 # notify() so the UI can show downloading/loading/generating states.
@@ -55,7 +55,7 @@ DEFAULT_SPEED = 1.0
 DEFAULT_LANG = "en-us"
 DEFAULT_MODEL_DIR = Path.home() / ".cache" / "hkp-python" / "kokoro"
 
-INSTALL_HINT = 'kokoro-onnx is not installed — run: pip install "hkp-python[tts]"'
+INSTALL_HINT = "kokoro-onnx is not installed — run in hkp-python: uv sync --extra tts"
 
 
 def _download(url: str, destination: Path) -> None:

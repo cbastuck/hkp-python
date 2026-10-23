@@ -56,7 +56,7 @@ def test_wav_needs_nothing_installed_and_says_what_it_holds() -> None:
 
 
 def test_mp3_is_an_mp3() -> None:
-    lameenc = pytest.importorskip("lameenc", reason='needs pip install "hkp-python[mp3]"')
+    lameenc = pytest.importorskip("lameenc", reason="needs uv sync --extra mp3")
     assert lameenc
 
     encoded = _service({"format": "mp3", "bitrate": 64}).process(_tone(0.5), _notify([]))

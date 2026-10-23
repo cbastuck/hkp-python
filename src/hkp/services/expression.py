@@ -22,6 +22,10 @@ it keep working.
 
     expression = Expression.parse("round(params.value * 2)")
     result = expression.evaluate(input)   # raises EvaluationError on failure
+
+A member of nothing is nothing: ``params.a.b`` with no ``a`` is ``None``, as in
+the browser, Node and C++ runtimes. Whoever wants to know which reads came up
+empty passes ``on_missing``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import random
 import re
 import time
 import uuid as uuid_module
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -500,6 +505,40 @@ def _callee_name(node: _Node | None) -> str | None:
     return None
 
 
+# Told the path of a read that found nothing — ``params.titel`` — during the
+# evaluation that asked for it, and only that one: a find/filter predicate
+# evaluated inside it reports nothing, as in the other runtimes.
+_on_missing: ContextVar[Callable[[str], None] | None] = ContextVar("_on_missing", default=None)
+
+
+def _path_of(node: _Node | None) -> str:
+    """How a read is named when it is reported: ``params.items[0].title``."""
+    if node is None:
+        return "…"
+    if node.kind == "identifier":
+        return node.name
+    if node.kind == "member":
+        obj = _path_of(node.left)
+        if not node.computed:
+            return f"{obj}.{node.name}"
+        if node.right is not None and node.right.kind == "literal":
+            return f"{obj}[{json_module.dumps(node.right.value)}]"
+        return f"{obj}[…]"
+    return "…"
+
+
+def _has_member(obj: Any, key: Any) -> bool:
+    """Whether ``_member_of`` finds something there, even an empty value."""
+    if isinstance(obj, (list, tuple, str)):
+        if key == "length":
+            return True
+        index = to_number(key)
+        return not math.isnan(index) and 0 <= index < len(obj)
+    if isinstance(obj, dict):
+        return (key if isinstance(key, str) else to_text(key)) in obj
+    return False
+
+
 def _member_of(obj: Any, key: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         if key == "length":
@@ -603,6 +642,12 @@ def _evaluate_node(node: _Node | None, scope: dict[str, Any]) -> Any:
     if node.kind == "member":
         obj = _evaluate_node(node.left, scope)
         key = _evaluate_node(node.right, scope) if node.computed else node.name
+        on_missing = _on_missing.get()
+        if on_missing is not None and not _has_member(obj, key):
+            # A read past a link that already came up empty was reported with it.
+            past_missing = obj is None and node.left is not None and node.left.kind == "member"
+            if not past_missing:
+                on_missing(_path_of(node))
         return _member_of(obj, key)
 
     if node.kind == "array":
@@ -660,8 +705,19 @@ class Expression:
     def parse(source: str) -> "Expression":
         return Expression(source, _Parser(source).parse())
 
-    def evaluate(self, params: Any = None, scope: dict[str, Any] | None = None) -> Any:
-        return _evaluate_node(self._root, scope if scope is not None else {"params": params})
+    def evaluate(
+        self,
+        params: Any = None,
+        scope: dict[str, Any] | None = None,
+        on_missing: Callable[[str], None] | None = None,
+    ) -> Any:
+        """``on_missing`` hears about every read that found nothing, once per
+        chain: in ``params.a.b.c`` with no ``a``, only ``params.a``."""
+        token = _on_missing.set(on_missing)
+        try:
+            return _evaluate_node(self._root, scope if scope is not None else {"params": params})
+        finally:
+            _on_missing.reset(token)
 
 
 # ── Builtins ───────────────────────────────────────────────────────────────────
@@ -861,20 +917,22 @@ def _builtins() -> dict[str, Callable[[list[Any]], Any]]:
 
 
 def compile_expression(source: Any) -> Callable[[Any], Any]:
-    """Compiles an expression source into a callable. Non-string sources are
-    constants and are returned as-is; a source that does not parse raises when
-    called, so the caller decides how a broken term is reported."""
+    """Compiles an expression source into a callable taking ``params`` and an
+    optional ``on_missing``. Non-string sources are constants and are returned
+    as-is; a source that does not parse raises when called and carries
+    ``parse_error``, so the caller decides how a broken term is reported."""
     if not isinstance(source, str):
-        return lambda params: source
+        return lambda params, on_missing=None: source
 
     try:
         expression = Expression.parse(source)
     except ParseError as error:
-        message = str(error)
+        parse_error = f"invalid expression {source!r}: {error}"
 
-        def broken(params: Any) -> Any:
-            raise EvaluationError(f"invalid expression {source!r}: {message}")
+        def broken(params: Any, on_missing: Any = None) -> Any:
+            raise EvaluationError(parse_error)
 
+        broken.parse_error = parse_error  # type: ignore[attr-defined]
         return broken
 
-    return expression.evaluate
+    return lambda params, on_missing=None: expression.evaluate(params, on_missing=on_missing)

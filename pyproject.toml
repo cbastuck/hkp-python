@@ -57,6 +57,12 @@ mp3 = [
     "lameenc>=1.7",
 ]
 
+# What a plain `uv sync` installs beside the runtime deps — uv syncs the `dev`
+# group unless told `--no-dev` — and so what run_tests.sh and run_server.sh run
+# with. llm stays opt-in: it compiles llama.cpp on install (`uv sync --extra llm`).
+[dependency-groups]
+dev = ["hkp-python[asr,tts,mp3,dev]"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/hkp"]
 

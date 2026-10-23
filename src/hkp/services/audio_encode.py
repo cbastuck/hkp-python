@@ -23,7 +23,7 @@ from __future__ import annotations
 # names would have to be told about both.
 #
 # `wav` needs nothing beyond the standard library and is always available.
-# `mp3` is an optional extra — pip install "hkp-python[mp3]" — because a board
+# `mp3` is an optional extra — uv sync --extra mp3 — because a board
 # that only ever plays audio back has no reason to carry an encoder; the two
 # formats are the same service because choosing between them is a board's
 # decision about size against fidelity, not a different job.
@@ -56,7 +56,7 @@ DEFAULT_QUALITY = 5
 DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_CHANNELS = 1
 
-INSTALL_HINT = 'lameenc is not installed — run: pip install "hkp-python[mp3]"'
+INSTALL_HINT = "lameenc is not installed — run in hkp-python: uv sync --extra mp3"
 
 
 def _to_int16(samples: array) -> bytes:
