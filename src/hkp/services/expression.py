@@ -793,6 +793,16 @@ def _at(args: list[Any]) -> Any:
     return array[int(abs(round(to_number(_arg(args, 1, 0))))) % len(array)]
 
 
+def _join(args: list[Any]) -> str:
+    """An array's elements as one text; an empty element is nothing, as Array.join has it."""
+    array = _arg(args, 0)
+    separator = _arg(args, 1)
+    separator = "" if separator is None else to_text(separator)
+    if isinstance(array, list):
+        return separator.join("" if item is None else to_text(item) for item in array)
+    return "" if array is None else to_text(array)
+
+
 _BUILTINS: dict[str, Callable[[list[Any]], Any]] | None = None
 
 
@@ -814,6 +824,7 @@ def _builtins() -> dict[str, Callable[[list[Any]], Any]]:
         "stringify": lambda args: json_module.dumps(_arg(args, 0), separators=(",", ":")),
         "parse": _parse_json,
         "concat": lambda args: "".join(to_text(a) for a in args),
+        "join": _join,
         "encodeURI": lambda args: quote(to_text(_arg(args, 0)), safe="-_.!~*'();/?:@&=+$,#"),
         "slug": lambda args: re.sub(r"[^a-z0-9_-]", "", to_text(_arg(args, 0)).lower()),
         "withoutUrls": lambda args: _without_urls(_arg(args, 0)),

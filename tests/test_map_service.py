@@ -298,3 +298,17 @@ def test_without_urls_strips_addresses_and_the_labels_that_introduced_them():
         "text": "Police said so."
     }
     assert service.process({}, lambda _n: None) == {"text": ""}
+
+
+def test_join_makes_one_text_of_an_array():
+    svc = create_map(
+        {"template": {"whole=": "join(params.items)", "csv=": "join(params.items, ',')"}}
+    )
+
+    assert svc.process({"items": ["ab", "cd", None, 1]}) == {"whole": "abcd1", "csv": "ab,cd,,1"}
+
+
+def test_join_answers_with_text_whatever_it_is_given():
+    svc = create_map({"template": {"=": "join(params.missing)"}})
+
+    assert svc.process({}) == ""
