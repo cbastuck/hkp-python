@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Coroutine, Callable, Iterator, Literal
 
 from .address import ADDRESS_SEPARATOR, descend, split_address
+from .call_report import reported_value
 from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
@@ -552,7 +553,12 @@ class HostedRuntime:
         self._emit_notification(
             RuntimeNotification(
                 instance_id=start_after_uuid,
-                payload={"__internal": {"state": "call-process-finished", "data": data}},
+                payload={
+                    "__internal": {
+                        "state": "call-process-finished",
+                        "data": reported_value(data),
+                    }
+                },
             ),
             on_notification,
         )
@@ -875,7 +881,9 @@ class HostedRuntime:
             self._emit_notification(
                 RuntimeNotification(
                     instance_id=uuid,
-                    payload={"__internal": {"state": "call-process", "data": result}},
+                    payload={
+                        "__internal": {"state": "call-process", "data": reported_value(result)}
+                    },
                 ),
                 on_notification,
             )
@@ -924,7 +932,12 @@ class HostedRuntime:
             self._emit_notification(
                 RuntimeNotification(
                     instance_id=uuid,
-                    payload={"__internal": {"state": "call-process-finished", "data": result}},
+                    payload={
+                        "__internal": {
+                            "state": "call-process-finished",
+                            "data": reported_value(result),
+                        }
+                    },
                 ),
                 on_notification,
             )

@@ -50,6 +50,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+from ..egress import client_session, failure_reason
 from ..mount import MOUNT_FIELD, is_mount_reference, join_mount_path
 from ..secrets import resolve_credential
 from ..types import (
@@ -309,7 +310,7 @@ class HttpClientService:
 
         try:
             timeout = aiohttp.ClientTimeout(total=self._timeout_ms / 1000)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with client_session(timeout=timeout) as session:
                 async with session.request(
                     self._method.upper(), url, data=body, headers=headers
                 ) as response:
@@ -337,7 +338,7 @@ class HttpClientService:
                     "method": self._method,
                     "url": url,
                     "status": 0,
-                    "error": str(err),
+                    "error": failure_reason(err),
                 }
             )
             # A failed request produces no result to pass on: the pipeline behind

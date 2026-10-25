@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .auth import AuthConfig, is_loopback_host
+from .egress import read_egress_policy, set_egress_policy
 from .origins import parse_allowed_origins
 from .server import create_runtime_server
 
@@ -168,6 +169,16 @@ async def main() -> None:
     host = os.environ.get("HOST", "0.0.0.0")
     external_host = os.environ.get("EXTERNAL_HOST", "127.0.0.1")
     allowed_origins = parse_allowed_origins(os.environ.get("ALLOWED_ORIGINS"))
+    # Before anything can dial out: a hosted server reaches only public
+    # addresses on a board's behalf (egress.py).
+    egress = read_egress_policy(os.environ)
+    set_egress_policy(egress)
+    if egress.mode == "public":
+        print(
+            "[hkp-python] HKP_EGRESS=public: boards reach public addresses only"
+            + (f", and {len(egress.allow)} allowed address(es) or range(s)" if egress.allow else ""),
+            file=sys.stderr,
+        )
     auth_config = resolve_server_auth_config(host)
 
     server = create_runtime_server(

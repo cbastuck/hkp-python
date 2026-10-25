@@ -44,6 +44,8 @@ The server listens on `0.0.0.0:8080` by default. Configure with environment vari
 | `PORT`            | `8080`      | TCP port to listen on                                         |
 | `HOST`            | `0.0.0.0`   | Bind address                                                  |
 | `EXTERNAL_HOST`   | `127.0.0.1` | Host used in `outputUrl` / WebSocket URLs returned to clients |
+| `HKP_EGRESS`      | unset — boards reach any address | `public` makes this a hosted server: a destination a board names (an HTTP Client's URL, an asset, a model's base URL) is reached only when every address its name resolves to is a public internet address — never this host, a private network or a cloud metadata endpoint. Checked on the address each connection opens to, redirects included. Set it on any server other people's boards run on |
+| `HKP_EGRESS_ALLOW` | — | Comma-separated addresses or ranges (`10.0.0.5`, `10.1.0.0/16`, `fd00::/8`) a hosted server reaches anyway. Addresses, not names: an allowed name could be repointed |
 | `ALLOWED_ORIGINS` | the Readymade apps and pages served from this machine | Browser origins that may call this server, comma-separated; replaces the default. `*` allows any page that carries a token, never one that carries none. See *Who may call from a browser* |
 | `AUTH0_DOMAIN`    | —           | Auth0 tenant domain; enables JWT auth together with `AUTH0_AUDIENCE` |
 | `AUTH0_AUDIENCE`  | —           | Accepted `aud` claims, comma-separated — the client id of each Auth0 application whose users this runtime serves (the frontend sends the ID token) |
@@ -95,8 +97,12 @@ hkp-node coordinator) works against both runtimes:
   `anonymous` tenant — identical to the pre-tenancy behaviour.
 - With `AUTH0_DOMAIN` + `AUTH0_AUDIENCE` set, every HTTP request needs
   `Authorization: Bearer <token>`; WebSocket upgrades take the token from the
-  Authorization header or `?access_token=` (browsers can't set WS headers) and
-  are Origin-checked against `ALLOWED_ORIGINS`.
+  Authorization header or, from a browser, `?ticket=` — a single-use ticket it
+  traded its token for at `POST /ws-tickets`, so the token is never in an
+  address (`?access_token=` is still taken from older clients) — and are
+  Origin-checked against `ALLOWED_ORIGINS`. A token must be RS256, issued by
+  `https://<AUTH0_DOMAIN>/`, for one of the audiences, with an expiry and a
+  subject.
 - `POST /runtimes/{id}/session-token` (JWT-gated) mints an opaque in-memory
   token bound to the calling user and that runtime. Tokens are purged when the
   runtime is removed. The coordinator no longer uses it — see below.

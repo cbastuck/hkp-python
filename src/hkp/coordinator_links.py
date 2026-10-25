@@ -24,7 +24,7 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -39,6 +39,25 @@ JOIN_PATH = "/join"
 #: coordinator restarting — is something a link reconnects through.
 CLOSE_TICKET_REVOKED = 4403
 CLOSE_REPLACED = 4409
+
+
+# How large one message from a coordinator may be. A coordinator drops a value
+# over its frame limit (``HKP_COORDINATOR_MAX_FRAME_BYTES``, 64 MiB unless
+# set) and keeps the connection; the library's own ceiling sits above that by
+# the room an introduction needs, so it refuses only what the coordinator
+# would never send. The same numbers are in hkp-node
+# (``src/coordinator/frameLimits.ts``) and hkp-rt (``coordinator_links.cpp``).
+DEFAULT_MAX_FRAME_BYTES = 64 * 1024 * 1024
+_SOCKET_HEADROOM_BYTES = 16 * 1024 * 1024
+
+
+def socket_ceiling(environ: Mapping[str, str] = os.environ) -> int:
+    """What the WebSocket library accepts on a link to a coordinator."""
+    try:
+        limit = int(environ.get("HKP_COORDINATOR_MAX_FRAME_BYTES", "") or 0)
+    except ValueError:
+        limit = 0
+    return (limit if limit > 0 else DEFAULT_MAX_FRAME_BYTES) + _SOCKET_HEADROOM_BYTES
 
 
 @dataclass(frozen=True)
@@ -276,10 +295,10 @@ class _Link:
                 # A header rather than the URL, which is what ends up in logs.
                 headers={"Authorization": f"Bearer {self.record.ticket}"},
                 heartbeat=30,
-                # No ceiling of the library's own: exceeding one closes the
-                # link, and the board would lose its runtime over one large
-                # value.
-                max_msg_size=0,
+                # Above the coordinator's frame limit, which drops an oversized
+                # value without closing anything; past this the library closes
+                # the link. See socket_ceiling.
+                max_msg_size=socket_ceiling(),
             ) as ws:
                 self._ws = ws
                 await ws.send_str(

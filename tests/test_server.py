@@ -106,6 +106,19 @@ async def test_registry_shape(server_info, base_url, port):
             "capabilities": ["subservices"],
         },
         {
+            "serviceId": "iterator",
+            "serviceName": "Iterator",
+            "version": "v1",
+            "capabilities": ["subservices"],
+        },
+        {
+            "serviceId": "gather",
+            "serviceName": "Gather",
+            "version": "v1",
+            "capabilities": ["subservices"],
+        },
+        {"serviceId": "spread", "serviceName": "Spread", "version": "v1", "capabilities": []},
+        {
             "serviceId": "http-server-subservices",
             "serviceName": "HttpServerSubservices",
             "capabilities": ["subservices"],

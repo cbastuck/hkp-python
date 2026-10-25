@@ -12,6 +12,13 @@ the second in ``Host``; a page cannot forge either.
 A caller that is not a browser sends none of these, and is let in as before:
 another process on this machine is not what this guards against.
 
+A request a proxy passed on is never let in this way. A reverse proxy on the
+same host — nginx, Caddy — makes every request arrive from this machine at a
+name the server knows, so where it comes from says nothing any more. One that
+says so (``Forwarded``, ``X-Forwarded-For``, ``X-Real-IP``) is refused; one that
+says nothing cannot be told apart, which is why a loopback bind is a boundary
+only while nothing forwards to it.
+
 The same rule, row for row, is in hkp-node (``src/origins.ts``) and hkp-rt
 (``lib/include/origins.h``).
 """
@@ -19,7 +26,7 @@ The same rule, row for row, is in hkp-node (``src/origins.ts``) and hkp-rt
 from __future__ import annotations
 
 import re
-from typing import Sequence, Union
+from typing import Mapping, Sequence, Union
 
 # The origins a server was told may call it, the way ``ALLOWED_ORIGINS`` gives
 # them:
@@ -132,15 +139,26 @@ def allows_origin(origin: str | None, allowed: AllowedOrigins) -> bool:
     return allowed == "*" or allows_origin_without_credential(origin, allowed)
 
 
+_FORWARDING_HEADERS = ("Forwarded", "X-Forwarded-For", "X-Real-IP")
+
+
+def is_forwarded(headers: Mapping[str, str]) -> bool:
+    """Whether a request carries a header a proxy adds when it passes one on."""
+    return any((headers.get(name) or "").strip() for name in _FORWARDING_HEADERS)
+
+
 def admits_without_credential(
     origin: str | None,
     sec_fetch_site: str | None,
     host: str | None,
     allowed: AllowedOrigins,
     own_names: Sequence[str],
+    forwarded: bool = False,
 ) -> bool:
     """Whether a request that carries no credential may be let in on the
     strength of where it comes from. See the top of this file."""
+    if forwarded:
+        return False
     if (origin or "").strip():
         if not allows_origin_without_credential(origin, allowed):
             return False
