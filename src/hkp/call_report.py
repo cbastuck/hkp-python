@@ -17,6 +17,13 @@ description, in every runtime: ``callReport.ts`` in hkp-node and hkp-frontend,
 Measuring stops once the limit is passed, so a value of a hundred megabytes
 costs no more to judge than one of five. A size counted only that far is said
 to be not ``exact``.
+
+**And only while the board is captured.** What passes between the services of a
+run is private; only what a board outputs is public. So a report carries its
+value only in Capture mode — switched on by someone building the board, never
+saved — and otherwise says only that the call happened and, when it ended,
+whether it passed nothing on (``stopped``). See ``outgoing_payload``, and
+``plans/TODO-CAPTURE-MODE.md``.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .data import TextData
+from .data import NullData, TextData, UndefinedData
 
 #: The most a report carries of one value: 5 MiB.
 CALL_REPORT_LIMIT = 5 * 1024 * 1024
@@ -40,6 +47,31 @@ _OPAQUE_SIZE = 16
 def is_too_large(value: Any) -> bool:
     """Whether a reported value is the description of one too large to carry."""
     return isinstance(value, dict) and "__hkpTooLarge" in value
+
+
+def outgoing_payload(payload: Any, capture: bool) -> Any:
+    """A notification's payload as it may leave for anyone listening: a call
+    report carrying its value only while ``capture`` is on, and then no more of
+    it than ``reported_value`` allows; every other payload as it is."""
+    if not isinstance(payload, dict):
+        return payload
+    internal = payload.get("__internal")
+    if not isinstance(internal, dict) or internal.get("state") not in (
+        "call-process",
+        "call-process-finished",
+    ):
+        return payload
+    report = {key: value for key, value in internal.items() if key != "data"}
+    if capture:
+        if "data" in internal:
+            report["data"] = reported_value(internal["data"])
+    elif report["state"] == "call-process-finished" and _passes_nothing(internal.get("data")):
+        report["stopped"] = True
+    return {**payload, "__internal": report}
+
+
+def _passes_nothing(value: Any) -> bool:
+    return value is None or isinstance(value, (NullData, UndefinedData))
 
 
 def reported_value(value: Any, limit: int = CALL_REPORT_LIMIT) -> Any:

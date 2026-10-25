@@ -178,6 +178,8 @@ async def test_logging_can_be_turned_on_without_rebuilding_the_runtime(servers):
                 "logging": True,
                 "logData": True,
                 "logLevel": "info",
+                # Logging does not touch Capture mode, which starts off.
+                "capture": False,
             }
 
     entries = await collect_entries(ws_url, lambda: drive(base_url))
