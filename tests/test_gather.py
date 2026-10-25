@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from hkp.services.gather import GatherService, is_part
+from hkp.services.gather import MAX_GROUP_LENGTH, MAX_REFUSED, GatherService, is_part
 from hkp.services.map_service import MapService
 from hkp.types import ServiceConfiguration
 
@@ -193,6 +193,48 @@ def test_is_refused_when_its_parts_disagree_on_how_many_there_are():
     assert "said 2 parts, then 3" in service.get_state()["error"]
 
 
+def test_refuses_a_new_group_past_max_groups_keeping_the_ones_already_arriving():
+    service, run, _, host = _gather({"maxGroups": 2})
+
+    run(_part("a", 0, 2, "a0"))
+    run(_part("b", 0, 2, "b0"))
+    assert run(_part("c", 0, 2, "c0")) is None
+
+    assert service.get_state()["pending"] == 2
+    assert "c refused: 2 groups are already incomplete" in service.get_state()["error"]
+    assert [event for _, event, _ in host.logged] == ["gather.refused"]
+    # The groups it kept still complete.
+    assert run(_part("a", 1, 2, "a1")) == ["a0", "a1"]
+    # And the refused one stays refused, rather than starting late without the
+    # part that went with the refusal.
+    assert run(_part("c", 1, 2, "c1")) is None
+    assert service.get_state()["pending"] == 1
+
+
+def test_takes_a_new_group_once_one_has_been_let_go():
+    service, run, _, _ = _gather({"maxGroups": 1, "timeoutMs": 10})
+
+    run(_part("old", 0, 2, "a"))
+    time.sleep(0.02)
+    run(_part("new", 0, 2, "b"))
+
+    assert service.get_state()["pending"] == 1
+    assert run(_part("new", 1, 2, "c")) == ["b", "c"]
+
+
+def test_forgets_the_oldest_refusals_rather_than_keeping_every_one():
+    service, run, _, _ = _gather({"maxGroups": 1})
+    run(_part("held", 0, 2, "x"))
+
+    for i in range(MAX_REFUSED + 1):
+        run(_part(f"flood-{i}", 0, 2, "x"))
+
+    refused = service._refused
+    assert len(refused) == MAX_REFUSED
+    assert "flood-0" not in refused
+    assert f"flood-{MAX_REFUSED}" in refused
+
+
 def test_what_counts_as_a_part():
     assert is_part(_part("g", 0, 1, None))
     assert not is_part({"group": "g", "index": 0, "total": 1})
@@ -201,13 +243,19 @@ def test_what_counts_as_a_part():
     assert not is_part(_part("g", 0.5, 2, "x"))
     assert not is_part(_part("g", True, 2, "x"))
     assert not is_part([_part("g", 0, 1, "x")])
+    # A group is held for as long as its parts are, so its name is bounded.
+    assert is_part(_part("g" * MAX_GROUP_LENGTH, 0, 1, "x"))
+    assert not is_part(_part("g" * (MAX_GROUP_LENGTH + 1), 0, 1, "x"))
 
 
 def test_configuration_is_read_from_the_board_as_well_as_set_later():
-    service, _, _, _ = _gather({"maxBytes": 1000, "timeoutMs": 5000})
+    service, _, _, _ = _gather({"maxBytes": 1000, "maxGroups": 4, "timeoutMs": 5000})
 
     assert service.get_state()["maxBytes"] == 1000
+    assert service.get_state()["maxGroups"] == 4
     assert service.get_state()["timeoutMs"] == 5000
-    service.configure({"maxBytes": 2000})
+    service.configure({"maxBytes": 2000, "maxGroups": 0})
     assert service.get_state()["maxBytes"] == 2000
+    # Fewer than one group would refuse everything; it is not taken.
+    assert service.get_state()["maxGroups"] == 4
     assert service.get_state()["timeoutMs"] == 5000

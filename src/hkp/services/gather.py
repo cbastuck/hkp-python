@@ -5,7 +5,7 @@ from __future__ import annotations
 # Service Name: Gather
 # Runtime: hkp-python
 # Modes: none — the items as an array, or what the nested pipeline makes of them
-# Key Config: pipeline, maxBytes, timeoutMs, bypass
+# Key Config: pipeline, maxBytes, maxGroups, timeoutMs, bypass
 # IO: in=one part a Spread sent on -> out=the whole group, once every part is in; None until then
 # Arrays: what a group becomes, in the order it was spread
 # Binary: an item may be bytes; joining bytes is the nested pipeline's to do
@@ -26,10 +26,11 @@ answer Tracks gives its reducer. With no pipeline the items travel on as a list;
 with one, the pipeline is given ``{"group", "items"}`` and its answer is what
 goes on.
 
-**Collecting a group holds it in memory.** ``maxBytes`` bounds one group, and a
-group still incomplete after ``timeoutMs`` is let go — both said in the log,
-because a group that never arrives looks, from outside, exactly like nothing
-having been sent.
+**Collecting a group holds it in memory.** ``maxBytes`` bounds one group,
+``maxGroups`` how many may be incomplete at once — so the most held is the two
+multiplied — and a group still incomplete after ``timeoutMs`` is let go — each
+said in the log, because a group that never arrives looks, from outside, exactly
+like nothing having been sent.
 
 Matches ``gather`` in hkp-node, hkp-rt and the browser runtime.
 """
@@ -58,6 +59,16 @@ GATHER_DESCRIPTOR = ServiceRegistryEntry(
 #: As much as the coordinator lets through in one frame by default.
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_TIMEOUT_MS = 60_000
+#: Groups incomplete at once. A new group beyond it is refused rather than
+#: making room: what is already arriving is not given up for what arrives next.
+DEFAULT_MAX_GROUPS = 16
+#: Refusals remembered at once, the oldest forgotten first. They expire anyway;
+#: this keeps a stream of new groups, each refused, from growing the list
+#: instead of the groups.
+MAX_REFUSED = 1024
+#: The longest group a part may name. A group is held as long as its parts are,
+#: and is not counted against ``maxBytes``; Spread names its groups by UUID.
+MAX_GROUP_LENGTH = 256
 
 
 def is_part(value: Any) -> bool:
@@ -68,6 +79,7 @@ def is_part(value: Any) -> bool:
     return (
         isinstance(group, str)
         and group != ""
+        and len(group) <= MAX_GROUP_LENGTH
         and _is_int(total)
         and total > 0
         and _is_int(index)
@@ -115,6 +127,7 @@ class GatherService(SubService):
         # Before the base constructor, which configures from the board's state
         # and so reaches the override below.
         self._max_bytes = DEFAULT_MAX_BYTES
+        self._max_groups = DEFAULT_MAX_GROUPS
         self._timeout_ms = DEFAULT_TIMEOUT_MS
         self._last_error = ""
         self._collecting: dict[str, _Collecting] = {}
@@ -127,6 +140,9 @@ class GatherService(SubService):
         max_bytes = config.get("maxBytes")
         if isinstance(max_bytes, (int, float)) and not isinstance(max_bytes, bool) and max_bytes > 0:
             self._max_bytes = int(max_bytes)
+        max_groups = config.get("maxGroups")
+        if isinstance(max_groups, (int, float)) and not isinstance(max_groups, bool) and max_groups >= 1:
+            self._max_groups = int(max_groups)
         timeout_ms = config.get("timeoutMs")
         if isinstance(timeout_ms, (int, float)) and not isinstance(timeout_ms, bool) and timeout_ms > 0:
             self._timeout_ms = int(timeout_ms)
@@ -138,6 +154,7 @@ class GatherService(SubService):
         return {
             **super().get_state(),
             "maxBytes": self._max_bytes,
+            "maxGroups": self._max_groups,
             "timeoutMs": self._timeout_ms,
             "pending": len(self._collecting),
             "error": self._last_error,
@@ -159,6 +176,14 @@ class GatherService(SubService):
 
         collecting = self._collecting.get(group)
         if collecting is None:
+            if len(self._collecting) >= self._max_groups:
+                self._refuse(
+                    group,
+                    now,
+                    f"group {group} refused: {self._max_groups} groups are already incomplete",
+                    notify,
+                )
+                return None
             collecting = _Collecting(total, now)
             self._collecting[group] = collecting
 
@@ -211,6 +236,9 @@ class GatherService(SubService):
     def _refuse(self, group: str, now: float, message: str, notify: NotifyCallback) -> None:
         self._collecting.pop(group, None)
         self._refused[group] = now
+        # A dict keeps insertion order, so the first key is the oldest refusal.
+        while len(self._refused) > MAX_REFUSED:
+            del self._refused[next(iter(self._refused))]
         self._last_error = message
         if self._host:
             self._host.log("error", "gather.refused", {"group": group, "message": message})
