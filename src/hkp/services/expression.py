@@ -527,39 +527,51 @@ def _path_of(node: _Node | None) -> str:
     return "…"
 
 
-def _has_member(obj: Any, key: Any) -> bool:
-    """Whether ``_member_of`` finds something there, even an empty value."""
+# What a member read returns when nothing is there, told apart from a None that
+# is.
+_MISSING = object()
+
+
+def _member(obj: Any, key: Any) -> Any:
+    """What ``obj[key]`` finds, or ``_MISSING`` when nothing is there.
+
+    One set of rules for every container, so what a read finds and whether it
+    found anything cannot disagree: a list, tuple or string is a sequence — its
+    ``length``, or the item at an index within it — and a dict is read by the
+    key as text.
+    """
     if isinstance(obj, (list, tuple, str)):
         if key == "length":
-            return True
-        index = to_number(key)
-        return not math.isnan(index) and 0 <= index < len(obj)
-    if isinstance(obj, dict):
-        return (key if isinstance(key, str) else to_text(key)) in obj
-    return False
-
-
-def _member_of(obj: Any, key: Any) -> Any:
-    if isinstance(obj, (list, tuple)):
-        if key == "length":
             return len(obj)
         index = to_number(key)
-        if math.isnan(index) or index < 0 or index >= len(obj):
-            return None
+        if math.isnan(index) or not 0 <= index < len(obj):
+            return _MISSING
         return obj[int(index)]
-
-    if isinstance(obj, str):
-        if key == "length":
-            return len(obj)
-        index = to_number(key)
-        if math.isnan(index) or index < 0 or index >= len(obj):
-            return None
-        return obj[int(index)]
-
     if isinstance(obj, dict):
-        return obj.get(key if isinstance(key, str) else to_text(key))
+        return obj.get(key if isinstance(key, str) else to_text(key), _MISSING)
+    return _MISSING
 
-    return None
+
+def _read_member(node: _Node, scope: dict[str, Any]) -> tuple[Any, bool]:
+    """A member read's value, and whether it found something there.
+
+    A read past a link that came up empty was reported with it; one past a link
+    that is there but None is reported itself. Only a member read can tell the
+    two apart, which is why the chain is walked here rather than through
+    ``_evaluate_node``.
+    """
+    if node.left is not None and node.left.kind == "member":
+        obj, obj_found = _read_member(node.left, scope)
+    else:
+        obj, obj_found = _evaluate_node(node.left, scope), True
+    key = _evaluate_node(node.right, scope) if node.computed else node.name
+    value = _member(obj, key)
+    if value is not _MISSING:
+        return value, True
+    on_missing = _on_missing.get()
+    if on_missing is not None and obj_found:
+        on_missing(_path_of(node))
+    return None, False
 
 
 def _loose_equals(left: Any, right: Any) -> bool:
@@ -640,15 +652,7 @@ def _evaluate_node(node: _Node | None, scope: dict[str, Any]) -> Any:
         return None
 
     if node.kind == "member":
-        obj = _evaluate_node(node.left, scope)
-        key = _evaluate_node(node.right, scope) if node.computed else node.name
-        on_missing = _on_missing.get()
-        if on_missing is not None and not _has_member(obj, key):
-            # A read past a link that already came up empty was reported with it.
-            past_missing = obj is None and node.left is not None and node.left.kind == "member"
-            if not past_missing:
-                on_missing(_path_of(node))
-        return _member_of(obj, key)
+        return _read_member(node, scope)[0]
 
     if node.kind == "array":
         return [_evaluate_node(item, scope) for item in node.items]

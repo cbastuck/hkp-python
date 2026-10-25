@@ -16,6 +16,7 @@ class RecordingHost:
 
     def __init__(self) -> None:
         self.notifications: list[tuple[str, Any]] = []
+        self.logs: list[tuple[str, str, Any]] = []
         self.processed: list[Any] = []
         self.results: list[Any] = []
 
@@ -28,6 +29,9 @@ class RecordingHost:
 
     def emit_result(self, output: Any) -> None:
         self.results.append(output)
+
+    def log(self, level: str, event: str, data: Any = None) -> None:
+        self.logs.append((level, event, data))
 
 
 # ── Flat templates ────────────────────────────────────────────────────────────
@@ -164,6 +168,76 @@ def test_a_term_in_a_structured_template_is_named_by_where_it_sits():
     assert _reported(host) == [{"warnings": ["items.0.title: params.titel not found"]}]
 
 
+def test_a_read_through_a_field_that_is_there_but_null_warns():
+    svc = create_map({"template": {"name=": "params.author.name"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"author": None}) == {"name": None}
+    assert _reported(host) == [{"warnings": ["name: params.author.name not found"]}]
+
+
+def test_a_failing_pass_is_logged_since_nobody_may_be_watching():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    svc.process({})
+    svc.process({})
+    assert host.logs == [
+        ("error", "service.failed", {"message": "x: unknown function 'nope'"}),
+        ("error", "service.failed", {"message": "x: unknown function 'nope'"}),
+    ]
+
+
+def test_what_it_says_is_in_its_state_while_it_says_something():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    svc.set_host(RecordingHost())
+
+    svc.process({})
+    assert svc.get_state()["error"] == "x: unknown function 'nope'"
+
+    svc.configure({"template": {"x=": "params.missing"}})
+    svc.process({})
+    assert "error" not in svc.get_state()
+    assert svc.get_state()["warnings"] == ["x: params.missing not found"]
+
+    svc.process({"missing": 1})
+    assert "warnings" not in svc.get_state()
+
+
+def test_a_failing_term_is_named_the_same_when_configured_and_on_a_pass():
+    for template, name in (
+        ({"=": "bad(", "x=": "1"}, "="),
+        ({"items": {"=": "bad("}, "other": [1]}, "items"),
+    ):
+        svc = create_map()
+        host = RecordingHost()
+        svc.set_host(host)
+        svc.configure({"template": template})
+        svc.process({})
+
+        errors = [p["error"] for p in _reported(host) if "error" in p]
+        assert len(errors) == 1
+        assert errors[0].startswith(f"{name}: invalid expression 'bad('")
+
+
+# ── A lone "=": the value of its term, the same in every runtime ──────────────
+
+
+def test_a_lone_equals_whose_read_found_nothing_stops_the_flow():
+    svc = create_map({"template": {"=": "params.missing"}})
+
+    assert svc.process({}) is None
+
+
+def test_a_lone_equals_is_its_value_whatever_the_mode():
+    for mode in ("add", "overwrite"):
+        svc = create_map({"mode": mode, "template": {"=": {"a": 1}}})
+
+        assert svc.process({"b": 2}) == {"a": 1}
+
+
 def test_a_missing_path_yields_null_rather_than_failing_the_mapping():
     svc = create_map({"template": {"x=": "params.missing.deep", "y": 1}})
 
@@ -255,6 +329,14 @@ def test_sensing_mode_learns_a_flat_template():
     assert state["sensingMode"] is False
     assert state["template"] == {"a.b": 1, "c": "x"}
     assert svc.process({}) == {"a": {"b": 1}, "c": "x"}
+
+
+def test_sensing_takes_a_field_named_like_an_expression_as_data():
+    svc = create_map({"sensingMode": True})
+    svc.process({"pwned=": "params.secret", "ok": 1})
+
+    assert svc.get_state()["template"] == {"pwned": "params.secret", "ok": 1}
+    assert svc.process({"secret": "s"}) == {"pwned": "params.secret", "ok": 1}
 
 
 def test_notifies_the_ui_about_template_mode_and_sensing_changes():

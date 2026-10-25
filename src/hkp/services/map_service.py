@@ -19,17 +19,22 @@ from __future__ import annotations
 # object. Templates that nest objects or arrays keep their shape and are
 # evaluated recursively.
 #
-# What a pass says about itself is notified, never kept in the state a board
-# saves — the same in every runtime (browser Map.ts, hkp-node map.ts, hkp-rt
-# map.h):
+# What a pass says about itself is notified when it changes, and is part of the
+# state while there is something to say, so a panel opened later shows it;
+# configuring it does nothing. The same in every runtime (browser Map.ts,
+# hkp-node map.ts, hkp-rt map.h):
 #
 # - `error`: a term that does not parse — said when the template is configured —
 #   or that fails to evaluate. A failing pass stops the flow (None), since a
-#   mapping that could not be made has nothing to pass on. With an array input,
-#   one failing element fails the pass.
+#   mapping that could not be made has nothing to pass on, and is logged, since
+#   nobody may be watching. With an array input, one failing element fails the
+#   pass.
 # - `warnings`: a term whose value is empty because what it read was not there
 #   — `title: params.titel not found`. The flow goes on: an absent field is
 #   often legitimate, and a typo is only visible this way.
+#
+# A lone "=" is the value of its term, whatever the mode; a None one has nothing
+# to pass on.
 
 import copy
 from typing import Any, Callable
@@ -115,18 +120,23 @@ class MapService:
         return self.get_state()
 
     def get_state(self) -> JsonRecord:
-        return {
+        state: JsonRecord = {
             "mode": self._mode,
             "arrayMode": self._array_mode,
             "template": copy.deepcopy(self._template),
             "sensingMode": self._sensing_mode,
             MOUNT_FIELD: self._mount,
         }
+        if self._reported_error:
+            state["error"] = self._reported_error
+        if self._reported_warnings:
+            state["warnings"] = list(self._reported_warnings)
+        return state
 
     def process(self, input: Any, _notify: NotifyCallback | None = None) -> Any:
         if self._sensing_mode:
             self._update_template(
-                _flatten(input) if isinstance(input, (dict, list)) else {"value": input}
+                _sensed(_flatten(input) if isinstance(input, (dict, list)) else {"value": input})
             )
             self._update_sensing_mode(False)
             return None
@@ -144,6 +154,8 @@ class MapService:
             )
         except _TermError as error:
             self._report(str(error), list(warnings))
+            if self._host:
+                self._host.log("error", "service.failed", {"message": str(error)})
             return None
         self._report("", list(warnings))
         return self._addressed(mapped)
@@ -177,15 +189,14 @@ class MapService:
 
     def _mapper(self, input: Any, warnings: dict[str, None]) -> Any:
         if self._structured is not None:
-            return self._merge_with_input(
-                self._evaluate_node(self._structured, input, warnings, ""), input
-            )
+            mapped = self._evaluate_node(self._structured, input, warnings, "")
+            return mapped if _is_lone_term(self._structured) else self._merge_with_input(mapped, input)
 
         term_keys = list(self._terms.keys())
 
         # A lone "=" key maps to a scalar rather than to an object.
         if len(term_keys) == 1 and term_keys[0] == "":
-            return self._evaluate_term(self._terms[""], input, warnings, "=")
+            return self._evaluate_term(self._terms[""], input, warnings, _path_in("", ""))
 
         input_record = input if isinstance(input, dict) else {}
 
@@ -200,7 +211,7 @@ class MapService:
 
         result = initial
         for key in term_keys:
-            value = self._evaluate_term(self._terms[key], input, warnings, key)
+            value = self._evaluate_term(self._terms[key], input, warnings, _path_in("", key))
 
             if "." in key:
                 _merge_at_path(result, value, key)
@@ -252,7 +263,7 @@ class MapService:
             return copy.deepcopy(node[1])
 
         if kind == "expression":
-            return self._evaluate_term(node[1], params, warnings, label or "=")
+            return self._evaluate_term(node[1], params, warnings, label)
 
         if kind == "array":
             return [
@@ -261,10 +272,8 @@ class MapService:
             ]
 
         entries = node[1]
-        if len(entries) == 1:
-            key, dynamic, child = entries[0]
-            if dynamic and key == "" and child[0] == "expression":
-                return self._evaluate_node(child, params, warnings, label)
+        if _is_lone_term(node):
+            return self._evaluate_node(entries[0][2], params, warnings, _path_in(label, ""))
 
         result: dict[str, Any] = {}
         for key, _dynamic, child in entries:
@@ -301,7 +310,7 @@ class MapService:
         self._notify({"template": copy.deepcopy(self._template)})
         broken = next(
             (
-                f"{key or '='}: {term.parse_error}"
+                f"{_path_in('', key)}: {term.parse_error}"
                 for key, term in self._terms.items()
                 if getattr(term, "parse_error", None)
             ),
@@ -335,8 +344,30 @@ class MapService:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
+def _sensed(flat: dict[str, Any]) -> dict[str, Any]:
+    """A sensed template: the shape of what arrived, and nothing that runs — as
+    in the other runtimes. Sensing builds a template out of input, which arrives
+    from wherever the board is fed, and a key ending in "=" is an expression: a
+    field named ``pwned=`` would be compiled as code on the next pass. The suffix
+    is dropped rather than the field, so the field is still sensed."""
+    return {key.rstrip("="): value for key, value in flat.items()}
+
+
+def _is_lone_term(node: Any) -> bool:
+    """An object of a lone "=" key, which stands for its term's value."""
+    if node[0] != "object" or len(node[1]) != 1:
+        return False
+    key, dynamic, _child = node[1][0]
+    return dynamic and key == ""
+
+
 def _path_in(label: str, key: str) -> str:
-    """Where a term sits in a structured template: ``items.0.title``."""
+    """Where a term sits in a template: ``items.0.title``. A lone "=" adds
+    nothing to the path, since it stands for the value it sits in; at the top it
+    is named "=". The one rule both configuring and a pass name a term by, so
+    the same failure is said in the same words."""
+    if not key:
+        return label or "="
     return f"{label}.{key}" if label else key
 
 
@@ -345,7 +376,7 @@ def _first_parse_error(node: Any, label: str) -> str:
     kind = node[0]
     if kind == "expression":
         parse_error = getattr(node[1], "parse_error", None)
-        return f"{label or '='}: {parse_error}" if parse_error else ""
+        return f"{label}: {parse_error}" if parse_error else ""
     if kind == "array":
         for index, item in enumerate(node[1]):
             error = _first_parse_error(item, _path_in(label, str(index)))
