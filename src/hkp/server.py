@@ -73,6 +73,9 @@ from .services.audio_encode import AUDIO_ENCODE_DESCRIPTOR, AudioEncodeService
 from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.join import JOIN_DESCRIPTOR, JoinService
 from .services.tracks import TRACKS_DESCRIPTOR, TracksService
+from .services.iterator import ITERATOR_DESCRIPTOR, IteratorService
+from .services.gather import GATHER_DESCRIPTOR, GatherService
+from .services.spread import SPREAD_DESCRIPTOR, SpreadService
 from .services.timer import (
     TIMER_DESCRIPTOR,
     TIMER_LEGACY_SERVICE_ID,
@@ -198,6 +201,18 @@ class RuntimeServer:
             TRACKS_DESCRIPTOR.service_id: HostedServiceFactory(
                 TRACKS_DESCRIPTOR,
                 lambda cfg, cs: TracksService(cfg, cs),
+            ),
+            ITERATOR_DESCRIPTOR.service_id: HostedServiceFactory(
+                ITERATOR_DESCRIPTOR,
+                lambda cfg, cs: IteratorService(cfg, cs),
+            ),
+            GATHER_DESCRIPTOR.service_id: HostedServiceFactory(
+                GATHER_DESCRIPTOR,
+                lambda cfg, cs: GatherService(cfg, cs),
+            ),
+            SPREAD_DESCRIPTOR.service_id: HostedServiceFactory(
+                SPREAD_DESCRIPTOR,
+                lambda cfg, _cs: SpreadService(cfg),
             ),
             HTTP_SERVER_SUBSERVICES_DESCRIPTOR.service_id: HostedServiceFactory(
                 HTTP_SERVER_SUBSERVICES_DESCRIPTOR,
