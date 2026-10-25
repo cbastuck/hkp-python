@@ -399,6 +399,20 @@ async def test_the_apps_and_pages_served_from_this_machine_are_answered_and_told
     assert preflight.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
     assert "Authorization" in preflight.headers["Access-Control-Allow-Headers"]
 
+    # Capture mode is switched from the page, on a runtime already running.
+    patch = await rt.send(
+        "OPTIONS",
+        "/runtimes/rt-1/state",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "PATCH",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert patch.status == 200
+    assert patch.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    assert "PATCH" in patch.headers["Access-Control-Allow-Methods"]
+
 
 async def test_the_website_is_a_site_like_any_other_until_the_server_is_told_otherwise(
     listening,

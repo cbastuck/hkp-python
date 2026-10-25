@@ -4,7 +4,7 @@ import asyncio
 import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Coroutine
 
 from aiohttp import WSMsgType, web
@@ -24,6 +24,7 @@ from .origins import (
     allows_origin,
     allows_origin_without_credential,
 )
+from .call_report import outgoing_payload
 from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
 from .ws_tickets import TICKET_TTL_SECONDS, WsTickets
@@ -476,7 +477,9 @@ class RuntimeServer:
             if not allowed:
                 return web.Response(status=403)
             response = web.Response(status=200)
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+            # PATCH: the page switching Capture mode on a runtime while it runs
+            # (PATCH /runtimes/{id}/state), which nothing else sends from a browser.
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             _allow_origin(response, origin)
             return response
@@ -681,7 +684,9 @@ class RuntimeServer:
                 message: dict[str, Any] = {
                     "type": "notification",
                     "serviceUuid": notification.instance_id,
-                    "payload": notification.payload,
+                    # A coordinator always listens: what it is sent of a call is
+                    # what Capture mode allows, as for any other listener.
+                    "payload": outgoing_payload(notification.payload, runtime.captures_calls()),
                 }
                 # Carries the run captured at the service boundary, so the
                 # coordinator can address and revalidate it. A standing timer
@@ -709,7 +714,13 @@ class RuntimeServer:
 
         socket_key = _tenant_key(owner, runtime_id)
         runtime.register_notification_target(
-            lambda notification: self._send_notification(socket_key, notification)
+            lambda notification: self._send_notification(
+                socket_key,
+                replace(
+                    notification,
+                    payload=outgoing_payload(notification.payload, runtime.captures_calls()),
+                ),
+            )
         )
         runtime.register_result_target(
             lambda result, _context: self._send_result(socket_key, result)
@@ -767,11 +778,16 @@ class RuntimeServer:
             runtime.set_log_level(state["logLevel"])
         if isinstance(state.get("logData"), bool):
             runtime.set_log_data(state["logData"])
+        if isinstance(state.get("capture"), bool):
+            runtime.set_capture(state["capture"])
         settings = runtime.log_settings()
         return {
             "logging": settings["logging"],
             "logData": settings["log_data"],
             "logLevel": settings["log_level"],
+            # Answered, never configured: nothing that saves a runtime's
+            # configuration can keep it.
+            "capture": runtime.captures_calls(),
         }
 
     # ── What a coordinator may do here, over a link this server opened ─────────

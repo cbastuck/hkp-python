@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from typing import Any, Coroutine, Callable, Iterator, Literal
 
 from .address import ADDRESS_SEPARATOR, descend, split_address
-from .call_report import reported_value
 from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
@@ -285,6 +284,13 @@ class HostedRuntime:
         #: can only escape somewhere somebody deliberately opened it.
         # Absent means allowed; the per-service choice is the gate.
         self._log_data = config.log_data
+        #: Capture mode: whether this runtime's call reports leave it with their
+        #: values. Switched while the board runs and never part of its
+        #: configuration, so a runtime always starts without it. Read where a
+        #: report leaves the server (``outgoing_payload``), so a pipeline nested
+        #: at any depth — whose reports reach the server only through this
+        #: runtime — follows it too.
+        self._capture = False
         #: Whether anything is recorded at all; see RuntimeConfiguration.logging
         self._logging = config.logging
         self._log_level = config.log_level if config.log_level in LOG_LEVELS else "info"
@@ -553,12 +559,7 @@ class HostedRuntime:
         self._emit_notification(
             RuntimeNotification(
                 instance_id=start_after_uuid,
-                payload={
-                    "__internal": {
-                        "state": "call-process-finished",
-                        "data": reported_value(data),
-                    }
-                },
+                payload={"__internal": {"state": "call-process-finished", "data": data}},
             ),
             on_notification,
         )
@@ -688,6 +689,12 @@ class HostedRuntime:
 
     def set_log_data(self, enabled: bool) -> None:
         self._log_data = enabled
+
+    def set_capture(self, enabled: bool) -> None:
+        self._capture = enabled
+
+    def captures_calls(self) -> bool:
+        return self._capture
 
     def set_logging(self, enabled: bool) -> None:
         self._logging = enabled
@@ -881,9 +888,7 @@ class HostedRuntime:
             self._emit_notification(
                 RuntimeNotification(
                     instance_id=uuid,
-                    payload={
-                        "__internal": {"state": "call-process", "data": reported_value(result)}
-                    },
+                    payload={"__internal": {"state": "call-process", "data": result}},
                 ),
                 on_notification,
             )
@@ -932,12 +937,7 @@ class HostedRuntime:
             self._emit_notification(
                 RuntimeNotification(
                     instance_id=uuid,
-                    payload={
-                        "__internal": {
-                            "state": "call-process-finished",
-                            "data": reported_value(result),
-                        }
-                    },
+                    payload={"__internal": {"state": "call-process-finished", "data": result}},
                 ),
                 on_notification,
             )

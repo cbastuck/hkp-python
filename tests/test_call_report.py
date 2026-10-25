@@ -5,13 +5,25 @@ call-report.test.ts and hkp-rt's call_report.test.cpp.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from typing import Any
 
-from hkp.call_report import CALL_REPORT_LIMIT, PREVIEW_LENGTH, is_too_large, reported_value
+import aiohttp
+import pytest
+import pytest_asyncio
+
+from hkp.call_report import (
+    CALL_REPORT_LIMIT,
+    PREVIEW_LENGTH,
+    is_too_large,
+    outgoing_payload,
+    reported_value,
+)
 from hkp.data import TextData
-from hkp.runtime import HostedRuntime
-from hkp.types import RuntimeConfiguration, ServiceConfiguration
+from hkp.server import create_runtime_server
+from hkp.services.monitor import MONITOR_DESCRIPTOR
 
 LIMIT = 100
 
@@ -90,55 +102,102 @@ def test_a_description_is_told_apart_from_a_value():
     assert not is_too_large(None)
 
 
-class _Producer:
-    """Answers with a text of ``length`` characters, whatever it is given."""
-
-    service_id = "producer"
-    service_name = "Producer"
-
-    def __init__(self, config: ServiceConfiguration, length: int) -> None:
-        self.uuid = config.uuid
-        self._length = length
-
-    def configure(self, config: dict) -> dict:
-        return {}
-
-    def get_state(self) -> dict:
-        return {}
-
-    def process(self, _input: Any, _notify: Any) -> Any:
-        return "z" * self._length
+def _report(state: str, data: Any = ..., call: int = 7) -> dict:
+    internal: dict[str, Any] = {"state": state, "call": call}
+    if data is not ...:
+        internal["data"] = data
+    return {"__internal": internal}
 
 
-def _finished_report(length: int) -> tuple[Any, Any]:
-    runtime = HostedRuntime(
-        RuntimeConfiguration(
-            id="rt",
-            name="Rt",
-            services=[ServiceConfiguration(service_id="producer", uuid="p")],
-        ),
-        lambda config: _Producer(config, length),
+def test_without_capture_mode_only_that_a_call_happened_leaves():
+    assert outgoing_payload(_report("call-process", {"secret": 1}), False) == _report("call-process")
+    assert outgoing_payload(_report("call-process-finished", {"secret": 1}), False) == _report(
+        "call-process-finished"
     )
-    reports: list[Any] = []
-    result = runtime.process_at("p", "in", reports.append)
-    finished = next(
-        n.payload["__internal"]
-        for n in reports
-        if isinstance(n.payload, dict)
-        and n.payload.get("__internal", {}).get("state") == "call-process-finished"
-    )
-    return result, finished
 
 
-def test_a_runtime_describes_a_value_above_the_limit_while_the_run_carries_all_of_it():
-    result, finished = _finished_report(CALL_REPORT_LIMIT + 1)
+def test_without_capture_mode_a_call_that_passed_nothing_on_says_so():
+    assert outgoing_payload({"__internal": {"state": "call-process-finished", "data": None}}, False) == {
+        "__internal": {"state": "call-process-finished", "stopped": True}
+    }
+    assert outgoing_payload({"__internal": {"state": "call-process-finished"}}, False) == {
+        "__internal": {"state": "call-process-finished", "stopped": True}
+    }
 
-    assert len(result) == CALL_REPORT_LIMIT + 1
-    assert finished["data"]["__hkpTooLarge"]["type"] == "string"
-    assert finished["data"]["__hkpTooLarge"]["bytes"] == CALL_REPORT_LIMIT + 1
+
+def test_with_capture_mode_the_value_leaves_bounded():
+    assert outgoing_payload(_report("call-process", {"a": 1}), True) == _report("call-process", {"a": 1})
+    carried = outgoing_payload(_report("call-process-finished", "z" * (CALL_REPORT_LIMIT + 1)), True)
+    assert carried["__internal"]["data"]["__hkpTooLarge"]["type"] == "string"
 
 
-def test_a_runtime_reports_a_value_at_the_limit_as_it_is():
-    _, finished = _finished_report(CALL_REPORT_LIMIT)
+def test_any_other_notification_leaves_as_it_is():
+    own = {"level": 0.5}
+    assert outgoing_payload(own, False) is own
+    other = {"__internal": {"state": "something-else", "data": 1}}
+    assert outgoing_payload(other, False) is other
 
-    assert len(finished["data"]) == CALL_REPORT_LIMIT
+
+# ── Out of a real server ────────────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def server_url():
+    server = create_runtime_server({"external_host": "127.0.0.1"})
+    address = await server.start(0, "127.0.0.1")
+    yield address["base_url"]
+    await server.stop()
+
+
+async def _reports_while(base_url: str, ws_url: str, payload: Any) -> list[dict]:
+    """Every call report the runtime's socket carried while `payload` ran."""
+    seen: list[dict] = []
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            await ws.send_str(json.dumps({"type": "readwrite", "id": "rt-1"}))
+
+            async def reader() -> None:
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    message = json.loads(msg.data)
+                    if message.get("type") != "notification":
+                        continue
+                    value = json.loads(message["value"])
+                    if isinstance(value, dict) and "__internal" in value:
+                        seen.append(value["__internal"])
+
+            task = asyncio.create_task(reader())
+            async with session.post(f"{base_url}/runtimes/rt-1", json=payload) as response:
+                assert response.status == 200
+            await asyncio.sleep(0.3)
+            task.cancel()
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_server_sends_call_values_only_while_captured(server_url):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{server_url}/runtimes",
+            json={
+                "id": "rt-1",
+                "name": "Python",
+                "services": [{"serviceId": MONITOR_DESCRIPTOR.service_id, "uuid": "monitor-1"}],
+            },
+        ) as response:
+            ws_url = (await response.json())["runtimes"][0]["outputUrl"]
+
+        uncaptured = await _reports_while(server_url, ws_url, {"secret": "inside the run"})
+        assert [r["state"] for r in uncaptured] == ["call-process", "call-process-finished"]
+        assert all("data" not in r for r in uncaptured)
+
+        async with session.patch(f"{server_url}/runtimes/rt-1/state", json={"capture": True}) as response:
+            assert (await response.json())["capture"] is True
+        captured = await _reports_while(server_url, ws_url, {"secret": "inside the run"})
+        assert captured[0]["data"] == {"secret": "inside the run"}
+
+        async with session.patch(f"{server_url}/runtimes/rt-1/state", json={"capture": False}) as response:
+            assert (await response.json())["capture"] is False
+        released = await _reports_while(server_url, ws_url, {"secret": "inside the run"})
+        assert all("data" not in r for r in released)

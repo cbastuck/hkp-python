@@ -155,12 +155,27 @@ async def test_foreign_runtime_is_404_everywhere(servers):
             f"{base_url}/runtimes/alice-rt/services/m1", headers=auth(BOB)
         ) as res:
             assert res.status == 404
+        # Capture mode sends the values inside Alice's runs to whoever listens
+        # on her runtime; Bob switching it on would be reading them.
+        async with session.patch(
+            f"{base_url}/runtimes/alice-rt/state",
+            headers=auth(BOB),
+            json={"capture": True, "logging": True},
+        ) as res:
+            assert res.status == 404
 
         # Alice's runtime and its service survived all of that.
         async with session.get(
             f"{base_url}/runtimes/alice-rt/services/m1", headers=auth(ALICE)
         ) as res:
             assert res.status == 200
+        async with session.patch(
+            f"{base_url}/runtimes/alice-rt/state", headers=auth(ALICE), json={}
+        ) as res:
+            assert res.status == 200
+            state = await res.json()
+            assert state["capture"] is False
+            assert state["logging"] is False
 
 
 @pytest.mark.asyncio
