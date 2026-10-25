@@ -16,6 +16,7 @@ class RecordingHost:
 
     def __init__(self) -> None:
         self.notifications: list[tuple[str, Any]] = []
+        self.logs: list[tuple[str, str, Any]] = []
         self.processed: list[Any] = []
         self.results: list[Any] = []
 
@@ -28,6 +29,9 @@ class RecordingHost:
 
     def emit_result(self, output: Any) -> None:
         self.results.append(output)
+
+    def log(self, level: str, event: str, data: Any = None) -> None:
+        self.logs.append((level, event, data))
 
 
 # ── Flat templates ────────────────────────────────────────────────────────────
@@ -89,10 +93,149 @@ def test_empty_template():
     assert create_map({"mode": "overwrite"}).process({"value": 1}) == {"value": 1}
 
 
-def test_returns_the_input_unchanged_when_an_expression_fails():
-    svc = create_map({"template": {"x=": "nope("}})
+# ── Missing reads, warnings and errors ────────────────────────────────────────
+# What a pass says about itself — the same in every runtime (browser Map.ts,
+# hkp-node map.ts, hkp-rt map.h).
 
-    assert svc.process({"value": 1}) == {"value": 1}
+
+def _reported(host: RecordingHost) -> list[Any]:
+    return [payload for _, payload in host.notifications]
+
+
+def test_a_read_that_found_nothing_maps_to_null_and_warns():
+    svc = create_map({"template": {"title=": "params.titel", "x=": "params.missing.deep"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"title": "Hello"}) == {"title": None, "x": None}
+    assert _reported(host) == [
+        {"warnings": ["title: params.titel not found", "x: params.missing not found"]}
+    ]
+
+
+def test_no_warning_for_a_read_a_fallback_covered_or_a_value_that_is_null():
+    svc = create_map({"template": {"slug=": "params.id || params.link", "none=": "params.none"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"link": "l", "none": None}) == {"slug": "l", "none": None}
+    assert _reported(host) == []
+
+
+def test_builds_the_template_without_input():
+    svc = create_map({"template": {"text=": "'Today is ' + string(1 + 1)"}})
+
+    assert svc.process(None) == {"text": "Today is 2"}
+
+
+def test_a_failing_term_stops_the_flow_says_why_and_clears_once_it_works():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({}) is None
+    svc.configure({"template": {"x=": "params.n"}})
+    assert svc.process({"n": 2}) == {"x": 2}
+    assert [p for p in _reported(host) if "error" in p] == [
+        {"error": "x: unknown function 'nope'"},
+        {"error": ""},
+    ]
+
+
+def test_an_array_input_fails_when_one_element_fails():
+    svc = create_map({"template": {"x=": "round(params.n) + nope()"}})
+
+    assert svc.process([{"n": 1}, {}]) is None
+
+
+def test_a_term_that_does_not_parse_is_said_when_configured():
+    svc = create_map()
+    host = RecordingHost()
+    svc.set_host(host)
+
+    svc.configure({"template": {"x=": "nope("}})
+
+    assert _reported(host)[1]["error"].startswith("x: invalid expression 'nope('")
+    assert svc.process({}) is None
+
+
+def test_a_term_in_a_structured_template_is_named_by_where_it_sits():
+    svc = create_map({"template": {"items": [{"title=": "params.titel"}]}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({}) == {"items": [{"title": None}]}
+    assert _reported(host) == [{"warnings": ["items.0.title: params.titel not found"]}]
+
+
+def test_a_read_through_a_field_that_is_there_but_null_warns():
+    svc = create_map({"template": {"name=": "params.author.name"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    assert svc.process({"author": None}) == {"name": None}
+    assert _reported(host) == [{"warnings": ["name: params.author.name not found"]}]
+
+
+def test_a_failing_pass_is_logged_since_nobody_may_be_watching():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    host = RecordingHost()
+    svc.set_host(host)
+
+    svc.process({})
+    svc.process({})
+    assert host.logs == [
+        ("error", "service.failed", {"message": "x: unknown function 'nope'"}),
+        ("error", "service.failed", {"message": "x: unknown function 'nope'"}),
+    ]
+
+
+def test_what_it_says_is_in_its_state_while_it_says_something():
+    svc = create_map({"template": {"x=": "nope(params.n)"}})
+    svc.set_host(RecordingHost())
+
+    svc.process({})
+    assert svc.get_state()["error"] == "x: unknown function 'nope'"
+
+    svc.configure({"template": {"x=": "params.missing"}})
+    svc.process({})
+    assert "error" not in svc.get_state()
+    assert svc.get_state()["warnings"] == ["x: params.missing not found"]
+
+    svc.process({"missing": 1})
+    assert "warnings" not in svc.get_state()
+
+
+def test_a_failing_term_is_named_the_same_when_configured_and_on_a_pass():
+    for template, name in (
+        ({"=": "bad(", "x=": "1"}, "="),
+        ({"items": {"=": "bad("}, "other": [1]}, "items"),
+    ):
+        svc = create_map()
+        host = RecordingHost()
+        svc.set_host(host)
+        svc.configure({"template": template})
+        svc.process({})
+
+        errors = [p["error"] for p in _reported(host) if "error" in p]
+        assert len(errors) == 1
+        assert errors[0].startswith(f"{name}: invalid expression 'bad('")
+
+
+# ── A lone "=": the value of its term, the same in every runtime ──────────────
+
+
+def test_a_lone_equals_whose_read_found_nothing_stops_the_flow():
+    svc = create_map({"template": {"=": "params.missing"}})
+
+    assert svc.process({}) is None
+
+
+def test_a_lone_equals_is_its_value_whatever_the_mode():
+    for mode in ("add", "overwrite"):
+        svc = create_map({"mode": mode, "template": {"=": {"a": 1}}})
+
+        assert svc.process({"b": 2}) == {"a": 1}
 
 
 def test_a_missing_path_yields_null_rather_than_failing_the_mapping():
@@ -186,6 +329,14 @@ def test_sensing_mode_learns_a_flat_template():
     assert state["sensingMode"] is False
     assert state["template"] == {"a.b": 1, "c": "x"}
     assert svc.process({}) == {"a": {"b": 1}, "c": "x"}
+
+
+def test_sensing_takes_a_field_named_like_an_expression_as_data():
+    svc = create_map({"sensingMode": True})
+    svc.process({"pwned=": "params.secret", "ok": 1})
+
+    assert svc.get_state()["template"] == {"pwned": "params.secret", "ok": 1}
+    assert svc.process({"secret": "s"}) == {"pwned": "params.secret", "ok": 1}
 
 
 def test_notifies_the_ui_about_template_mode_and_sensing_changes():

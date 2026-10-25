@@ -744,6 +744,11 @@ tts = [
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "hkp-python", extra = ["asr", "dev", "mp3", "tts"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
@@ -759,6 +764,9 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.0" },
 ]
 provides-extras = ["dev", "asr", "tts", "llm", "mp3"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "hkp-python", extras = ["asr", "tts", "mp3", "dev"] }]
 
 [[package]]
 name = "httpcore2"

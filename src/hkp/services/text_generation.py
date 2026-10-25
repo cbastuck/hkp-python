@@ -32,7 +32,7 @@ from __future__ import annotations
 # the PrismML fork — see "Text generation backends" in the hkp-python README.
 #
 # Local backend: standard GGUFs (Qwen, Llama, ...) load directly into this
-# process via llama-cpp-python (optional extra: pip install "hkp-python[llm]").
+# process via llama-cpp-python (optional extra: uv sync --extra llm).
 # The model is loaded lazily on first use and reloaded when modelPath /
 # contextSize / gpuLayers change; no external server is required.
 #
@@ -61,7 +61,7 @@ _BACKENDS = ["server", "local"]
 DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_GPU_LAYERS = -1  # -1 = offload every layer (llama-cpp-python convention)
 
-INSTALL_HINT = 'llama-cpp-python is not installed — run: pip install "hkp-python[llm]"'
+INSTALL_HINT = "llama-cpp-python is not installed — run in hkp-python: uv sync --extra llm"
 
 # Recommended defaults for the Bonsai reference backend (model card values);
 # they are sensible generic chat settings for other backends too.

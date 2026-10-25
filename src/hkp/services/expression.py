@@ -22,6 +22,10 @@ it keep working.
 
     expression = Expression.parse("round(params.value * 2)")
     result = expression.evaluate(input)   # raises EvaluationError on failure
+
+A member of nothing is nothing: ``params.a.b`` with no ``a`` is ``None``, as in
+the browser, Node and C++ runtimes. Whoever wants to know which reads came up
+empty passes ``on_missing``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import random
 import re
 import time
 import uuid as uuid_module
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -500,27 +505,73 @@ def _callee_name(node: _Node | None) -> str | None:
     return None
 
 
-def _member_of(obj: Any, key: Any) -> Any:
-    if isinstance(obj, (list, tuple)):
+# Told the path of a read that found nothing — ``params.titel`` — during the
+# evaluation that asked for it, and only that one: a find/filter predicate
+# evaluated inside it reports nothing, as in the other runtimes.
+_on_missing: ContextVar[Callable[[str], None] | None] = ContextVar("_on_missing", default=None)
+
+
+def _path_of(node: _Node | None) -> str:
+    """How a read is named when it is reported: ``params.items[0].title``."""
+    if node is None:
+        return "…"
+    if node.kind == "identifier":
+        return node.name
+    if node.kind == "member":
+        obj = _path_of(node.left)
+        if not node.computed:
+            return f"{obj}.{node.name}"
+        if node.right is not None and node.right.kind == "literal":
+            return f"{obj}[{json_module.dumps(node.right.value)}]"
+        return f"{obj}[…]"
+    return "…"
+
+
+# What a member read returns when nothing is there, told apart from a None that
+# is.
+_MISSING = object()
+
+
+def _member(obj: Any, key: Any) -> Any:
+    """What ``obj[key]`` finds, or ``_MISSING`` when nothing is there.
+
+    One set of rules for every container, so what a read finds and whether it
+    found anything cannot disagree: a list, tuple or string is a sequence — its
+    ``length``, or the item at an index within it — and a dict is read by the
+    key as text.
+    """
+    if isinstance(obj, (list, tuple, str)):
         if key == "length":
             return len(obj)
         index = to_number(key)
-        if math.isnan(index) or index < 0 or index >= len(obj):
-            return None
+        if math.isnan(index) or not 0 <= index < len(obj):
+            return _MISSING
         return obj[int(index)]
-
-    if isinstance(obj, str):
-        if key == "length":
-            return len(obj)
-        index = to_number(key)
-        if math.isnan(index) or index < 0 or index >= len(obj):
-            return None
-        return obj[int(index)]
-
     if isinstance(obj, dict):
-        return obj.get(key if isinstance(key, str) else to_text(key))
+        return obj.get(key if isinstance(key, str) else to_text(key), _MISSING)
+    return _MISSING
 
-    return None
+
+def _read_member(node: _Node, scope: dict[str, Any]) -> tuple[Any, bool]:
+    """A member read's value, and whether it found something there.
+
+    A read past a link that came up empty was reported with it; one past a link
+    that is there but None is reported itself. Only a member read can tell the
+    two apart, which is why the chain is walked here rather than through
+    ``_evaluate_node``.
+    """
+    if node.left is not None and node.left.kind == "member":
+        obj, obj_found = _read_member(node.left, scope)
+    else:
+        obj, obj_found = _evaluate_node(node.left, scope), True
+    key = _evaluate_node(node.right, scope) if node.computed else node.name
+    value = _member(obj, key)
+    if value is not _MISSING:
+        return value, True
+    on_missing = _on_missing.get()
+    if on_missing is not None and obj_found:
+        on_missing(_path_of(node))
+    return None, False
 
 
 def _loose_equals(left: Any, right: Any) -> bool:
@@ -601,9 +652,7 @@ def _evaluate_node(node: _Node | None, scope: dict[str, Any]) -> Any:
         return None
 
     if node.kind == "member":
-        obj = _evaluate_node(node.left, scope)
-        key = _evaluate_node(node.right, scope) if node.computed else node.name
-        return _member_of(obj, key)
+        return _read_member(node, scope)[0]
 
     if node.kind == "array":
         return [_evaluate_node(item, scope) for item in node.items]
@@ -660,8 +709,19 @@ class Expression:
     def parse(source: str) -> "Expression":
         return Expression(source, _Parser(source).parse())
 
-    def evaluate(self, params: Any = None, scope: dict[str, Any] | None = None) -> Any:
-        return _evaluate_node(self._root, scope if scope is not None else {"params": params})
+    def evaluate(
+        self,
+        params: Any = None,
+        scope: dict[str, Any] | None = None,
+        on_missing: Callable[[str], None] | None = None,
+    ) -> Any:
+        """``on_missing`` hears about every read that found nothing, once per
+        chain: in ``params.a.b.c`` with no ``a``, only ``params.a``."""
+        token = _on_missing.set(on_missing)
+        try:
+            return _evaluate_node(self._root, scope if scope is not None else {"params": params})
+        finally:
+            _on_missing.reset(token)
 
 
 # ── Builtins ───────────────────────────────────────────────────────────────────
@@ -861,20 +921,22 @@ def _builtins() -> dict[str, Callable[[list[Any]], Any]]:
 
 
 def compile_expression(source: Any) -> Callable[[Any], Any]:
-    """Compiles an expression source into a callable. Non-string sources are
-    constants and are returned as-is; a source that does not parse raises when
-    called, so the caller decides how a broken term is reported."""
+    """Compiles an expression source into a callable taking ``params`` and an
+    optional ``on_missing``. Non-string sources are constants and are returned
+    as-is; a source that does not parse raises when called and carries
+    ``parse_error``, so the caller decides how a broken term is reported."""
     if not isinstance(source, str):
-        return lambda params: source
+        return lambda params, on_missing=None: source
 
     try:
         expression = Expression.parse(source)
     except ParseError as error:
-        message = str(error)
+        parse_error = f"invalid expression {source!r}: {error}"
 
-        def broken(params: Any) -> Any:
-            raise EvaluationError(f"invalid expression {source!r}: {message}")
+        def broken(params: Any, on_missing: Any = None) -> Any:
+            raise EvaluationError(parse_error)
 
+        broken.parse_error = parse_error  # type: ignore[attr-defined]
         return broken
 
-    return expression.evaluate
+    return lambda params, on_missing=None: expression.evaluate(params, on_missing=on_missing)
