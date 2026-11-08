@@ -35,7 +35,8 @@ from __future__ import annotations
 # Unless it stopped because something in it failed, and the board asked to hear
 # about it (`onFailure: "merge"`): a service that failed said why in an `error`
 # notification, and with `merge` the input goes on with `{ error, service }`
-# where the result would have gone. A service that chose to stop — a filter, a
+# where the result would have gone — under `as`, or under `failure` when no
+# name is given. A service that chose to stop — a filter, a
 # claim that took nothing — still stops this one. Only a service directly in
 # the detour is heard.
 #
@@ -132,9 +133,19 @@ class JoinService(SubService):
 
         if result is None:
             if failure and self._on_failure == "merge":
-                return self._merged(input, failure)
+                return self._failed(input, failure)
             return None
         return self._merged(input, result)
+
+    def _failed(self, input: Any, failure: JsonRecord) -> Any:
+        """The input with the detour's failure beside it, always under a name of
+        its own: spread into the input like a result, an `error` the input
+        already carried would hide it in `add` mode, and in `overwrite` it would
+        replace the input's own `service`."""
+        name = self._as or "failure"
+        if _is_record(input):
+            return {**input, name: failure}
+        return {"input": input, name: failure}
 
     def _merged(self, input: Any, result: Any) -> Any:
         """The input with what came back from the detour beside it."""

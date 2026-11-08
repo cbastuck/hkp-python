@@ -176,6 +176,25 @@ def test_a_failed_detour_goes_on_with_its_failure_where_the_result_would_be():
     }
 
 
+def test_a_failure_keeps_a_name_of_its_own_when_none_is_given():
+    # Spread like a result, it would be hidden by an `error` the item already
+    # carried in `add` mode, and replace the item's own `service` otherwise.
+    added = _judged({"onFailure": "merge", "mode": "add"})
+    assert added.process({"id": "a", "fail": "boom", "error": ""}, _noop) == {
+        "id": "a",
+        "fail": "boom",
+        "error": "",
+        "failure": {"error": "boom", "service": "write"},
+    }
+    overwritten = _judged({"onFailure": "merge"})
+    assert overwritten.process({"id": "a", "fail": "boom", "service": "court-3"}, _noop) == {
+        "id": "a",
+        "fail": "boom",
+        "service": "court-3",
+        "failure": {"error": "boom", "service": "write"},
+    }
+
+
 def test_a_detour_that_chose_to_stop_still_stops_with_merge():
     join = _judged({"as": "brief", "onFailure": "merge"})
     assert join.process({"id": "a", "skip": True}, _noop) is None
