@@ -118,3 +118,100 @@ def test_an_empty_join_passes_its_input_through():
     )
 
     assert service.process({"path": "one"}, _noop) == {"path": "one"}
+
+
+# ── A detour that fails, told apart from one that chose to stop ──────────────
+#
+# Ported from hkp-node's "when something in the detour fails": both end with
+# nothing, and only the failure has a reason, which `onFailure: "merge"` hands
+# on beside the input.
+
+
+class _Judging:
+    """Fails for an input carrying `fail`, stops for one carrying `skip`."""
+
+    service_id = "judging"
+    service_name = "Judging"
+
+    def __init__(self, config: ServiceConfiguration, _create: Any = None) -> None:
+        self.uuid = config.uuid
+
+    def configure(self, config: dict) -> dict:
+        return {}
+
+    def get_state(self) -> dict:
+        return {}
+
+    def process(self, input: Any, notify: Any) -> Any:
+        if input.get("fail"):
+            notify({"error": input["fail"]})
+            return None
+        if input.get("skip"):
+            return None
+        return {"text": f"brief of {input['id']}"}
+
+
+def _judged(state: dict) -> JoinService:
+    return JoinService(
+        ServiceConfiguration(
+            service_id="join",
+            uuid="brief",
+            state={
+                "pipeline": [
+                    {"instanceId": "write", "serviceId": "judging", "serviceName": "Judging"}
+                ],
+                **state,
+            },
+        ),
+        lambda config: _Judging(config),
+    )
+
+
+def test_a_failed_detour_goes_on_with_its_failure_where_the_result_would_be():
+    join = _judged({"as": "brief", "onFailure": "merge"})
+    assert join.process({"id": "a", "fail": "no value stored for anthropic.key"}, _noop) == {
+        "id": "a",
+        "fail": "no value stored for anthropic.key",
+        "brief": {"error": "no value stored for anthropic.key", "service": "write"},
+    }
+
+
+def test_a_failure_keeps_a_name_of_its_own_when_none_is_given():
+    # Spread like a result, it would be hidden by an `error` the item already
+    # carried in `add` mode, and replace the item's own `service` otherwise.
+    added = _judged({"onFailure": "merge", "mode": "add"})
+    assert added.process({"id": "a", "fail": "boom", "error": ""}, _noop) == {
+        "id": "a",
+        "fail": "boom",
+        "error": "",
+        "failure": {"error": "boom", "service": "write"},
+    }
+    overwritten = _judged({"onFailure": "merge"})
+    assert overwritten.process({"id": "a", "fail": "boom", "service": "court-3"}, _noop) == {
+        "id": "a",
+        "fail": "boom",
+        "service": "court-3",
+        "failure": {"error": "boom", "service": "write"},
+    }
+
+
+def test_a_detour_that_chose_to_stop_still_stops_with_merge():
+    join = _judged({"as": "brief", "onFailure": "merge"})
+    assert join.process({"id": "a", "skip": True}, _noop) is None
+
+
+def test_a_failure_stops_unless_the_board_asked_to_hear_it():
+    join = _judged({"as": "brief"})
+    assert join.process({"id": "a", "fail": "boom"}, _noop) is None
+
+
+def test_a_detour_that_worked_is_merged_as_before_with_merge():
+    join = _judged({"as": "brief", "onFailure": "merge"})
+    assert join.process({"id": "a"}, _noop) == {"id": "a", "brief": {"text": "brief of a"}}
+
+
+def test_it_says_how_it_handles_a_failure():
+    join = _judged({"onFailure": "merge"})
+    assert join.get_state()["onFailure"] == "merge"
+    join.configure({"onFailure": "nonsense"})
+    assert join.get_state()["onFailure"] == "merge"
