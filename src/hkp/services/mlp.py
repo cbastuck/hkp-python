@@ -50,3 +50,33 @@ class MlpService(LayerService):
             self._layer, "mlp.c_proj.bias"
         )
         return added, {}
+
+    def update_trace(
+        self,
+        trace: list[JsonRecord],
+        *,
+        added_size: float,
+        out_size: float,
+        last_vector: list[float],
+        report: JsonRecord,  # noqa: ARG002
+        pieces: list[str],
+    ) -> list[JsonRecord]:
+        if trace and trace[-1].get("layer") == self._layer and trace[-1].get("mlpAdded") == 0.0:
+            updated = {
+                **trace[-1],
+                "mlpAdded": added_size,
+                "size": out_size,
+                "vector": last_vector,
+            }
+            return [*trace[:-1], updated]
+        return [
+            *trace,
+            {
+                "layer": self._layer,
+                "attentionAdded": 0.0,
+                "mlpAdded": added_size,
+                "size": out_size,
+                "vector": last_vector,
+                "pieces": pieces,
+            },
+        ]

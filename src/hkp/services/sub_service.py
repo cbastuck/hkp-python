@@ -294,15 +294,27 @@ class SubService:
         # own pipeline, so on its own it is a name, not an address. Prefixing
         # at each boundary is what makes the path a listener hears the path it
         # can dial.
-        self._release_pipeline_notifications = self._pipeline.register_notification_target(
-            # With the run it was reported in, which only the nested runtime
-            # knows when its pipeline was entered directly rather than through
-            # this service's own call.
-            lambda n: self._host.notify(
+        def forward_notification(n: Any) -> None:
+            if not self._host:
+                return
+            self._host.notify(
                 n.payload, join_address(self.uuid, n.instance_id), n.context
             )
-            if self._host
-            else None
+            # A plain SubService — including a use of a block, which a facade
+            # addresses as a whole rather than reaching inside — also reports
+            # what its direct steps say under their instanceId on its own
+            # address, so `source: { serviceUuid: "<use>", path: "<step>.…" }`
+            # reads them without crossing the block boundary.
+            if (
+                self.service_id == SUB_SERVICE_DESCRIPTOR.service_id
+                and "." not in n.instance_id
+                and isinstance(n.payload, dict)
+                and not n.payload.get("__internal")
+            ):
+                self._host.notify({n.instance_id: n.payload}, self.uuid, n.context)
+
+        self._release_pipeline_notifications = (
+            self._pipeline.register_notification_target(forward_notification)
         )
 
         # A nested pipeline's entries belong to the same board log as everything

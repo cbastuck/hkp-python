@@ -555,3 +555,107 @@ def test_services_refuse_out_of_range_tokens_and_layers_and_work_without_optiona
     assert len(chosen["tokens"]) == 3
     assert "piece" not in notes[-1]["chosen"]
 
+
+def test_attention_heads_masks_temperature_and_early_answers(tiny_model) -> None:
+    weights_cfg = {"model": "hkp-asset://weights", "config": "hkp-asset://config"}
+    tok_cfg = {"tokenizer": "hkp-asset://tokenizer"}
+    rt, said = _runtime(
+        tiny_model,
+        [
+            ServiceConfiguration(service_id="token-embed", uuid="embed", state=weights_cfg),
+            ServiceConfiguration(
+                service_id="sub-service",
+                uuid="layer-0",
+                state=_layer_entry(0)["state"],
+            ),
+            ServiceConfiguration(
+                service_id="unembed",
+                uuid="early",
+                state={**weights_cfg, **tok_cfg, "passThrough": True, "top": 2},
+            ),
+            ServiceConfiguration(
+                service_id="sub-service",
+                uuid="layer-1",
+                state=_layer_entry(1)["state"],
+            ),
+            ServiceConfiguration(
+                service_id="unembed",
+                uuid="unembed",
+                state={**weights_cfg, **tok_cfg, "inspectLayer": 0, "inspectHead": 1},
+            ),
+        ],
+    )
+    _wait_ready(rt.get_service("embed"))
+    _wait_ready(rt.get_service("early"))
+    _wait_ready(rt.get_service("unembed"))
+    for i in (0, 1):
+        sub = rt.get_service(f"layer-{i}")
+        _wait_ready(sub.find_nested("attention"))
+        _wait_ready(sub.find_nested("mlp"))
+
+    prompt = {"tokens": [1, 2, 3], "pieces": ["red", "orange", "yellow"], "promptTokens": 3}
+    result = rt.process(prompt, lambda *_: None)
+    meta, _ = scores_of(result)
+    assert "_trace" not in meta
+
+    by_id = dict(said)
+    # SubService rolls up its direct steps onto its own address (Option A).
+    assert "attention" in by_id or "mlp" in by_id.get("layer-0", {})
+    layer0_notes = [payload for inst, payload in said if inst == "layer-0"]
+    assert any("attention" in p for p in layer0_notes)
+    assert any("mlp" in p for p in layer0_notes)
+
+    # Early unembed (passThrough=True) scored layer 0 and handed the stream on.
+    assert len(by_id["early"]["candidates"]) == 2
+    assert len(by_id["early"]["layers"]) == 1
+
+    # Final unembed reports the layer-by-layer progression and inspected pattern.
+    final_report = by_id["unembed"]
+    assert [row["layer"] for row in final_report["layers"]] == [0, 1]
+    assert final_report["layers"][0]["token"] == by_id["early"]["candidates"][0]["token"]
+    assert final_report["attention"]["layer"] == 0
+    assert final_report["attention"]["head"] == 1
+    assert final_report["attention"]["pieces"] == ["red", "orange", "yellow"]
+    pattern = final_report["attention"]["pattern"]
+    assert len(pattern) == 3 and len(pattern[0]) == 3
+    # Causal mask: token 0 cannot look ahead at token 1 or 2.
+    assert pattern[0][1] == 0.0 and pattern[0][2] == 0.0
+
+    # Changing inspectLayer / inspectHead re-notifies immediately from the kept trace.
+    said.clear()
+    rt.get_service("unembed").configure({"inspectLayer": 1, "inspectHead": 0})
+    assert said[-1][0] == "unembed"
+    assert said[-1][1]["attention"]["layer"] == 1
+    assert said[-1][1]["attention"]["head"] == 0
+
+    # Window mask (window=1): token 2 looks only at itself (probability 1.0).
+    attn0 = rt.get_service("layer-0").find_nested("attention")
+    with pytest.raises(ValueError, match="unknown mask"):
+        attn0.configure({"mask": "diagonal"})
+    attn0.configure({"mask": "window", "window": 1})
+    rt.process(prompt, lambda *_: None)
+    attn_note = dict(said)["layer-0.attention"]
+    assert attn_note["pattern"][2] == [0.0, 0.0, 1.0]
+
+    # Full mask: token 0 can look ahead at tokens 1 and 2.
+    attn0.configure({"mask": "full"})
+    rt.process(prompt, lambda *_: None)
+    attn_note = dict(said)["layer-0.attention"]
+    assert attn_note["pattern"][0][1] > 0.0 and attn_note["pattern"][0][2] > 0.0
+
+    # Temperature < 1 sharpens attention onto the largest weight.
+    max_before = max(attn_note["pattern"][2])
+    attn0.configure({"temperature": 0.2})
+    rt.process(prompt, lambda *_: None)
+    assert max(dict(said)["layer-0.attention"]["pattern"][2]) > max_before
+
+    # Disabling a head zeroes its pattern and its contribution; disabling all
+    # heads leaves only the bias of c_proj.
+    attn0.configure({"disabledHeads": "0"})
+    assert attn0.get_state()["disabledHeads"] == [0]
+    rt.process(prompt, lambda *_: None)
+    attn_note = dict(said)["layer-0.attention"]
+    assert attn_note["patterns"][0] == [[0.0, 0.0, 0.0]] * 3
+    assert attn_note["headSizes"][0] == 0.0 and attn_note["headSizes"][1] > 0.0
+
+

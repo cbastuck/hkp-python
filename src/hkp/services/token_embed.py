@@ -60,5 +60,21 @@ class TokenEmbedService(ModelService):
         except Problem as problem:
             return self.fail(notify, str(problem))
 
-        notify({"tokens": len(tokens), "width": weights.width, "size": length(stream[-1])}, None)
+        raw_pieces = input.get("pieces")
+        pieces = (
+            [str(p) for p in raw_pieces]
+            if isinstance(raw_pieces, list) and len(raw_pieces) == len(tokens)
+            else [str(t) for t in tokens]
+        )
+        token_sizes = [length(stream[i]) for i in range(len(tokens))]
+        notify(
+            {
+                "tokens": len(tokens),
+                "width": weights.width,
+                "size": token_sizes[-1],
+                "pieces": pieces,
+                "tokenSizes": token_sizes,
+            },
+            None,
+        )
         return MixedData({**input, "shape": [len(tokens), weights.width]}, stream)
