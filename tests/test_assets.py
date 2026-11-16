@@ -299,6 +299,37 @@ class TestAsAFile:
 
         assert a.exists() and c.exists() and not b.exists()
 
+    def test_whoever_waits_for_a_fetch_is_told_how_far_it_is(self, tmp_path) -> None:
+        import time
+
+        files = AssetFileCache(tmp_path)
+        asset = read_assets_payload(
+            {"m": {"mediaType": "text/plain", "text": "weights", "sha256": _sha("weights")}}
+        )
+        fetcher = AssetStore(file_cache=files)
+        waiter = AssetStore(file_cache=files)
+        fetcher.replace(asset)
+        waiter.replace(asset)
+
+        release = threading.Event()
+        first = threading.Thread(
+            target=lambda: fetcher.resolve_path("hkp-asset://m", lambda *_: release.wait(5))
+        )
+        first.start()
+        while files.fetching(_sha("weights")) is None:
+            time.sleep(0.005)
+
+        heard: list[tuple[int, int | None]] = []
+        resolved = waiter.resolve_path(
+            "hkp-asset://m", lambda *seen: (heard.append(seen), release.set())
+        )
+        first.join(5)
+
+        assert resolved.problem == "" and resolved.path.read_bytes() == b"weights"
+        assert heard and heard[0] == (7, 7)
+        assert files.fetching(_sha("weights")) is None
+
+
 
 class TestModels:
     """What services loaded from those files, shared between them."""

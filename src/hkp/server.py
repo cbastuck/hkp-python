@@ -76,6 +76,13 @@ from .services.join import JOIN_DESCRIPTOR, JoinService
 from .services.tracks import TRACKS_DESCRIPTOR, TracksService
 from .services.iterator import ITERATOR_DESCRIPTOR, IteratorService
 from .services.loop import LOOP_DESCRIPTOR, LoopService
+from .services.tokenize import TOKENIZE_DESCRIPTOR, TokenizeService
+from .services.detokenize import DETOKENIZE_DESCRIPTOR, DetokenizeService
+from .services.sample import SAMPLE_DESCRIPTOR, SampleService
+from .services.token_embed import TOKEN_EMBED_DESCRIPTOR, TokenEmbedService
+from .services.attention import ATTENTION_DESCRIPTOR, AttentionService
+from .services.mlp import MLP_DESCRIPTOR, MlpService
+from .services.unembed import UNEMBED_DESCRIPTOR, UnembedService
 from .services.gather import GATHER_DESCRIPTOR, GatherService
 from .services.spread import SPREAD_DESCRIPTOR, SpreadService
 from .services.timer import (
@@ -260,6 +267,34 @@ class RuntimeServer:
             TEXT_GENERATION_DESCRIPTOR.service_id: HostedServiceFactory(
                 TEXT_GENERATION_DESCRIPTOR,
                 lambda cfg, _cs: TextGenerationService(cfg),
+            ),
+            TOKENIZE_DESCRIPTOR.service_id: HostedServiceFactory(
+                TOKENIZE_DESCRIPTOR,
+                lambda cfg, _cs: TokenizeService(cfg),
+            ),
+            TOKEN_EMBED_DESCRIPTOR.service_id: HostedServiceFactory(
+                TOKEN_EMBED_DESCRIPTOR,
+                lambda cfg, _cs: TokenEmbedService(cfg),
+            ),
+            ATTENTION_DESCRIPTOR.service_id: HostedServiceFactory(
+                ATTENTION_DESCRIPTOR,
+                lambda cfg, _cs: AttentionService(cfg),
+            ),
+            MLP_DESCRIPTOR.service_id: HostedServiceFactory(
+                MLP_DESCRIPTOR,
+                lambda cfg, _cs: MlpService(cfg),
+            ),
+            UNEMBED_DESCRIPTOR.service_id: HostedServiceFactory(
+                UNEMBED_DESCRIPTOR,
+                lambda cfg, _cs: UnembedService(cfg),
+            ),
+            SAMPLE_DESCRIPTOR.service_id: HostedServiceFactory(
+                SAMPLE_DESCRIPTOR,
+                lambda cfg, _cs: SampleService(cfg),
+            ),
+            DETOKENIZE_DESCRIPTOR.service_id: HostedServiceFactory(
+                DETOKENIZE_DESCRIPTOR,
+                lambda cfg, _cs: DetokenizeService(cfg),
             ),
             TEXT_TO_SPEECH_DESCRIPTOR.service_id: HostedServiceFactory(
                 TEXT_TO_SPEECH_DESCRIPTOR,

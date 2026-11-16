@@ -26,8 +26,9 @@ A plain `uv sync` includes the `dev` group in `pyproject.toml`, which pulls in
 the `asr`, `tts` and `mp3` extras and the test tooling. Other combinations:
 
 ```bash
-uv sync --extra llm       # + local LLM inference (llama-cpp-python, compiles llama.cpp)
-uv sync --no-dev          # base runtime only, e.g. for a server
+uv sync --extra llm          # + local LLM inference (llama-cpp-python, compiles llama.cpp)
+uv sync --extra transformer  # + transformer layer services (torch, safetensors, tokenizers)
+uv sync --no-dev             # base runtime only, e.g. for a server
 uv sync --no-dev --extra tts --extra mp3   # base runtime with chosen extras
 ```
 
@@ -241,6 +242,14 @@ WebSocket endpoint at `/{runtime_id}` — send `{ "type": "processRuntime", "par
 | `text-generation`         | Generates text with a local LLM — either via an OpenAI-compatible server (llama-server, Ollama, ...) or by loading a GGUF in-process (requires the `llm` extra); accepts a String prompt or JSON with `prompt`/`text`/`messages` |
 | `text-to-speech`          | Synthesizes speech with the local Kokoro-82M model (requires the `tts` extra); accepts a String or JSON with `text`/`prompt`, emits a 24 kHz `FloatRingBuffer` |
 | `skill-router`            | Matches free-form text against configured skills via the local LLM and emits `{ board, payload }` for dispatch (or `null` to stop) |
+| `loop`                    | Repeats its nested pipeline on its own output until a condition holds or `maxRounds` is reached |
+| `tokenize`                | Cuts text into token ids and pieces using a `tokenizer.json` asset (requires the `transformer` extra) |
+| `token-embed`             | Looks up token and position embeddings from `.safetensors` weights to start the residual stream (`transformer` extra) |
+| `attention`               | Runs causal multi-head self-attention for one transformer `layer` and adds to the stream (`transformer` extra) |
+| `mlp`                     | Runs the feed-forward MLP for one transformer `layer` and adds to the stream (`transformer` extra) |
+| `unembed`                 | Projects the last position of the stream to vocabulary scores (`transformer` extra) |
+| `sample`                  | One sampling step (`repetition-penalty`, `top-k`, `top-p`, `min-p`, `temperature`, `pick`, `greedy`) (`transformer` extra) |
+| `detokenize`              | Turns token ids back into text and reports whether the last token ends generation (`transformer` extra) |
 
 ### Text generation backends
 

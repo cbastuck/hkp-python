@@ -56,10 +56,19 @@ llm = [
 mp3 = [
     "lameenc>=1.7",
 ]
+# A language model laid out as services: token-embed, attention, mlp, unembed
+# and what goes around them (tokenize, sample, detokenize).
+transformer = [
+    "torch>=2.4",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+    "numpy>=1.26",
+]
 
 # What a plain `uv sync` installs beside the runtime deps — uv syncs the `dev`
 # group unless told `--no-dev` — and so what run_tests.sh and run_server.sh run
 # with. llm stays opt-in: it compiles llama.cpp on install (`uv sync --extra llm`).
+# So does transformer, for PyTorch's size (`uv sync --extra transformer`).
 [dependency-groups]
 dev = ["hkp-python[asr,tts,mp3,dev]"]
 

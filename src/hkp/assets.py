@@ -287,6 +287,14 @@ class AssetFileCache:
         self.max_bytes = max_bytes
         self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
+        #: How far each fetch in flight is: (received, expected).
+        self._fetching: dict[str, tuple[int, int | None]] = {}
+
+    def fetching(self, sha256: str) -> tuple[int, int | None] | None:
+        """How far a fetch of this file is, for whoever waits on one somebody
+        else is doing. None when nobody is fetching it."""
+        with self._lock:
+            return self._fetching.get(sha256)
 
     def lock(self, sha256: str) -> threading.Lock:
         """Held while a file is fetched, so two askers wait for one download."""
@@ -324,6 +332,8 @@ class AssetFileCache:
                         raise _Refused(f"larger than {self.max_bytes} bytes")
                     digest.update(chunk)
                     file.write(chunk)
+                    with self._lock:
+                        self._fetching[sha256] = (written, expected)
                     if progress:
                         progress(written, expected)
             actual = digest.hexdigest()
@@ -337,6 +347,9 @@ class AssetFileCache:
             except OSError:
                 pass
             raise
+        finally:
+            with self._lock:
+                self._fetching.pop(sha256, None)
         self._make_room(keep=path)
         return path
 
@@ -537,7 +550,18 @@ class AssetStore:
             )
 
         files = self._file_cache or default_file_cache()
-        with files.lock(sha256):
+        lock = files.lock(sha256)
+        try:
+            # Somebody else may be fetching it: wait for them, and say how far
+            # they are, so that every service naming a model shows the download
+            # and not only the one that happened to start it.
+            while not lock.acquire(timeout=0.25):
+                under_way = files.fetching(sha256)
+                if progress and under_way:
+                    progress(*under_way)
+        except Exception as error:  # noqa: BLE001 — a caller that stopped waiting
+            return AssetPathResolution(None, f'asset "{asset_id}": {error}')
+        try:
             found = files.get(sha256)
             if found is not None:
                 return AssetPathResolution(found, "", sha256)
@@ -552,6 +576,8 @@ class AssetStore:
                 return AssetPathResolution(None, f'asset "{asset_id}": {refused}')
             except Exception as error:  # noqa: BLE001 — reported by name, never raised
                 return AssetPathResolution(None, f'asset "{asset_id}": {error}')
+        finally:
+            lock.release()
         return AssetPathResolution(path, "", sha256)
 
     # ── Private ──────────────────────────────────────────────────────────────
