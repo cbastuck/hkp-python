@@ -44,6 +44,7 @@ import re
 import threading
 import urllib.error
 import urllib.request
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -65,8 +66,10 @@ DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024
 DEFAULT_TIMEOUT_S = 30.0
 
 #: A descriptor as it travels: ``id``, ``mediaType``, exactly one of ``text``,
-#: ``base64`` or ``url``, and optional ``name``, ``sha256``, ``size`` and
-#: ``runtimes`` — the runtimes it is for, which whoever provisions them reads.
+#: ``base64`` or ``url``, and optional ``name``, ``sha256``, ``size``,
+#: ``encoding`` — how the content is stored packed, ``gzip`` being unpacked
+#: before it is handed over — and ``runtimes``, the runtimes it is for, which
+#: whoever provisions them reads.
 AssetDescriptor = dict[str, Any]
 
 
@@ -166,6 +169,9 @@ def read_asset_descriptor(value: Any, fallback_id: str | None = None) -> AssetDe
     size = value.get("size")
     if isinstance(size, (int, float)) and not isinstance(size, bool):
         descriptor["size"] = size
+    encoding = value.get("encoding")
+    if isinstance(encoding, str) and encoding:
+        descriptor["encoding"] = encoding
     runtimes = value.get("runtimes")
     if isinstance(runtimes, list):
         descriptor["runtimes"] = [entry for entry in runtimes if isinstance(entry, str)]
@@ -347,6 +353,10 @@ class AssetStore:
         problem = self._check(descriptor, content)
         if problem:
             return AssetResolution(None, f'asset "{asset_id}": {problem}')
+        try:
+            content = self._unpack(descriptor, content)
+        except _Refused as refused:
+            return AssetResolution(None, f'asset "{asset_id}": {refused}')
 
         asset = ResolvedAsset(asset_id, descriptor["mediaType"], content)
         with self._lock:
@@ -397,6 +407,25 @@ class AssetStore:
             raise _Refused(f"{url} is unreachable: {error.reason}") from error
         except TimeoutError as error:
             raise _Refused(f"{url} did not answer in time") from error
+
+    def _unpack(self, descriptor: AssetDescriptor, content: bytes) -> bytes:
+        """The content as a service is handed it: unpacked where the descriptor
+        says it is stored packed, and held to the same limit as what is fetched."""
+        encoding = descriptor.get("encoding")
+        if not encoding:
+            return content
+        if encoding != "gzip":
+            raise _Refused(f"content encoded as {json.dumps(encoding)} cannot be unpacked by this runtime")
+        try:
+            unpacker = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
+            unpacked = unpacker.decompress(content, self._max_bytes + 1)
+        except zlib.error as error:
+            raise _Refused("its content is not gzip") from error
+        if len(unpacked) > self._max_bytes:
+            raise _Refused(f"unpacks to more than {self._max_bytes} bytes")
+        if not unpacker.eof:
+            raise _Refused("its content is not gzip")
+        return unpacked
 
     def _check(self, descriptor: AssetDescriptor, content: bytes) -> str:
         if len(content) > self._max_bytes:

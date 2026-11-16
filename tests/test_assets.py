@@ -125,6 +125,30 @@ class TestStore:
         assert "file:// sources cannot be read" in store.resolve("hkp-asset://local").problem
         assert "not supported" in store.resolve("hkp-asset://ftp").problem
 
+    def test_hands_over_content_stored_gzipped_unpacked(self) -> None:
+        import base64 as b64
+        import gzip
+
+        def packed(text: str) -> str:
+            return b64.b64encode(gzip.compress(text.encode())).decode()
+
+        entries = read_assets_payload(
+            {
+                "table": {"mediaType": "text/plain", "base64": packed("the content"), "encoding": "gzip"},
+                "zstd": {"mediaType": "text/plain", "text": "x", "encoding": "zstd"},
+                "plain": {"mediaType": "text/plain", "text": "not packed", "encoding": "gzip"},
+                "bomb": {"mediaType": "text/plain", "base64": packed("a" * 100_000), "encoding": "gzip"},
+            }
+        )
+        assert entries["table"]["encoding"] == "gzip"
+
+        store = AssetStore(max_bytes=1024)
+        store.merge(entries)
+        assert store.resolve("hkp-asset://table").asset.content == b"the content"
+        assert 'encoded as "zstd" cannot be unpacked' in store.resolve("hkp-asset://zstd").problem
+        assert "is not gzip" in store.resolve("hkp-asset://plain").problem
+        assert "unpacks to more than 1024 bytes" in store.resolve("hkp-asset://bomb").problem
+
     def test_serves_an_edit_on_the_next_use_and_tells_subscribers(self) -> None:
         store = AssetStore()
         store.replace({"page": {"id": "page", "mediaType": "text/html", "text": "v1"}})
