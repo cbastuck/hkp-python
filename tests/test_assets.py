@@ -19,6 +19,7 @@ import pytest
 import pytest_asyncio
 
 from hkp.assets import (
+    AssetFileCache,
     AssetStore,
     decode_base64,
     parse_asset_ref,
@@ -226,6 +227,140 @@ class TestUrlSource:
         assert store.resolve("hkp-asset://r").asset.content == b"remote v1"
         sent = {name.lower() for name in remote["requests"][0]}
         assert "authorization" not in sent and "x-api-key" not in sent
+
+
+class TestAsAFile:
+    """What a library loads by path: fetched once to a folder the server owns."""
+
+    def _store(self, folder, assets: dict[str, Any], max_bytes: int = 1024) -> AssetStore:
+        store = AssetStore(file_cache=AssetFileCache(folder, max_bytes))
+        store.replace(read_assets_payload(assets))
+        return store
+
+    def test_is_fetched_once_and_found_by_another_runtime(self, remote, tmp_path) -> None:
+        asset = {"m": {"mediaType": "application/octet-stream", "url": remote["url"], "sha256": _sha("remote v1")}}
+        progress: list[tuple[int, int | None]] = []
+
+        first = self._store(tmp_path, asset).resolve_path("hkp-asset://m", lambda *seen: progress.append(seen))
+        second = self._store(tmp_path, asset).resolve_path("hkp-asset://m")
+
+        assert first.problem == "" and first.path.read_bytes() == b"remote v1"
+        assert first.sha256 == _sha("remote v1")
+        assert second.path == first.path
+        assert len(remote["requests"]) == 1
+        assert progress == [(9, 9)]
+
+    def test_keeps_inline_content_as_a_file_too(self, tmp_path) -> None:
+        store = self._store(tmp_path, {"t": {"mediaType": "text/plain", "text": "abc", "sha256": _sha("abc")}})
+
+        assert store.resolve_path("hkp-asset://t").path.read_bytes() == b"abc"
+
+    def test_keeps_nothing_that_does_not_match_its_hash(self, remote, tmp_path) -> None:
+        store = self._store(
+            tmp_path, {"m": {"mediaType": "text/plain", "url": remote["url"], "sha256": _sha("something else")}}
+        )
+
+        assert "does not match its sha256" in store.resolve_path("hkp-asset://m").problem
+        assert list(tmp_path.iterdir()) == []
+
+    def test_says_why_there_is_no_file(self, remote, tmp_path) -> None:
+        store = self._store(
+            tmp_path,
+            {
+                "unpinned": {"mediaType": "text/plain", "url": remote["url"]},
+                "packed": {"mediaType": "text/plain", "base64": "AA==", "encoding": "gzip", "sha256": _sha("x")},
+                "local": {"mediaType": "text/plain", "url": "file:///etc/passwd", "sha256": _sha("x")},
+                "big": {"mediaType": "text/plain", "text": "x" * 2000, "sha256": _sha("x" * 2000)},
+            },
+        )
+
+        assert "does not say its sha256" in store.resolve_path("hkp-asset://unpinned").problem
+        assert "not kept as a file" in store.resolve_path("hkp-asset://packed").problem
+        assert "file:// sources cannot be read" in store.resolve_path("hkp-asset://local").problem
+        assert "larger than 1024 bytes" in store.resolve_path("hkp-asset://big").problem
+        assert "not known" in store.resolve_path("hkp-asset://nothing").problem
+        assert list(tmp_path.iterdir()) == []
+
+    def test_lets_go_of_what_was_used_longest_ago_when_the_folder_is_full(self, tmp_path) -> None:
+        import os
+
+        contents = {name: name * 400 for name in ("a", "b", "c")}
+        store = self._store(
+            tmp_path,
+            {name: {"mediaType": "text/plain", "text": text, "sha256": _sha(text)} for name, text in contents.items()},
+        )
+
+        a = store.resolve_path("hkp-asset://a").path
+        b = store.resolve_path("hkp-asset://b").path
+        os.utime(a, (1, 1))
+        os.utime(b, (2, 2))
+        store.resolve_path("hkp-asset://a")  # used again, so b is now the oldest
+        c = store.resolve_path("hkp-asset://c").path
+
+        assert a.exists() and c.exists() and not b.exists()
+
+
+class TestModels:
+    """What services loaded from those files, shared between them."""
+
+    def test_loads_once_for_everyone_and_closes_when_the_last_lets_go(self) -> None:
+        store = AssetStore()
+        loads: list[str] = []
+        closed: list[str] = []
+
+        def load() -> str:
+            loads.append("load")
+            return "weights"
+
+        first = store.models.acquire(("gpt2", "abc"), load, closed.append)
+        second = store.models.acquire(("gpt2", "abc"), load, closed.append)
+
+        assert first.value is second.value and loads == ["load"]
+        first.release()
+        first.release()  # a second release is not somebody else's
+        assert closed == [] and store.models.keys() == [("gpt2", "abc")]
+        second.release()
+        assert closed == ["weights"] and store.models.keys() == []
+
+        store.models.acquire(("gpt2", "abc"), load)
+        assert loads == ["load", "load"]
+
+    def test_a_load_that_fails_leaves_nothing_behind(self) -> None:
+        store = AssetStore()
+
+        def broken() -> str:
+            raise RuntimeError("not a model")
+
+        with pytest.raises(RuntimeError, match="not a model"):
+            store.models.acquire("k", broken)
+
+        assert store.models.acquire("k", lambda: "ok").value == "ok"
+
+    def test_two_services_asking_at_once_wait_for_one_load(self) -> None:
+        store = AssetStore()
+        loads: list[int] = []
+        started = threading.Event()
+        go = threading.Event()
+
+        def load() -> str:
+            loads.append(1)
+            started.set()
+            go.wait(5)
+            return "weights"
+
+        got: list[str] = []
+        workers = [
+            threading.Thread(target=lambda: got.append(store.models.acquire("k", load).value))
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        assert started.wait(5)
+        go.set()
+        for worker in workers:
+            worker.join(5)
+
+        assert got == ["weights", "weights"] and loads == [1]
 
 
 class TestAssetService:

@@ -25,7 +25,7 @@ from .origins import (
     allows_origin_without_credential,
 )
 from .call_report import outgoing_payload
-from .data import BinaryData, FloatRingBuffer, NullData, TextData, UndefinedData
+from .data import BinaryData, FloatRingBuffer, MixedData, NullData, TextData, UndefinedData
 from .mounts import MOUNT_PREFIX, MountRegistry, RuntimeMounts
 from .ws_tickets import TICKET_TTL_SECONDS, WsTickets
 from .runtime import set_server_loop
@@ -75,6 +75,7 @@ from .services.sub_service import SUB_SERVICE_DESCRIPTOR, SubService
 from .services.join import JOIN_DESCRIPTOR, JoinService
 from .services.tracks import TRACKS_DESCRIPTOR, TracksService
 from .services.iterator import ITERATOR_DESCRIPTOR, IteratorService
+from .services.loop import LOOP_DESCRIPTOR, LoopService
 from .services.gather import GATHER_DESCRIPTOR, GatherService
 from .services.spread import SPREAD_DESCRIPTOR, SpreadService
 from .services.timer import (
@@ -206,6 +207,10 @@ class RuntimeServer:
             ITERATOR_DESCRIPTOR.service_id: HostedServiceFactory(
                 ITERATOR_DESCRIPTOR,
                 lambda cfg, cs: IteratorService(cfg, cs),
+            ),
+            LOOP_DESCRIPTOR.service_id: HostedServiceFactory(
+                LOOP_DESCRIPTOR,
+                lambda cfg, cs: LoopService(cfg, cs),
             ),
             GATHER_DESCRIPTOR.service_id: HostedServiceFactory(
                 GATHER_DESCRIPTOR,
@@ -1557,6 +1562,10 @@ def _json_placeholder(value: Any) -> Any:
         }
     if isinstance(value, BinaryData):
         return {"type": "BinaryData", "size": len(value.data)}
+    if isinstance(value, MixedData):
+        # The JSON side as it is — it is what a panel reads — and the payload
+        # by its size only.
+        return {**value.meta, "binary": {"type": "BinaryData", "size": value.size}}
     if isinstance(value, TextData):
         return value.text
     if isinstance(value, (NullData, UndefinedData)):

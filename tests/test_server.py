@@ -111,6 +111,7 @@ async def test_registry_shape(server_info, base_url, port):
             "version": "v1",
             "capabilities": ["subservices"],
         },
+        {"serviceId": "loop", "serviceName": "Loop", "version": "v1", "capabilities": ["subservices"]},
         {
             "serviceId": "gather",
             "serviceName": "Gather",

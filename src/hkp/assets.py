@@ -21,6 +21,13 @@ Where the content comes from depends on the source:
     fetched by this runtime as anyone would fetch it, cached by ``sha256`` or
     revalidated by ETag
 
+Content is held in memory, and no asset larger than 64 MB is. What a library
+loads by file path — a model's weights — is resolved to a **path** instead
+(``resolve_path``): the content is written once to a folder this server owns,
+under its ``sha256``, and found there by every runtime and after every restart.
+Only an asset that says its ``sha256`` is kept that way; the hash is the file's
+name and the check that what was fetched is what the board meant.
+
 Anything else — ``file://`` among them, since this runtime keeps no files a
 board may name — is refused by name rather than guessed at.
 
@@ -40,18 +47,22 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import re
+import tempfile
 import threading
 import urllib.error
 import urllib.request
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import urlsplit
 
 from .egress import refusal_in
 from .egress import urlopen as egress_urlopen
+from .models import ModelCache
 
 
 ASSET_SCHEME = "hkp-asset://"
@@ -64,6 +75,13 @@ _ANY_REFERENCE = re.compile(rf"hkp-asset://({_ID})")
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024
 DEFAULT_TIMEOUT_S = 30.0
+#: Everything kept on disk together, and so also the largest single file.
+DEFAULT_MAX_FILE_CACHE_BYTES = 8 * 1024 * 1024 * 1024
+_CHUNK = 1024 * 1024
+
+#: Told how much of a file has arrived, and how much is expected (None when the
+#: source did not say).
+Progress = Callable[[int, "int | None"], None]
 
 #: A descriptor as it travels: ``id``, ``mediaType``, exactly one of ``text``,
 #: ``base64`` or ``url``, and optional ``name``, ``sha256``, ``size``,
@@ -86,6 +104,16 @@ class AssetResolution:
     asset: ResolvedAsset | None
     #: Why there is none, or "" when there is.
     problem: str
+
+
+@dataclass
+class AssetPathResolution:
+    #: The file holding the content, or None when there is none.
+    path: Path | None
+    #: Why there is none, or "" when there is.
+    problem: str
+    #: What the file holds, for keying whatever is loaded from it.
+    sha256: str = ""
 
 
 def parse_asset_ref(value: Any) -> str | None:
@@ -245,6 +273,114 @@ def decode_base64(value: str) -> bytes | None:
         return None
 
 
+class AssetFileCache:
+    """Asset content kept as files, each named by the ``sha256`` of what it holds.
+
+    One folder per server, shared by its runtimes: two boards naming the same
+    model fetch it once. A file appears under its name only after its content
+    was hashed and matched, so what is found here is not checked again. When
+    the folder passes its limit the files used longest ago go first.
+    """
+
+    def __init__(self, folder: Path | str, max_bytes: int = DEFAULT_MAX_FILE_CACHE_BYTES) -> None:
+        self.folder = Path(folder)
+        self.max_bytes = max_bytes
+        self._locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def lock(self, sha256: str) -> threading.Lock:
+        """Held while a file is fetched, so two askers wait for one download."""
+        with self._lock:
+            return self._locks.setdefault(sha256, threading.Lock())
+
+    def get(self, sha256: str) -> Path | None:
+        path = self.folder / sha256
+        if not path.is_file():
+            return None
+        try:
+            os.utime(path)  # used now, for what goes first when space runs out
+        except OSError:
+            pass
+        return path
+
+    def put(
+        self,
+        sha256: str,
+        chunks: Iterable[bytes],
+        *,
+        expected: int | None = None,
+        progress: Progress | None = None,
+    ) -> Path:
+        """Writes ``chunks`` to the file named ``sha256``, if that is what they are."""
+        self.folder.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        written = 0
+        handle, temporary = tempfile.mkstemp(dir=self.folder, prefix=".fetching-")
+        try:
+            with os.fdopen(handle, "wb") as file:
+                for chunk in chunks:
+                    written += len(chunk)
+                    if written > self.max_bytes:
+                        raise _Refused(f"larger than {self.max_bytes} bytes")
+                    digest.update(chunk)
+                    file.write(chunk)
+                    if progress:
+                        progress(written, expected)
+            actual = digest.hexdigest()
+            if actual != sha256:
+                raise _Refused(f"content does not match its sha256 (got {actual})")
+            path = self.folder / sha256
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        self._make_room(keep=path)
+        return path
+
+    def _make_room(self, keep: Path) -> None:
+        files = []
+        for entry in self.folder.iterdir():
+            if entry.name.startswith(".") or not entry.is_file():
+                continue
+            status = entry.stat()
+            files.append((status.st_mtime, status.st_size, entry))
+        total = sum(size for _, size, _ in files)
+        for _, size, entry in sorted(files, key=lambda item: item[0]):
+            if total <= self.max_bytes:
+                break
+            if entry == keep:
+                continue
+            try:
+                # A model loaded from it stays loaded; the next load fetches.
+                entry.unlink()
+                total -= size
+            except OSError:
+                pass
+
+
+_default_file_cache: AssetFileCache | None = None
+_default_file_cache_lock = threading.Lock()
+
+
+def default_file_cache() -> AssetFileCache:
+    """This server's folder: ``HKP_ASSET_CACHE``, else ``~/.hkp/python/asset-cache``,
+    holding at most ``HKP_ASSET_CACHE_MAX_BYTES``."""
+    global _default_file_cache
+    with _default_file_cache_lock:
+        if _default_file_cache is None:
+            folder = os.environ.get("HKP_ASSET_CACHE") or (
+                Path.home() / ".hkp" / "python" / "asset-cache"
+            )
+            limit = os.environ.get("HKP_ASSET_CACHE_MAX_BYTES", "")
+            _default_file_cache = AssetFileCache(
+                folder, int(limit) if limit.isdigit() and int(limit) > 0 else DEFAULT_MAX_FILE_CACHE_BYTES
+            )
+        return _default_file_cache
+
+
 class AssetStore:
     """The descriptors one runtime was given, and the content they resolve to."""
 
@@ -255,7 +391,13 @@ class AssetStore:
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         opener: Callable[..., Any] | None = None,
+        file_cache: AssetFileCache | None = None,
     ) -> None:
+        #: Where content resolved to a path is kept; the server's own folder
+        #: unless given one. Not touched until something asks for a path.
+        self._file_cache = file_cache
+        #: What this runtime's services loaded from those files; see models.py.
+        self.models = ModelCache()
         self._descriptors: dict[str, AssetDescriptor] = {}
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._cached_bytes = 0
@@ -366,7 +508,85 @@ class AssetStore:
                 self._remember(asset_id, _CacheEntry(version, asset, etag))
         return AssetResolution(asset, "")
 
+    def resolve_path(self, reference: str, progress: Progress | None = None) -> AssetPathResolution:
+        """A file holding an asset's content, for a library that loads by path.
+
+        Blocking, and for a first use possibly for minutes: the content is
+        fetched to this server's folder, and ``progress`` is told how far it
+        is. Every later use, by any runtime, finds the file there.
+
+        Only for an asset that says its ``sha256``. The file belongs to the
+        server: it is read, never written to or removed by whoever is handed it.
+        """
+        asset_id = parse_asset_ref(reference)
+        if not asset_id:
+            return AssetPathResolution(None, f"{json.dumps(reference)} is not an asset reference")
+        with self._lock:
+            descriptor = self._descriptors.get(asset_id)
+        if descriptor is None:
+            return AssetPathResolution(None, f'asset "{asset_id}" is not known to this runtime')
+        sha256 = descriptor.get("sha256")
+        if not sha256:
+            return AssetPathResolution(
+                None, f'asset "{asset_id}" does not say its sha256, so it is not kept as a file'
+            )
+        if descriptor.get("encoding"):
+            return AssetPathResolution(
+                None,
+                f'asset "{asset_id}": content stored as {json.dumps(descriptor["encoding"])} is not kept as a file',
+            )
+
+        files = self._file_cache or default_file_cache()
+        with files.lock(sha256):
+            found = files.get(sha256)
+            if found is not None:
+                return AssetPathResolution(found, "", sha256)
+            try:
+                if "url" in descriptor:
+                    expected, chunks = self._stream(descriptor["url"], files.max_bytes)
+                else:
+                    content, _ = self._load(descriptor, None)
+                    expected, chunks = len(content), iter((content,))
+                path = files.put(sha256, chunks, expected=expected, progress=progress)
+            except _Refused as refused:
+                return AssetPathResolution(None, f'asset "{asset_id}": {refused}')
+            except Exception as error:  # noqa: BLE001 — reported by name, never raised
+                return AssetPathResolution(None, f'asset "{asset_id}": {error}')
+        return AssetPathResolution(path, "", sha256)
+
     # ── Private ──────────────────────────────────────────────────────────────
+
+    def _stream(self, url: str, limit: int) -> tuple[int | None, Iterator[bytes]]:
+        """A URL's content in pieces, and how much of it the source says there is."""
+        scheme = urlsplit(url).scheme.lower()
+        if scheme not in ("http", "https"):
+            if scheme == "file":
+                raise _Refused("file:// sources cannot be read by this runtime")
+            raise _Refused(f"{scheme}:// sources are not supported by this runtime")
+        try:
+            response = self._open(urllib.request.Request(url), timeout=self._timeout_s)
+        except Exception as error:  # noqa: BLE001
+            raise _unreachable(url, error) from error
+        declared = response.headers.get("Content-Length")
+        expected = int(declared) if declared and declared.isdigit() else None
+        if expected is not None and expected > limit:
+            response.close()
+            raise _Refused(f"{url} is larger than {limit} bytes")
+
+        def chunks() -> Iterator[bytes]:
+            try:
+                with response:
+                    while True:
+                        chunk = response.read(_CHUNK)
+                        if not chunk:
+                            return
+                        yield chunk
+            except _Refused:
+                raise
+            except Exception as error:  # noqa: BLE001
+                raise _unreachable(url, error) from error
+
+        return expected, chunks()
 
     def _load(self, descriptor: AssetDescriptor, cached: _CacheEntry | None) -> tuple[bytes, str | None]:
         if "text" in descriptor:
@@ -466,3 +686,19 @@ class AssetStore:
 
 class _Refused(Exception):
     """A source that cannot be read, said in a sentence."""
+
+
+def _unreachable(url: str, error: Exception) -> _Refused:
+    """Why a URL gave nothing, in the words ``resolve`` uses for the same."""
+    if isinstance(error, _Refused):
+        return error
+    if isinstance(error, urllib.error.HTTPError):
+        return _Refused(f"{url} answered {error.code}")
+    if isinstance(error, urllib.error.URLError):
+        refused = refusal_in(error)
+        if refused:
+            return _Refused(f"{url}: {refused}")
+        return _Refused(f"{url} is unreachable: {error.reason}")
+    if isinstance(error, TimeoutError):
+        return _Refused(f"{url} did not answer in time")
+    return _Refused(f"{url}: {error}")

@@ -14,6 +14,7 @@ that travel over the YAS binary wire format.
 from array import array
 from dataclasses import dataclass, field
 from typing import Any
+import sys
 import time
 
 
@@ -72,6 +73,78 @@ class ControlFlowData:
     makes `result` the runtime's output (see the shared data-types table)."""
 
     result: Any
+
+
+_BYTES = (bytes, bytearray, memoryview)
+
+
+@dataclass
+class MixedData:
+    """JSON beside a payload of numbers or bytes — a model's scores, the
+    tensor its layers add to.
+
+    Inside one runtime the payload stays whatever the service that made it
+    holds: a tensor, an array, bytes. Services hand it on untouched, so
+    fourteen of them in a row copy nothing. It becomes bytes only where the
+    value leaves — a coordinator connection, a captured call report — and then
+    as little-endian float32 unless it already is bytes.
+
+    Arriving from another runtime the same value is a dict with the bytes under
+    ``binary`` (see ``binary_frame.py``); ``MixedData.of`` reads either.
+    """
+
+    meta: dict[str, Any]
+    payload: Any
+
+    @classmethod
+    def of(cls, value: Any) -> "MixedData | None":
+        """``value`` as mixed data, or None when it is not: one of these
+        already, or the dict a coordinator connection delivers."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            carried = value.get("binary")
+            if isinstance(carried, BinaryData):
+                carried = carried.data
+            if isinstance(carried, _BYTES):
+                rest = {key: item for key, item in value.items() if key != "binary"}
+                return cls(rest, bytes(carried))
+        return None
+
+    @property
+    def size(self) -> int:
+        """How many bytes the payload travels as, without making them."""
+        payload = self.payload
+        if isinstance(payload, memoryview):
+            return payload.nbytes
+        if isinstance(payload, (bytes, bytearray)):
+            return len(payload)
+        if isinstance(payload, array):
+            return len(payload) * 4
+        count = getattr(payload, "numel", None)  # a torch tensor
+        if callable(count):
+            return int(count()) * 4
+        size = getattr(payload, "size", None)  # a numpy array
+        if isinstance(size, int):
+            return size * 4
+        return len(self.to_bytes())
+
+    def to_bytes(self) -> bytes:
+        """The payload as it travels."""
+        payload = self.payload
+        if isinstance(payload, _BYTES):
+            return bytes(payload)
+        if isinstance(payload, array):
+            floats = payload if payload.typecode == "f" else array("f", payload)
+            if sys.byteorder != "little":
+                floats = array("f", floats)
+                floats.byteswap()
+            return floats.tobytes()
+        if callable(getattr(payload, "detach", None)):  # a torch tensor
+            payload = payload.detach().cpu().numpy()
+        if callable(getattr(payload, "astype", None)):  # a numpy array
+            return payload.astype("<f4").tobytes()
+        raise TypeError(f"MixedData cannot carry a {type(payload).__name__}")
 
 
 class NullData:

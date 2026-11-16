@@ -10,8 +10,8 @@ left out and a ``binary`` field in its place saying what the payload is:
 
     bytes            the payload is the value
     floatRingBuffer  little-endian float32 samples; ``id`` and ``ts`` in the header
-    mixed            a dict with bytes under ``binary``; the header carries the
-                     rest of the dict, the payload those bytes
+    mixed            a dict with bytes under ``binary``, or a ``MixedData``; the
+                     header carries the JSON side, the payload the bytes
 
 The coordinator forwards the payload without reading it. Mirrors
 hkp-node/src/coordinator/binaryFrame.ts; the two must agree.
@@ -22,7 +22,7 @@ import json
 import struct
 from typing import Any
 
-from .data import BinaryData, FloatRingBuffer
+from .data import BinaryData, FloatRingBuffer, MixedData
 
 _LENGTH = struct.Struct(">I")
 _BYTES = (bytes, bytearray, memoryview)
@@ -44,6 +44,8 @@ def to_binary(value: Any) -> tuple[dict[str, Any], bytes] | None:
             {"kind": "floatRingBuffer", "id": value.id, "ts": value.ts},
             bytes(value.samples),
         )
+    if isinstance(value, MixedData):
+        return {"kind": "mixed", "json": value.meta}, value.to_bytes()
     raw = _raw(value)
     if raw is not None:
         return {"kind": "bytes"}, raw
