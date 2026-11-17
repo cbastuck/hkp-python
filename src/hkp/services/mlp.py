@@ -39,7 +39,7 @@ class MlpService(LayerService):
     version = MLP_DESCRIPTOR.version
     capabilities = MLP_DESCRIPTOR.capabilities
 
-    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord]:
+    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord, JsonRecord]:
         read = weights.norm(stream, f"h.{self._layer}.ln_2")
         wide = read @ weights.layer(self._layer, "mlp.c_fc.weight") + weights.layer(
             self._layer, "mlp.c_fc.bias"
@@ -49,34 +49,13 @@ class MlpService(LayerService):
         added = passed @ weights.layer(self._layer, "mlp.c_proj.weight") + weights.layer(
             self._layer, "mlp.c_proj.bias"
         )
-        return added, {}
+        return added, {}, {}
 
-    def update_trace(
-        self,
-        trace: list[JsonRecord],
-        *,
-        added_size: float,
-        out_size: float,
-        last_vector: list[float],
-        report: JsonRecord,  # noqa: ARG002
-        pieces: list[str],
-    ) -> list[JsonRecord]:
-        if trace and trace[-1].get("layer") == self._layer and trace[-1].get("mlpAdded") == 0.0:
-            updated = {
-                **trace[-1],
-                "mlpAdded": added_size,
-                "size": out_size,
-                "vector": last_vector,
-            }
-            return [*trace[:-1], updated]
-        return [
-            *trace,
-            {
-                "layer": self._layer,
-                "attentionAdded": 0.0,
-                "mlpAdded": added_size,
-                "size": out_size,
-                "vector": last_vector,
-                "pieces": pieces,
-            },
-        ]
+    def record(self, layers: list[JsonRecord], entry: JsonRecord, added: float) -> list[JsonRecord]:
+        # The second half of the layer whose attention ran just before: one
+        # entry for the two. Otherwise (an MLP on its own, or after another
+        # layer's attention) an entry of its own.
+        last = layers[-1] if layers else None
+        if last is not None and last.get("layer") == self._layer and "mlpAdded" not in last:
+            return [*layers[:-1], {**last, **entry, "mlpAdded": added}]
+        return [*layers, {"layer": self._layer, **entry, "mlpAdded": added}]

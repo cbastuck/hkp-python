@@ -154,6 +154,23 @@ def stream_of(value: Any) -> tuple[JsonRecord, Any] | None:
     return mixed.meta, stream
 
 
+def layers_of(value: Any) -> list[JsonRecord]:
+    """What the layers the stream went through recorded about it, earliest
+    first: for each, ``layer``, what attention and MLP added, the last token's
+    vector (a tensor) and the attention patterns (a ``[heads, tokens, tokens]``
+    tensor) with how attention was set. Kept in the stream's ``local`` side,
+    so it costs a reference per layer and never leaves the runtime; a stream
+    that came from another runtime has none."""
+    mixed = MixedData.of(value)
+    layers = mixed.local.get("layers") if mixed is not None else None
+    return list(layers) if isinstance(layers, list) else []
+
+
+def matrix(tensor: Any) -> list[list[float]]:
+    """A 2D tensor as a panel reads it: rows of numbers, four places."""
+    return [[round(cell, 4) for cell in row] for row in tensor.tolist()]
+
+
 def most_likely(scores: Any, count: int) -> tuple[list[tuple[int, float]], int]:
     """The ``count`` most likely tokens among those still in the running, each
     with the probability it has among them, and how many are in the running."""

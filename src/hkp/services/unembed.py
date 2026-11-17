@@ -31,6 +31,10 @@ It reports:
               far ("logit lens"), with how much attention and MLP added there
   attention   the attention pattern for ``inspectLayer`` and ``inspectHead``
 
+The last two come from the record the layers keep in the stream's ``local``
+side, which stays in this runtime: a stream that arrives from another one
+has no layers to report.
+
 Placed between two layers with ``passThrough: true``, it scores the stream at
 that point and hands the stream on untouched, so an early answer can be
 inspected anywhere in the stack.
@@ -40,7 +44,17 @@ from typing import Any
 
 from ..data import MixedData
 from ..types import JsonRecord, NotifyCallback, ServiceConfiguration, ServiceRegistryEntry
-from .llm_model import ModelService, Problem, candidates, most_likely, number, stream_of, torch
+from .llm_model import (
+    ModelService,
+    Problem,
+    candidates,
+    layers_of,
+    matrix,
+    most_likely,
+    number,
+    stream_of,
+    torch,
+)
 
 UNEMBED_DESCRIPTOR = ServiceRegistryEntry(service_id="unembed", service_name="Unembed")
 
@@ -59,7 +73,7 @@ class UnembedService(ModelService):
         self._pass_through = False
         self._inspect_layer = 0
         self._inspect_head = 0
-        self._last_trace: list[JsonRecord] = []
+        self._last_record: list[JsonRecord] = []
         self._last_candidates: list[JsonRecord] = []
         self._last_layers: list[JsonRecord] = []
         super().__init__(config)
@@ -80,7 +94,7 @@ class UnembedService(ModelService):
             self._inspect_head = int(inspect_head)
             re_inspect = True
         state = super().configure(config)
-        if re_inspect and self._last_trace and self._host is not None:
+        if re_inspect and self._last_record and self._host is not None:
             try:
                 self._host.notify(self._build_report(), self.uuid)
             except Exception:  # noqa: BLE001
@@ -109,24 +123,23 @@ class UnembedService(ModelService):
                 raise Problem(
                     f"a stream {stream.shape[1]} wide is not this model's, which is {weights.width} wide"
                 )
-            trace = list(meta.get("_trace") or [])
+            layers = layers_of(input)
             with lib.no_grad():
                 wte = weights.get("wte.weight")
-                last = weights.norm(stream[-1], "ln_f")
-                scores = wte @ last
-                layers_report = self._score_layers(lib, weights, wte, vocabulary, trace)
+                scores = wte @ weights.norm(stream[-1], "ln_f")
+                guesses = self._score_layers(lib, weights, wte, vocabulary, layers)
         except Problem as problem:
             return self.fail(notify, str(problem))
 
         best, _ = most_likely(scores, self._top)
         self._last_candidates = candidates(best, vocabulary)
-        self._last_layers = layers_report
-        self._last_trace = trace
+        self._last_layers = guesses
+        self._last_record = layers
         notify(self._build_report(), None)
 
         if self._pass_through:
-            return MixedData(meta, stream)
-        out = {key: value for key, value in meta.items() if key not in ("shape", "_trace")}
+            return input
+        out = {key: value for key, value in meta.items() if key != "shape"}
         return MixedData({**out, "applied": []}, scores)
 
     def _score_layers(
@@ -135,30 +148,32 @@ class UnembedService(ModelService):
         weights: Any,
         wte: Any,
         vocabulary: Any,
-        trace: list[JsonRecord],
+        layers: list[JsonRecord],
     ) -> list[JsonRecord]:
+        """The top guess after each layer: every layer's last vector scored at
+        once, as the final one is."""
+        recorded = [entry for entry in layers if lib.is_tensor(entry.get("vector"))]
+        if not recorded:
+            return []
+        vectors = lib.stack([entry["vector"] for entry in recorded])
+        probabilities = lib.softmax((weights.norm(vectors, "ln_f") @ wte.T).double(), dim=-1)
+        best = probabilities.max(dim=-1)
         rows: list[JsonRecord] = []
-        for idx, entry in enumerate(trace):
-            vec = entry.get("vector")
-            if not isinstance(vec, list) or len(vec) != weights.width:
-                continue
-            tensor = lib.tensor(vec, dtype=lib.float32)
-            layer_scores = wte @ weights.norm(tensor, "ln_f")
-            top_one, _ = most_likely(layer_scores, 1)
-            if not top_one:
-                continue
-            token, prob = top_one[0]
-            row: JsonRecord = {
-                "step": idx + 1,
-                "layer": entry.get("layer", idx),
-                "token": token,
-                "piece": vocabulary.piece(token) if vocabulary is not None else str(token),
-                "p": round(prob, 4),
-                "attentionAdded": entry.get("attentionAdded", 0.0),
-                "mlpAdded": entry.get("mlpAdded", 0.0),
-                "size": entry.get("size", 0.0),
-            }
-            rows.append(row)
+        for step, (entry, token, p) in enumerate(
+            zip(recorded, best.indices.tolist(), best.values.tolist()), start=1
+        ):
+            rows.append(
+                {
+                    "step": step,
+                    "layer": entry.get("layer", step - 1),
+                    "token": token,
+                    "piece": vocabulary.piece(token) if vocabulary is not None else str(token),
+                    "p": round(p, 4),
+                    "attentionAdded": entry.get("attentionAdded", 0.0),
+                    "mlpAdded": entry.get("mlpAdded", 0.0),
+                    "size": entry.get("size", 0.0),
+                }
+            )
         return rows
 
     def _build_report(self) -> JsonRecord:
@@ -166,24 +181,23 @@ class UnembedService(ModelService):
             "candidates": self._last_candidates,
             "layers": self._last_layers,
         }
-        with_patterns = [entry for entry in self._last_trace if entry.get("patterns")]
+        with_patterns = [entry for entry in self._last_record if entry.get("patterns") is not None]
         if with_patterns:
             chosen = next(
                 (entry for entry in with_patterns if entry.get("layer") == self._inspect_layer),
                 with_patterns[-1],
             )
             patterns = chosen["patterns"]
-            head = min(max(self._inspect_head, 0), len(patterns) - 1)
+            head = min(max(self._inspect_head, 0), int(patterns.shape[0]) - 1)
             report["attention"] = {
                 "layer": chosen.get("layer", 0),
                 "head": head,
-                "heads": len(patterns),
+                "heads": int(patterns.shape[0]),
                 "disabledHeads": chosen.get("disabledHeads", []),
                 "mask": chosen.get("mask", "causal"),
                 "window": chosen.get("window", 4),
                 "temperature": chosen.get("temperature", 1.0),
                 "pieces": chosen.get("pieces", []),
-                "pattern": patterns[head],
-                "patterns": patterns,
+                "pattern": matrix(patterns[head]),
             }
         return report

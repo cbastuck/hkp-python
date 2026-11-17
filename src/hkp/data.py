@@ -91,10 +91,17 @@ class MixedData:
 
     Arriving from another runtime the same value is a dict with the bytes under
     ``binary`` (see ``binary_frame.py``); ``MixedData.of`` reads either.
+
+    ``local`` is what services of one runtime hand each other beside the value
+    and nobody else sees: tensors kept for a later service to look at (the
+    stream's layer-by-layer record, which `unembed` reads). It never travels —
+    no notification, call report or connection carries it — so a value that
+    arrives from another runtime has none.
     """
 
     meta: dict[str, Any]
     payload: Any
+    local: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @classmethod
     def of(cls, value: Any) -> "MixedData | None":

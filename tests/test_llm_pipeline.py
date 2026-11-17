@@ -596,14 +596,18 @@ def test_attention_heads_masks_temperature_and_early_answers(tiny_model) -> None
     prompt = {"tokens": [1, 2, 3], "pieces": ["red", "orange", "yellow"], "promptTokens": 3}
     result = rt.process(prompt, lambda *_: None)
     meta, _ = scores_of(result)
-    assert "_trace" not in meta
+    # The record of the layers stays with the stream; scores do not carry it.
+    assert set(meta) == {"tokens", "pieces", "promptTokens", "applied"}
+    assert MixedData.of(result).local == {}
 
     by_id = dict(said)
-    # SubService rolls up its direct steps onto its own address (Option A).
-    assert "attention" in by_id or "mlp" in by_id.get("layer-0", {})
-    layer0_notes = [payload for inst, payload in said if inst == "layer-0"]
-    assert any("attention" in p for p in layer0_notes)
-    assert any("mlp" in p for p in layer0_notes)
+    # A step inside a layer is heard at its own address, and only there.
+    assert by_id["layer-0.attention"]["layer"] == 0
+    assert by_id["layer-0.mlp"]["layer"] == 0
+    assert "layer-0" not in by_id
+    # One head's pattern per call, not every head's.
+    assert by_id["layer-0.attention"]["head"] == 0
+    assert "patterns" not in by_id["layer-0.attention"]
 
     # Early unembed (passThrough=True) scored layer 0 and handed the stream on.
     assert len(by_id["early"]["candidates"]) == 2
@@ -616,6 +620,8 @@ def test_attention_heads_masks_temperature_and_early_answers(tiny_model) -> None
     assert final_report["attention"]["layer"] == 0
     assert final_report["attention"]["head"] == 1
     assert final_report["attention"]["pieces"] == ["red", "orange", "yellow"]
+    assert final_report["attention"]["heads"] == 2
+    assert "patterns" not in final_report["attention"]
     pattern = final_report["attention"]["pattern"]
     assert len(pattern) == 3 and len(pattern[0]) == 3
     # Causal mask: token 0 cannot look ahead at token 1 or 2.
@@ -655,7 +661,41 @@ def test_attention_heads_masks_temperature_and_early_answers(tiny_model) -> None
     assert attn0.get_state()["disabledHeads"] == [0]
     rt.process(prompt, lambda *_: None)
     attn_note = dict(said)["layer-0.attention"]
-    assert attn_note["patterns"][0] == [[0.0, 0.0, 0.0]] * 3
+    assert attn_note["pattern"] == [[0.0, 0.0, 0.0]] * 3
     assert attn_note["headSizes"][0] == 0.0 and attn_note["headSizes"][1] > 0.0
+
+    # Choosing another head reports it from the last call, without running.
+    said.clear()
+    attn0.configure({"head": 1})
+    assert said[-1][0] == "layer-0.attention"
+    assert said[-1][1]["head"] == 1
+    assert said[-1][1]["pattern"] != [[0.0, 0.0, 0.0]] * 3
+
+
+def test_the_record_of_the_layers_never_leaves_the_runtime(tiny_model) -> None:
+    """The layers' record is tensors kept beside the stream. A notification,
+    a call report and a coordinator connection carry the stream's JSON side
+    and its numbers, never the record."""
+    from hkp.binary_frame import to_binary  # noqa: PLC0415
+    from hkp.server import _json_placeholder  # noqa: PLC0415
+
+    weights_cfg = {"model": "hkp-asset://weights", "config": "hkp-asset://config"}
+    rt, _ = _runtime(
+        tiny_model,
+        [
+            ServiceConfiguration(service_id="token-embed", uuid="embed", state=weights_cfg),
+            ServiceConfiguration(service_id="attention", uuid="attn", state={**weights_cfg, "layer": 0}),
+        ],
+    )
+    _wait_ready(rt.get_service("embed"))
+    _wait_ready(rt.get_service("attn"))
+    stream = rt.process({"tokens": [1, 2, 3], "promptTokens": 3}, lambda *_: None)
+
+    assert [entry["layer"] for entry in llm_model.layers_of(stream)] == [0]
+    reported = json.dumps(stream, default=_json_placeholder)
+    assert "layers" not in json.loads(reported)
+    shape, payload = to_binary(stream)
+    assert set(shape["json"]) == {"tokens", "promptTokens", "shape"}
+    assert len(payload) == 3 * 8 * 4
 
 

@@ -37,6 +37,11 @@ stream that leaves is the one that came in, plus what this layer found.
 
 ``layer`` says which of the model's layers this is, and so which weights it
 uses. Two of these with the same ``layer`` run that layer twice.
+
+Each call reports the pattern of one head, ``head``; choosing another reports
+it from the last call without running again. Every head's pattern goes on in
+the stream's record of its layers (``local``, never sent), where `unembed`
+reads the one a board asks it to show.
 """
 
 import math
@@ -45,7 +50,7 @@ from typing import Any
 
 from ..data import MixedData
 from ..types import JsonRecord, NotifyCallback, ServiceConfiguration, ServiceRegistryEntry
-from .llm_model import ModelService, Problem, length, number, stream_of, torch
+from .llm_model import ModelService, Problem, layers_of, length, matrix, number, stream_of, torch
 
 ATTENTION_DESCRIPTOR = ServiceRegistryEntry(service_id="attention", service_name="Attention")
 
@@ -94,7 +99,6 @@ class LayerService(ModelService):
 
     def __init__(self, config: ServiceConfiguration, _create_service: Any = None) -> None:
         self._layer = 0
-        self._last_said: JsonRecord | None = None
         super().__init__(config)
 
     def configure(self, config: JsonRecord) -> JsonRecord:
@@ -122,49 +126,40 @@ class LayerService(ModelService):
                 raise Problem(f"this model has no layer {self._layer}: it has {weights.layers}, counted from 0")
             pieces = _pieces_of(meta, int(stream.shape[0]))
             with lib.no_grad():
-                added, report = self.add(lib, weights, stream)
+                added, said, kept = self.add(lib, weights, stream)
                 out = stream + added
+                token_sizes = [round(size, 3) for size in out.norm(dim=-1).tolist()]
         except Problem as problem:
             return self.fail(notify, str(problem))
 
         added_size = length(added[-1])
-        out_size = length(out[-1])
-        token_sizes = [length(out[i]) for i in range(int(out.shape[0]))]
-        said: JsonRecord = {
-            "layer": self._layer,
-            **report,
-            "added": added_size,
-            "size": out_size,
-            "pieces": pieces,
-            "tokenSizes": token_sizes,
-        }
-        self._last_said = said
-        notify(said, None)
-        trace = self.update_trace(
-            list(meta.get("_trace") or []),
-            added_size=added_size,
-            out_size=out_size,
-            last_vector=out[-1].tolist(),
-            report=report,
-            pieces=pieces,
+        notify(
+            {
+                "layer": self._layer,
+                **said,
+                "added": added_size,
+                "size": token_sizes[-1],
+                "pieces": pieces,
+                "tokenSizes": token_sizes,
+            },
+            None,
         )
-        return MixedData({**meta, "_trace": trace}, out)
+        layers = self.record(
+            layers_of(input),
+            {"size": token_sizes[-1], "vector": out[-1], "pieces": pieces, **kept},
+            added_size,
+        )
+        local = MixedData.of(input).local  # stream_of found it, so it is one
+        return MixedData(meta, out, {**local, "layers": layers})
 
-    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord]:
-        """What this step adds to the stream, and what it says about it."""
+    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord, JsonRecord]:
+        """What this step adds to the stream, what it says about it, and what
+        it keeps in the stream's record of its layers."""
         raise NotImplementedError
 
-    def update_trace(
-        self,
-        trace: list[JsonRecord],
-        *,
-        added_size: float,
-        out_size: float,
-        last_vector: list[float],
-        report: JsonRecord,
-        pieces: list[str],
-    ) -> list[JsonRecord]:
-        return trace
+    def record(self, layers: list[JsonRecord], entry: JsonRecord, added: float) -> list[JsonRecord]:
+        """The stream's record of its layers with this step in it."""
+        raise NotImplementedError
 
 
 class AttentionService(LayerService):
@@ -179,6 +174,10 @@ class AttentionService(LayerService):
         self._temperature = 1.0
         self._disabled_heads: list[int] = []
         self._head = 0
+        #: The last call's report and every head's pattern, so choosing
+        #: another head shows it without running again.
+        self._last_said: JsonRecord | None = None
+        self._last_patterns: Any = None
         super().__init__(config)
 
     def configure(self, config: JsonRecord) -> JsonRecord:
@@ -191,8 +190,6 @@ class AttentionService(LayerService):
         if window is not None:
             self._window = max(1, int(window))
         temp = number(config, "temperature", least=0.01)
-        if temp is None:
-            temp = number(config, "scale", least=0.01)
         if temp is not None:
             self._temperature = temp
         if "disabledHeads" in config:
@@ -200,20 +197,12 @@ class AttentionService(LayerService):
             if parsed is not None:
                 self._disabled_heads = parsed
         head = number(config, "head", least=0.0)
-        head_changed = False
-        if head is not None and int(head) != self._head:
+        head_changed = head is not None and int(head) != self._head
+        if head is not None:
             self._head = int(head)
-            head_changed = True
         state = super().configure(config)
-        if head_changed and self._last_said and self._host is not None:
-            patterns = self._last_said.get("patterns")
-            if isinstance(patterns, list) and patterns:
-                chosen = min(max(self._head, 0), len(patterns) - 1)
-                self._last_said = {**self._last_said, "head": chosen, "pattern": patterns[chosen]}
-                try:
-                    self._host.notify(self._last_said, self.uuid)
-                except Exception:  # noqa: BLE001
-                    pass
+        if head_changed:
+            self._say_head()
         return state
 
     def get_state(self) -> JsonRecord:
@@ -226,7 +215,7 @@ class AttentionService(LayerService):
             "head": self._head,
         }
 
-    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord]:
+    def add(self, lib: Any, weights: Any, stream: Any) -> tuple[Any, JsonRecord, JsonRecord]:
         count, width = stream.shape
         heads = weights.heads
         each = width // heads
@@ -262,58 +251,43 @@ class AttentionService(LayerService):
         if disabled:
             pattern = pattern.clone()
             head_out = head_out.clone()
-            for h in disabled:
-                pattern[h] = 0.0
-                head_out[h] = 0.0
+            pattern[disabled] = 0.0
+            head_out[disabled] = 0.0
 
-        head_sizes = [round(float(head_out[h, -1].norm()), 3) for h in range(heads)]
+        head_sizes = [round(size, 3) for size in head_out[:, -1].norm(dim=-1).tolist()]
         gathered = head_out.transpose(0, 1).reshape(count, width)
         added = gathered @ weights.layer(self._layer, "attn.c_proj.weight") + weights.layer(
             self._layer, "attn.c_proj.bias"
         )
 
-        patterns_list = [
-            [[round(float(cell), 4) for cell in row] for row in head_mat.tolist()]
-            for head_mat in pattern
-        ]
-        chosen_head = min(max(self._head, 0), heads - 1)
-        return added, {
+        setting: JsonRecord = {
             "heads": heads,
-            "head": chosen_head,
             "disabledHeads": disabled,
             "mask": self._mask,
             "window": self._window,
             "temperature": self._temperature,
-            "headSizes": head_sizes,
-            "pattern": patterns_list[chosen_head],
-            "patterns": patterns_list,
         }
+        chosen = min(max(self._head, 0), heads - 1)
+        said: JsonRecord = {
+            **setting,
+            "head": chosen,
+            "headSizes": head_sizes,
+            "pattern": matrix(pattern[chosen]),
+        }
+        self._last_said, self._last_patterns = said, pattern
+        return added, said, {**setting, "patterns": pattern}
 
-    def update_trace(
-        self,
-        trace: list[JsonRecord],
-        *,
-        added_size: float,
-        out_size: float,
-        last_vector: list[float],
-        report: JsonRecord,
-        pieces: list[str],
-    ) -> list[JsonRecord]:
-        return [
-            *trace,
-            {
-                "layer": self._layer,
-                "attentionAdded": added_size,
-                "mlpAdded": 0.0,
-                "size": out_size,
-                "vector": last_vector,
-                "heads": report.get("heads", 0),
-                "disabledHeads": report.get("disabledHeads", []),
-                "mask": report.get("mask", "causal"),
-                "window": report.get("window", self._window),
-                "temperature": report.get("temperature", self._temperature),
-                "headSizes": report.get("headSizes", []),
-                "patterns": report.get("patterns", []),
-                "pieces": pieces,
-            },
-        ]
+    def record(self, layers: list[JsonRecord], entry: JsonRecord, added: float) -> list[JsonRecord]:
+        return [*layers, {"layer": self._layer, **entry, "attentionAdded": added}]
+
+    def _say_head(self) -> None:
+        """Reports the chosen head from the last call, when there was one."""
+        said, patterns = self._last_said, self._last_patterns
+        if said is None or patterns is None or self._host is None:
+            return
+        chosen = min(max(self._head, 0), int(patterns.shape[0]) - 1)
+        self._last_said = {**said, "head": chosen, "pattern": matrix(patterns[chosen])}
+        try:
+            self._host.notify(self._last_said, self.uuid)
+        except Exception:  # noqa: BLE001 — nobody watching is not a failure
+            pass
