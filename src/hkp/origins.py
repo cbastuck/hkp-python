@@ -41,12 +41,17 @@ AllowedOrigins = Union[str, list[str]]
 
 DEFAULT_ORIGINS = "default"
 
-# Where the Readymade apps load their pages from: desktop, iOS, Android.
+# Where the Readymade apps load their pages from: desktop, iOS, Android, VS Code.
 _APP_ORIGINS = (
     "saucer://embedded",
     "hkp://app",
     "https://appassets.androidplatform.net",
 )
+_VSCODE_WEBVIEW_ORIGIN = re.compile(r"^vscode-webview://[0-9a-z.-]+$")
+
+
+def _is_app_origin(origin: str) -> bool:
+    return origin in _APP_ORIGINS or bool(_VSCODE_WEBVIEW_ORIGIN.match(origin))
 
 _HOST_PORT = re.compile(r"^(\[[^\]]*\]|[^:]+)(?::(\d+))?$")
 _IPV6_LITERAL = re.compile(r"^\[[0-9a-f:.]*:[0-9a-f:.]*\]$")
@@ -130,7 +135,7 @@ def allows_origin_without_credential(
         return False
     if isinstance(allowed, list):
         return value in allowed
-    return value in _APP_ORIGINS or is_loopback_origin(value)
+    return _is_app_origin(value) or is_loopback_origin(value)
 
 
 def allows_origin(origin: str | None, allowed: AllowedOrigins) -> bool:
