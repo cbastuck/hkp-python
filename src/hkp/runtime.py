@@ -14,6 +14,7 @@ from .data import ControlFlowData
 from .mounts import MountHandle, MountHandler, RuntimeMounts
 from .secrets import SecretEntry, SecretVault
 from .assets import AssetStore
+from .resources import ResourceStore
 from .auth import ANONYMOUS_SUB, AuthenticatedUser
 from .types import (
     Caller,
@@ -312,6 +313,9 @@ class HostedRuntime:
         #: Where this runtime's assets come from when they are not its own; see
         #: delegate_assets.
         self._assets_from: Callable[[], AssetStore | None] | None = None
+        self._resource_store = ResourceStore()
+        self._resource_store.replace(config.resources)
+        self._resources_from: Callable[[], ResourceStore | None] | None = None
         #: The cells services in this runtime hold values in between passes.
         #: Owned rather than delegated by default: a runtime is the outermost
         #: thing a slot name can mean, so two services that name the same slot
@@ -779,6 +783,26 @@ class HostedRuntime:
         edited while the board runs is what a nested service resolves next.
         """
         self._assets_from = source
+
+    def resources(self) -> ResourceStore:
+        """The runtime's resource bindings, for a service that connects to an
+        external resource by reference (``hkp-resource://<id>``)."""
+        if self._resources_from is not None:
+            delegated = self._resources_from()
+            if delegated is not None:
+                return delegated
+        return self._resource_store
+
+    def set_resources(self, entries: dict[str, Any]) -> None:
+        """Takes in resource bindings, or ``None`` for one unbound or deleted."""
+        self._resource_store.merge(entries)
+
+    def delegate_resources(
+        self, source: Callable[[], ResourceStore | None]
+    ) -> None:
+        """Take resource bindings from somewhere else rather than from this
+        runtime's own store."""
+        self._resources_from = source
 
     def slots(self) -> SlotStore:
         if self._slots_from is not None:

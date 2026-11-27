@@ -87,6 +87,10 @@ class RuntimeConfiguration:
     #: are, and only what the services reference. They go into the runtime's
     #: asset store and never into service state. See ``assets.py``.
     assets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Bindings for the ``hkp-resource://<id>`` references this runtime's
+    #: services carry, by id. They go into the runtime's resource store and
+    #: never into service state. See ``resources.py``.
+    resources: dict[str, dict[str, Any]] = field(default_factory=dict)
     services: list[ServiceConfiguration] = field(default_factory=list)
 
 

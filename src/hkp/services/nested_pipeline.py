@@ -67,6 +67,7 @@ class NestedPipeline:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_assets()
+        self._apply_resources()
         self._apply_slots()
         self._apply_mounts()
 
@@ -189,6 +190,7 @@ class NestedPipeline:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_assets()
+        self._apply_resources()
         self._apply_slots()
         self._apply_mounts()
 
@@ -213,6 +215,12 @@ class NestedPipeline:
         if self._runtime is not None:
             self._runtime.delegate_assets(
                 lambda: self._host.assets() if self._host and hasattr(self._host, "assets") else None
+            )
+
+    def _apply_resources(self) -> None:
+        if self._runtime is not None:
+            self._runtime.delegate_resources(
+                lambda: self._host.resources() if self._host and hasattr(self._host, "resources") else None
             )
 
     def _apply_slots(self) -> None:
