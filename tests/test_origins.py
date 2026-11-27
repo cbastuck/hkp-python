@@ -91,8 +91,11 @@ def test_with_nothing_said_the_apps_and_local_pages_may_call_and_no_site_may():
     assert admits(allowed, "saucer://embedded")
     assert admits(allowed, "hkp://app")
     assert admits(allowed, "https://appassets.androidplatform.net")
+    assert admits(allowed, "vscode-webview://1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d")
     assert admits(allowed, "http://localhost:5173")
 
+    assert not admits(allowed, "vscode-webview://")
+    assert not admits(allowed, "vscode-webview://evil/path")
     assert not admits(allowed, "https://evil.example")
     # The project's own website is a site like any other until somebody says so.
     assert not admits(allowed, "https://readymadeit.com")

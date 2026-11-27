@@ -154,6 +154,7 @@ class SubService:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_assets()
+        self._apply_resources()
         self._apply_slots()
         self._apply_mounts()
 
@@ -252,6 +253,12 @@ class SubService:
                 lambda: self._host.assets() if self._host and hasattr(self._host, "assets") else None
             )
 
+    def _apply_resources(self) -> None:
+        if self._pipeline is not None:
+            self._pipeline.delegate_resources(
+                lambda: self._host.resources() if self._host and hasattr(self._host, "resources") else None
+            )
+
     def _apply_log_settings(self) -> None:
         """Hands the board's log settings to the nested pipeline, if any."""
         if not self._host or not self._pipeline:
@@ -315,6 +322,7 @@ class SubService:
         self._apply_log_settings()
         self._apply_secrets()
         self._apply_assets()
+        self._apply_resources()
         self._apply_slots()
         self._apply_mounts()
 

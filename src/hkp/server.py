@@ -31,6 +31,7 @@ from .ws_tickets import TICKET_TTL_SECONDS, WsTickets
 from .runtime import set_server_loop
 from .secrets import SecretEntry, read_secrets_payload, referenced_secrets
 from .assets import read_assets_payload
+from .resources import read_resources_payload
 from .services.asset import ASSET_DESCRIPTOR, AssetService
 from .coordinator_links import (
     CoordinatorLinks,
@@ -535,6 +536,9 @@ class RuntimeServer:
         app.router.add_post("/runtimes/{runtime_id}/assets", self._post_assets)
         app.router.add_get(
             "/runtimes/{runtime_id}/assets/{asset_id}", self._check_asset
+        )
+        app.router.add_post(
+            "/runtimes/{runtime_id}/resources", self._post_resources
         )
         app.router.add_post("/runtimes/{runtime_id}/rearrange", self._rearrange_runtime)
         app.router.add_patch("/runtimes/{runtime_id}/state", self._patch_runtime_state)
@@ -1182,6 +1186,24 @@ class RuntimeServer:
         runtime.set_assets(read_assets_payload(body))
         return web.json_response({"ids": runtime.assets().ids()})
 
+    async def _post_resources(self, request: web.Request) -> web.Response:
+        """Bindings for the resources this runtime's services reference.
+
+        Provisioning carries them already; this is for a binding added or
+        changed while the board runs, and for a re-push after a restart. It
+        merges, and ``null`` removes a binding. Answers with the ids held,
+        never addresses or credentials.
+        """
+        runtime = self._get_runtime_or_404(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        if not isinstance(body, (dict, list)):
+            raise web.HTTPBadRequest()
+        runtime.set_resources(read_resources_payload(body))
+        return web.json_response({"ids": runtime.resources().ids()})
+
     async def _check_asset(self, request: web.Request) -> web.Response:
         """Whether an asset resolves here, and to what — a check, not a download."""
         runtime = self._get_runtime_or_404(request)
@@ -1638,6 +1660,13 @@ def _validate_runtime_configuration(value: Any) -> RuntimeConfiguration | None:
         assets={
             asset_id: entry
             for asset_id, entry in read_assets_payload(value.get("assets")).items()
+            if entry is not None
+        },
+        resources={
+            resource_id: entry
+            for resource_id, entry in read_resources_payload(
+                value.get("resources")
+            ).items()
             if entry is not None
         },
         services=services,
